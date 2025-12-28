@@ -227,9 +227,7 @@ async fn write_http(
         _ => "OK",
     };
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: keep-alive
-        Keep-Alive: timeout=5
-\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
         code,
         status,
         ctype,
