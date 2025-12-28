@@ -81,9 +81,10 @@ async fn handle_conn(mut stream: glommio::net::TcpStream, st: AppState) -> anyho
         }
 
         let header_end = find_double_crlf(&stash).unwrap();
-        let head = std::str::from_utf8(&stash[..header_end])?;
-
-        let (method, path, content_len, want_close) = parse_request_head(head);
+        let (method, path, content_len, want_close) = {
+            let head = std::str::from_utf8(&stash[..header_end])?;
+            parse_request_head(head)
+        };
 
         // 2) 读取 body（若有）
         let body_start = header_end + 4;
@@ -132,12 +133,12 @@ async fn handle_conn(mut stream: glommio::net::TcpStream, st: AppState) -> anyho
     }
 }
 
-fn parse_request_head(head: &str) -> (&str, &str, Option<usize>, bool) {
+fn parse_request_head(head: &str) -> (String, String, Option<usize>, bool) {
     let mut lines = head.split("\r\n");
     let first = lines.next().unwrap_or("");
     let mut it = first.split_whitespace();
-    let method = it.next().unwrap_or("");
-    let path = it.next().unwrap_or("");
+    let method = it.next().unwrap_or("").to_string();
+    let path = it.next().unwrap_or("").to_string();
 
     let mut content_len: Option<usize> = None;
     let mut want_close = false;
