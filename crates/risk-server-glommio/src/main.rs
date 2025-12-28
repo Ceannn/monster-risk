@@ -42,6 +42,7 @@ fn main() {
 
             loop {
                 let stream = listener.accept().await;
+                stream.set_nodelay(true).ok();
                 match stream {
                     Ok(stream) => {
                         let st = state.clone();
@@ -233,8 +234,13 @@ async fn write_http(
         ctype,
         body.len()
     );
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(body).await?;
+    // 关键：合并成一个 buffer，一次性写出，避免 Nagle/delayed-ack 造成 ~40ms 抖动
+    let mut out = Vec::with_capacity(header.len() + body.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(body);
+
+    stream.write_all(&out).await?;
+    // 一般不需要 flush；如果你想保险留着也行
     stream.flush().await?;
     Ok(())
 }
