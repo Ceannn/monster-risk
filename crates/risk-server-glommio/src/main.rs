@@ -41,10 +41,11 @@ fn main() {
             tracing::info!("risk-server-glommio listening on http://{}", addr);
 
             loop {
-                let stream = listener.accept().await;
-                stream.set_nodelay(true).ok();
-                match stream {
+                match listener.accept().await {
                     Ok(stream) => {
+                        // 这里 stream 才是 TcpStream
+                        let _ = stream.set_nodelay(true);
+
                         let st = state.clone();
                         glommio::spawn_local(async move {
                             if let Err(e) = handle_conn(stream, st).await {
