@@ -1,0 +1,18 @@
+# --- Rust / Cargo ---
+/target/
+**/target/
+**/*.rs.bk
+**/*.log
+# --- Bench / generated results (按需) ---
+results/
+crates/results/
+*.csv
+
+# --- OS / Editor (按需) ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+.env
+.env.*

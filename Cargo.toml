@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/risk-core",
+  "crates/risk-server-tokio",
+  "crates/risk-bench",
+  "crates/risk-server-glommio"
+
+]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
