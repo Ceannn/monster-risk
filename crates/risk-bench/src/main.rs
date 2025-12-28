@@ -153,6 +153,9 @@ struct Sample {
     l2_us: u64,
     serialize_us: u64,
 
+    // NEW: bench side schedule lag
+    bench_lag_us: u64,
+
     ok: bool,
 }
 
@@ -165,6 +168,11 @@ struct Summary {
     p50: u64,
     p95: u64,
     p99: u64,
+
+    // NEW: bench-side lag stats
+    bench_lag_p99_us: u64,
+    bench_lag_max_us: u64,
+    missed_ticks_total: u64,
 
     // stage p99（你可以在论文里直接对比 Tokio vs Glommio 的 stage 尾巴）
     e2e_p99: u64,
@@ -247,6 +255,14 @@ async fn main() -> anyhow::Result<()> {
                     summary.l1_p99,
                     summary.l2_p99,
                     summary.serialize_p99
+                );
+                println!(
+                    "[runtime={} rps={}] bench_lag_p99={}us bench_lag_max={}us missed_ticks_total={}",
+                    t.runtime,
+                    rps,
+                    summary.bench_lag_p99_us,
+                    summary.bench_lag_max_us,
+                    summary.missed_ticks_total
                 );
             }
 
@@ -431,9 +447,22 @@ async fn run_once(args: &Args, rps: u64, url: &str, metrics_url: &str) -> anyhow
     let end = start + Duration::from_secs(args.duration);
 
     // fixed-rate launcher（用传入的 rps）
+    // 关键：禁止 interval “追赶补发”(burst)。我们用 interval_at + Delay：
+    // - 错过 tick 不会补发，只会整体往后平移，更接近真正的 open-loop 固定速率压测。
     let ns = (1_000_000_000u64 / rps.max(1)).max(1);
     let interval = Duration::from_nanos(ns);
-    let mut tick = tokio::time::interval(interval);
+
+    let first_tick = tokio::time::Instant::now() + interval;
+    let mut tick = tokio::time::interval_at(first_tick, interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // bench 侧“发包滞后”统计：actual - planned
+    let interval_ns: u128 = interval.as_nanos().max(1);
+    let mut seq: u64 = 0;
+    let mut bench_lag_us_vec: Vec<u64> = Vec::with_capacity(
+        ((args.duration as usize).saturating_mul(rps as usize)).min(2_000_000),
+    );
+    let mut missed_ticks_total: u64 = 0;
 
     let sem = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
 
@@ -444,6 +473,23 @@ async fn run_once(args: &Args, rps: u64, url: &str, metrics_url: &str) -> anyhow
 
     while Instant::now() < end {
         tick.tick().await;
+
+        // 计算本次 tick 的“理论时间点” planned，并记录 lag（实际开始 - planned）
+        let off_ns: u128 = interval_ns.saturating_mul(seq as u128);
+        let off_ns_u64: u64 = off_ns.min(u64::MAX as u128) as u64;
+        let planned = first_tick + Duration::from_nanos(off_ns_u64);
+
+        let now = tokio::time::Instant::now();
+        let lag = now.saturating_duration_since(planned);
+        let lag_us: u64 = lag.as_micros() as u64;
+        bench_lag_us_vec.push(lag_us);
+
+        // 粗略估计“落后了多少个 tick”
+        if lag.as_nanos() > interval_ns {
+            missed_ticks_total += (lag.as_nanos() / interval_ns) as u64;
+        }
+
+        seq = seq.wrapping_add(1);
 
         let permit = match sem.clone().try_acquire_owned() {
             Ok(p) => p,
@@ -466,6 +512,7 @@ async fn run_once(args: &Args, rps: u64, url: &str, metrics_url: &str) -> anyhow
 
             let t0 = Instant::now();
             let mut sample = Sample::default();
+            sample.bench_lag_us = lag_us;
 
             match client2.post(url).json(&req).send().await {
                 Ok(resp) => match resp.bytes().await {
@@ -500,6 +547,12 @@ async fn run_once(args: &Args, rps: u64, url: &str, metrics_url: &str) -> anyhow
     summary.samples_ok = ok;
     summary.samples_err = err;
     summary.dropped = dropped;
+
+    // bench 侧滞后统计（包含 dropped 的 tick）
+    bench_lag_us_vec.sort_unstable();
+    summary.bench_lag_p99_us = percentile(&bench_lag_us_vec, 99.0);
+    summary.bench_lag_max_us = *bench_lag_us_vec.last().unwrap_or(&0);
+    summary.missed_ticks_total = missed_ticks_total;
 
     if ok > 0 {
         // sort for percentiles
@@ -564,14 +617,14 @@ fn write_csv_row(
     if need_header {
         writeln!(
             f,
-            "ts_ms,runtime,url,metrics_url,rps,duration_s,concurrency,ok,err,dropped,p50_us,p95_us,p99_us,feature_p99_us,router_p99_us,l1_p99_us,l2_p99_us,serialize_p99_us,router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total"
+            "ts_ms,runtime,url,metrics_url,rps,duration_s,concurrency,ok,err,dropped,p50_us,p95_us,p99_us,feature_p99_us,router_p99_us,l1_p99_us,l2_p99_us,serialize_p99_us,router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total,bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
         )?;
     }
 
     let ts_ms = current_time_ms();
     writeln!(
         f,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         ts_ms,
         escape_csv(runtime),
         escape_csv(url),
@@ -594,6 +647,9 @@ fn write_csv_row(
         opt_f64(s.router_deadline_miss_total),
         opt_f64(s.router_l2_skipped_budget_total),
         opt_f64(s.router_timeout_before_l2_total),
+        s.bench_lag_p99_us,
+        s.bench_lag_max_us,
+        s.missed_ticks_total,
     )?;
 
     println!("csv appended: {}", out_path.display());
