@@ -3,6 +3,7 @@ use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -10,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -45,6 +45,65 @@ struct Args {
     /// sweep 时每个档位之间休息 N ms（让系统冷却一下）
     #[arg(long, default_value_t = 500)]
     sweep_pause_ms: u64,
+
+    /// 目标列表：可重复传参
+    /// 用法：--target tokio,http://127.0.0.1:8080/score,http://127.0.0.1:8080/metrics
+    ///      --target glommio,http://127.0.0.1:8081/score,http://127.0.0.1:8081/metrics
+    #[arg(long, value_name = "NAME,SCORE_URL,METRICS_URL")]
+    target: Vec<String>,
+
+    /// 自动找拐点：从 start 开始，每次 +step，直到 dropped>0 或 p99 明显上扬
+    #[arg(long, default_value_t = false)]
+    find_knee: bool,
+
+    #[arg(long, default_value_t = 1000)]
+    knee_start_rps: u64,
+
+    #[arg(long, default_value_t = 1000)]
+    knee_step_rps: u64,
+
+    #[arg(long, default_value_t = 64000)]
+    knee_max_rps: u64,
+
+    /// “明显上扬”的阈值：本档 p99 > 上一档 p99 * (1 + knee_rise_pct)
+    #[arg(long, default_value_t = 0.30)]
+    knee_rise_pct: f64,
+
+    /// “明显上扬”的绝对门槛：本档 p99 必须至少比上一档高 knee_abs_us 才算拐点
+    #[arg(long, default_value_t = 200)]
+    knee_abs_us: u64,
+}
+
+#[derive(Debug, Clone)]
+struct Target {
+    runtime: String,
+    url: String,
+    metrics_url: String,
+}
+
+fn parse_targets(args: &Args) -> anyhow::Result<Vec<Target>> {
+    if args.target.is_empty() {
+        return Ok(vec![Target {
+            runtime: "default".to_string(),
+            url: args.url.clone(),
+            metrics_url: args.metrics_url.clone(),
+        }]);
+    }
+
+    let mut out = Vec::new();
+    for t in &args.target {
+        let parts: Vec<&str> = t.split(',').map(|x| x.trim()).collect();
+        anyhow::ensure!(
+            parts.len() == 3,
+            "invalid --target format: {t} (expect NAME,SCORE_URL,METRICS_URL)"
+        );
+        out.push(Target {
+            runtime: parts[0].to_string(),
+            url: parts[1].to_string(),
+            metrics_url: parts[2].to_string(),
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,43 +191,128 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
 
-    // 如果传了 --sweep-rps 就跑 sweep，否则只跑单次 args.rps
-    let rps_list = if let Some(s) = &args.sweep_rps {
+    let targets = parse_targets(&args)?;
+
+    // 生成 rps 序列
+    let rps_list: Vec<u64> = if args.find_knee {
+        let mut v = Vec::new();
+        let mut r = args.knee_start_rps.max(1);
+        while r <= args.knee_max_rps {
+            v.push(r);
+            r = r.saturating_add(args.knee_step_rps.max(1));
+            if r == 0 {
+                break;
+            }
+        }
+        v
+    } else if let Some(s) = &args.sweep_rps {
         parse_rps_list(s)?
     } else {
         vec![args.rps]
     };
 
-    for (i, rps) in rps_list.iter().copied().enumerate() {
-        let summary = run_once(&args, rps).await?;
+    // 记录每个 runtime 的上一档 p99（用于判断“明显上扬”）
+    let mut prev_p99: HashMap<String, u64> = HashMap::new();
 
-        // 打印（带上当前 rps）
-        if summary.samples_ok == 0 {
-            println!(
-                "[rps={}] no successful samples collected (errors={}, dropped={})",
-                rps, summary.samples_err, summary.dropped
-            );
-        } else {
-            println!(
-                "[rps={}] ok_samples={} err_samples={} dropped={}  p50={}us  p95={}us  p99={}us  (target p99<=10000us)",
-                rps, summary.samples_ok, summary.samples_err, summary.dropped, summary.p50, summary.p95, summary.p99
-            );
-            println!(
-                "[rps={}] stage_p99(us): feature={} router={} l1={} l2={} serialize={}",
+    for (i, rps) in rps_list.iter().copied().enumerate() {
+        // 收集所有 runtime 的 knee 触发原因（避免被最后一个覆盖）
+        let mut knee_reasons: Vec<String> = Vec::new();
+
+        for t in &targets {
+            let summary = run_once(&args, rps, &t.url, &t.metrics_url).await?;
+
+            if summary.samples_ok == 0 {
+                println!(
+                    "[runtime={} rps={}] no successful samples collected (errors={}, dropped={})",
+                    t.runtime, rps, summary.samples_err, summary.dropped
+                );
+            } else {
+                println!(
+                    "[runtime={} rps={}] ok_samples={} err_samples={} dropped={}  p50={}us  p95={}us  p99={}us",
+                    t.runtime,
+                    rps,
+                    summary.samples_ok,
+                    summary.samples_err,
+                    summary.dropped,
+                    summary.p50,
+                    summary.p95,
+                    summary.p99
+                );
+                println!(
+                    "[runtime={} rps={}] stage_p99(us): feature={} router={} l1={} l2={} serialize={}",
+                    t.runtime,
+                    rps,
+                    summary.feature_p99,
+                    summary.router_p99,
+                    summary.l1_p99,
+                    summary.l2_p99,
+                    summary.serialize_p99
+                );
+            }
+
+            // 写同一个 CSV，但带 runtime 列
+            write_csv_row(
+                &out_path,
+                &args,
+                &t.runtime,
+                &t.url,
+                &t.metrics_url,
                 rps,
-                summary.feature_p99,
-                summary.router_p99,
-                summary.l1_p99,
-                summary.l2_p99,
-                summary.serialize_p99
-            );
+                &summary,
+            )?;
+
+            // 拐点判定：dropped>0 或 p99 相对上一档跳升（加绝对阈值，避免误报）
+            if args.find_knee {
+                if summary.dropped > 0 {
+                    knee_reasons.push(format!(
+                        "{}: dropped>0 ({} drops)",
+                        t.runtime, summary.dropped
+                    ));
+                } else if summary.samples_ok > 0 {
+                    let last = *prev_p99.get(&t.runtime).unwrap_or(&0);
+
+                    if last > 0 {
+                        // 相对阈值
+                        let threshold_rel =
+                            (last as f64 * (1.0 + args.knee_rise_pct)).round() as u64;
+
+                        // 绝对阈值（需要你在 Args 里新增：knee_abs_us: u64，建议 default=200）
+                        let threshold_abs = last.saturating_add(args.knee_abs_us);
+
+                        // 同时满足相对和绝对门槛才算“明显上扬”
+                        if summary.p99 > threshold_rel && summary.p99 > threshold_abs {
+                            knee_reasons.push(format!(
+                                "{}: p99 jump {}us -> {}us (> {}us and > {}us, +{:.0}%)",
+                                t.runtime,
+                                last,
+                                summary.p99,
+                                threshold_rel,
+                                threshold_abs,
+                                args.knee_rise_pct * 100.0
+                            ));
+                        }
+                    }
+
+                    // 更新上一档 p99
+                    prev_p99.insert(t.runtime.clone(), summary.p99);
+                }
+            }
         }
 
-        // 写 CSV：注意这里用 rps（不是 args.rps）
-        write_csv_row(&out_path, &args, rps, &summary)?;
+        if args.find_knee && !knee_reasons.is_empty() {
+            println!("\n=== KNEE HIT at rps={} ===", rps);
+            for r in knee_reasons {
+                println!(" - {}", r);
+            }
+            println!();
+            break;
+        }
 
-        // sweep 档位间暂停（最后一个不暂停）
-        if args.sweep_rps.is_some() && i + 1 < rps_list.len() && args.sweep_pause_ms > 0 {
+        // sweep / knee 档位间暂停（最后一个不暂停）
+        if (args.find_knee || args.sweep_rps.is_some())
+            && i + 1 < rps_list.len()
+            && args.sweep_pause_ms > 0
+        {
             tokio::time::sleep(Duration::from_millis(args.sweep_pause_ms)).await;
         }
     }
@@ -243,7 +387,7 @@ fn parse_rps_list(s: &str) -> anyhow::Result<Vec<u64>> {
     Ok(out)
 }
 
-async fn run_once(args: &Args, rps: u64) -> anyhow::Result<Summary> {
+async fn run_once(args: &Args, rps: u64, url: &str, metrics_url: &str) -> anyhow::Result<Summary> {
     // 每次 run 独立 client，避免跨档位复用连接造成“状态污染”
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(30))
@@ -311,7 +455,7 @@ async fn run_once(args: &Args, rps: u64) -> anyhow::Result<Summary> {
 
         let tx2 = tx.clone();
         let client2 = client.clone();
-        let url = args.url.clone();
+        let url = url.to_string();
         let req_id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
@@ -379,7 +523,7 @@ async fn run_once(args: &Args, rps: u64) -> anyhow::Result<Summary> {
     }
 
     if args.scrape_metrics {
-        if let Ok(resp) = client.get(&args.metrics_url).send().await {
+        if let Ok(resp) = client.get(metrics_url).send().await {
             if let Ok(text) = resp.text().await {
                 let (l2_trig, miss, skip, before_l2) = scrape_counters(&text);
                 summary.router_l2_trigger_total = l2_trig;
@@ -403,6 +547,9 @@ fn current_time_ms() -> i64 {
 fn write_csv_row(
     out_path: &PathBuf,
     args: &Args,
+    runtime: &str,
+    url: &str,
+    metrics_url: &str,
     rps_used: u64,
     s: &Summary,
 ) -> anyhow::Result<()> {
@@ -417,16 +564,18 @@ fn write_csv_row(
     if need_header {
         writeln!(
             f,
-            "ts_ms,url,rps,duration_s,concurrency,ok,err,dropped,p50_us,p95_us,p99_us,feature_p99_us,router_p99_us,l1_p99_us,l2_p99_us,serialize_p99_us,router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total"
+            "ts_ms,runtime,url,metrics_url,rps,duration_s,concurrency,ok,err,dropped,p50_us,p95_us,p99_us,feature_p99_us,router_p99_us,l1_p99_us,l2_p99_us,serialize_p99_us,router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total"
         )?;
     }
 
     let ts_ms = current_time_ms();
     writeln!(
         f,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         ts_ms,
-        escape_csv(&args.url),
+        escape_csv(runtime),
+        escape_csv(url),
+        escape_csv(metrics_url),
         rps_used,
         args.duration,
         args.concurrency,
