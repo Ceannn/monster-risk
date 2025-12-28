@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -35,6 +37,14 @@ struct Args {
     /// 是否抓取 /metrics 写入计数器列
     #[arg(long, default_value_t = true)]
     scrape_metrics: bool,
+
+    /// 逗号分隔的 RPS 列表，如：1000,2000,4000,8000
+    #[arg(long)]
+    sweep_rps: Option<String>,
+
+    /// sweep 时每个档位之间休息 N ms（让系统冷却一下）
+    #[arg(long, default_value_t = 500)]
+    sweep_pause_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,179 +132,46 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
 
-    let client = reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(args.concurrency)
-        .tcp_nodelay(true)
-        .build()?;
+    // 如果传了 --sweep-rps 就跑 sweep，否则只跑单次 args.rps
+    let rps_list = if let Some(s) = &args.sweep_rps {
+        parse_rps_list(s)?
+    } else {
+        vec![args.rps]
+    };
 
-    // channel for samples
-    let (tx, mut rx) = mpsc::channel::<Sample>(1_000_000);
+    for (i, rps) in rps_list.iter().copied().enumerate() {
+        let summary = run_once(&args, rps).await?;
 
-    // collector task: gather into vectors
-    let collector = tokio::spawn(async move {
-        let mut e2e = Vec::<u64>::with_capacity(200_000);
-        let mut feature = Vec::<u64>::with_capacity(200_000);
-        let mut router = Vec::<u64>::with_capacity(200_000);
-        let mut l1 = Vec::<u64>::with_capacity(200_000);
-        let mut l2 = Vec::<u64>::with_capacity(200_000);
-        let mut serialize = Vec::<u64>::with_capacity(200_000);
-
-        let mut ok = 0usize;
-        let mut err = 0usize;
-
-        while let Some(s) = rx.recv().await {
-            if s.ok {
-                ok += 1;
-                e2e.push(s.e2e_us);
-                feature.push(s.feature_us);
-                router.push(s.router_us);
-                l1.push(s.l1_us);
-                l2.push(s.l2_us);
-                serialize.push(s.serialize_us);
-            } else {
-                err += 1;
-            }
+        // 打印（带上当前 rps）
+        if summary.samples_ok == 0 {
+            println!(
+                "[rps={}] no successful samples collected (errors={}, dropped={})",
+                rps, summary.samples_err, summary.dropped
+            );
+        } else {
+            println!(
+                "[rps={}] ok_samples={} err_samples={} dropped={}  p50={}us  p95={}us  p99={}us  (target p99<=10000us)",
+                rps, summary.samples_ok, summary.samples_err, summary.dropped, summary.p50, summary.p95, summary.p99
+            );
+            println!(
+                "[rps={}] stage_p99(us): feature={} router={} l1={} l2={} serialize={}",
+                rps,
+                summary.feature_p99,
+                summary.router_p99,
+                summary.l1_p99,
+                summary.l2_p99,
+                summary.serialize_p99
+            );
         }
 
-        (e2e, feature, router, l1, l2, serialize, ok, err)
-    });
+        // 写 CSV：注意这里用 rps（不是 args.rps）
+        write_csv_row(&out_path, &args, rps, &summary)?;
 
-    let start = Instant::now();
-    let end = start + Duration::from_secs(args.duration);
-
-    // fixed-rate launcher
-    let interval = Duration::from_nanos(1_000_000_000u64 / args.rps.max(1));
-    let mut tick = tokio::time::interval(interval);
-
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(args.concurrency));
-
-    // tracking
-    let mut dropped: u64 = 0;
-    let seed = 42u64;
-
-    while Instant::now() < end {
-        tick.tick().await;
-
-        let permit = match sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                dropped += 1;
-                continue;
-            }
-        };
-
-        let tx2 = tx.clone();
-        let client2 = client.clone();
-        let url = args.url.clone();
-
-        tokio::spawn(async move {
-            let _permit = permit;
-
-            let mut rng =
-                StdRng::seed_from_u64(seed ^ (Instant::now().elapsed().as_nanos() as u64));
-            let req = gen_req(&mut rng);
-
-            let t0 = Instant::now();
-            let mut sample = Sample::default();
-
-            match client2.post(url).json(&req).send().await {
-                Ok(resp) => {
-                    // 读完整 body：更接近真实“端到端”
-                    match resp.bytes().await {
-                        Ok(bytes) => {
-                            sample.e2e_us = t0.elapsed().as_micros() as u64;
-
-                            // JSON parse 不计入 e2e（避免把客户端开销混进去）
-                            if let Ok(sr) = serde_json::from_slice::<ScoreResponse>(&bytes) {
-                                sample.feature_us = sr.timings_us.feature;
-                                sample.router_us = sr.timings_us.router;
-                                sample.l1_us = sr.timings_us.l1;
-                                sample.l2_us = sr.timings_us.l2;
-                                sample.serialize_us = sr.timings_us.serialize;
-                                sample.ok = true;
-                            } else {
-                                sample.ok = false;
-                            }
-                        }
-                        Err(_) => {
-                            sample.ok = false;
-                        }
-                    }
-                }
-                Err(_) => {
-                    sample.ok = false;
-                }
-            }
-
-            let _ = tx2.send(sample).await;
-        });
-    }
-
-    drop(tx);
-    let (mut e2e, mut feature, mut router, mut l1, mut l2, mut serialize, ok, err) =
-        collector.await?;
-
-    if ok == 0 {
-        println!("no successful samples collected (errors={err}, dropped={dropped})");
-        return Ok(());
-    }
-
-    // sort for percentiles
-    e2e.sort_unstable();
-    feature.sort_unstable();
-    router.sort_unstable();
-    l1.sort_unstable();
-    l2.sort_unstable();
-    serialize.sort_unstable();
-
-    let p50 = percentile(&e2e, 50.0);
-    let p95 = percentile(&e2e, 95.0);
-    let p99 = percentile(&e2e, 99.0);
-
-    let mut summary = Summary::default();
-    summary.samples_ok = ok;
-    summary.samples_err = err;
-    summary.dropped = dropped;
-    summary.p50 = p50;
-    summary.p95 = p95;
-    summary.p99 = p99;
-
-    summary.e2e_p99 = percentile(&e2e, 99.0);
-    summary.feature_p99 = percentile(&feature, 99.0);
-    summary.router_p99 = percentile(&router, 99.0);
-    summary.l1_p99 = percentile(&l1, 99.0);
-    summary.l2_p99 = percentile(&l2, 99.0);
-    summary.serialize_p99 = percentile(&serialize, 99.0);
-
-    if args.scrape_metrics {
-        if let Ok(resp) = client.get(&args.metrics_url).send().await {
-            if let Ok(text) = resp.text().await {
-                let (l2_trig, miss, skip, before_l2) = scrape_counters(&text);
-                summary.router_l2_trigger_total = l2_trig;
-                summary.router_deadline_miss_total = miss;
-                summary.router_l2_skipped_budget_total = skip;
-                summary.router_timeout_before_l2_total = before_l2;
-            }
+        // sweep 档位间暂停（最后一个不暂停）
+        if args.sweep_rps.is_some() && i + 1 < rps_list.len() && args.sweep_pause_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(args.sweep_pause_ms)).await;
         }
     }
-
-    // print
-    println!(
-        "ok_samples={} err_samples={} dropped={}  p50={}us  p95={}us  p99={}us  (target p99<=10000us)",
-        summary.samples_ok, summary.samples_err, summary.dropped, summary.p50, summary.p95, summary.p99
-    );
-    println!(
-        "stage_p99(us): feature={} router={} l1={} l2={} serialize={}",
-        summary.feature_p99,
-        summary.router_p99,
-        summary.l1_p99,
-        summary.l2_p99,
-        summary.serialize_p99
-    );
-
-    // write CSV summary row (append)
-    write_csv_row(&out_path, &args, &summary)?;
 
     Ok(())
 }
@@ -347,6 +224,175 @@ fn gen_req(rng: &mut StdRng) -> ScoreRequest {
     }
 }
 
+fn parse_rps_list(s: &str) -> anyhow::Result<Vec<u64>> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let v: u64 = t
+            .parse()
+            .with_context(|| format!("invalid rps in --sweep-rps: {t}"))?;
+        if v == 0 {
+            continue;
+        }
+        out.push(v);
+    }
+    anyhow::ensure!(!out.is_empty(), "--sweep-rps parsed to empty list");
+    Ok(out)
+}
+
+async fn run_once(args: &Args, rps: u64) -> anyhow::Result<Summary> {
+    // 每次 run 独立 client，避免跨档位复用连接造成“状态污染”
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(args.concurrency)
+        .tcp_nodelay(true)
+        .build()?;
+
+    // channel for samples
+    let (tx, mut rx) = mpsc::channel::<Sample>(1_000_000);
+
+    // collector task: gather into vectors
+    let collector = tokio::spawn(async move {
+        let mut e2e = Vec::<u64>::with_capacity(200_000);
+        let mut feature = Vec::<u64>::with_capacity(200_000);
+        let mut router = Vec::<u64>::with_capacity(200_000);
+        let mut l1 = Vec::<u64>::with_capacity(200_000);
+        let mut l2 = Vec::<u64>::with_capacity(200_000);
+        let mut serialize = Vec::<u64>::with_capacity(200_000);
+
+        let mut ok = 0usize;
+        let mut err = 0usize;
+
+        while let Some(s) = rx.recv().await {
+            if s.ok {
+                ok += 1;
+                e2e.push(s.e2e_us);
+                feature.push(s.feature_us);
+                router.push(s.router_us);
+                l1.push(s.l1_us);
+                l2.push(s.l2_us);
+                serialize.push(s.serialize_us);
+            } else {
+                err += 1;
+            }
+        }
+
+        (e2e, feature, router, l1, l2, serialize, ok, err)
+    });
+
+    let start = Instant::now();
+    let end = start + Duration::from_secs(args.duration);
+
+    // fixed-rate launcher（用传入的 rps）
+    let ns = (1_000_000_000u64 / rps.max(1)).max(1);
+    let interval = Duration::from_nanos(ns);
+    let mut tick = tokio::time::interval(interval);
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
+
+    // tracking
+    let mut dropped: u64 = 0;
+    let seed = 42u64;
+    static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    while Instant::now() < end {
+        tick.tick().await;
+
+        let permit = match sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                dropped += 1;
+                continue;
+            }
+        };
+
+        let tx2 = tx.clone();
+        let client2 = client.clone();
+        let url = args.url.clone();
+        let req_id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+
+        tokio::spawn(async move {
+            let _permit = permit;
+
+            let mut rng = StdRng::seed_from_u64(seed ^ req_id);
+            let req = gen_req(&mut rng);
+
+            let t0 = Instant::now();
+            let mut sample = Sample::default();
+
+            match client2.post(url).json(&req).send().await {
+                Ok(resp) => match resp.bytes().await {
+                    Ok(bytes) => {
+                        sample.e2e_us = t0.elapsed().as_micros() as u64;
+                        if let Ok(sr) = serde_json::from_slice::<ScoreResponse>(&bytes) {
+                            sample.feature_us = sr.timings_us.feature;
+                            sample.router_us = sr.timings_us.router;
+                            sample.l1_us = sr.timings_us.l1;
+                            sample.l2_us = sr.timings_us.l2;
+                            sample.serialize_us = sr.timings_us.serialize;
+                            sample.ok = true;
+                        } else {
+                            sample.ok = false;
+                        }
+                    }
+                    Err(_) => sample.ok = false,
+                },
+                Err(_) => sample.ok = false,
+            }
+
+            let _ = tx2.send(sample).await;
+        });
+    }
+
+    drop(tx);
+
+    let (mut e2e, mut feature, mut router, mut l1, mut l2, mut serialize, ok, err) =
+        collector.await?;
+
+    let mut summary = Summary::default();
+    summary.samples_ok = ok;
+    summary.samples_err = err;
+    summary.dropped = dropped;
+
+    if ok > 0 {
+        // sort for percentiles
+        e2e.sort_unstable();
+        feature.sort_unstable();
+        router.sort_unstable();
+        l1.sort_unstable();
+        l2.sort_unstable();
+        serialize.sort_unstable();
+
+        summary.p50 = percentile(&e2e, 50.0);
+        summary.p95 = percentile(&e2e, 95.0);
+        summary.p99 = percentile(&e2e, 99.0);
+
+        summary.e2e_p99 = percentile(&e2e, 99.0);
+        summary.feature_p99 = percentile(&feature, 99.0);
+        summary.router_p99 = percentile(&router, 99.0);
+        summary.l1_p99 = percentile(&l1, 99.0);
+        summary.l2_p99 = percentile(&l2, 99.0);
+        summary.serialize_p99 = percentile(&serialize, 99.0);
+    }
+
+    if args.scrape_metrics {
+        if let Ok(resp) = client.get(&args.metrics_url).send().await {
+            if let Ok(text) = resp.text().await {
+                let (l2_trig, miss, skip, before_l2) = scrape_counters(&text);
+                summary.router_l2_trigger_total = l2_trig;
+                summary.router_deadline_miss_total = miss;
+                summary.router_l2_skipped_budget_total = skip;
+                summary.router_timeout_before_l2_total = before_l2;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
 fn current_time_ms() -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -354,7 +400,12 @@ fn current_time_ms() -> i64 {
     now.as_millis() as i64
 }
 
-fn write_csv_row(out_path: &PathBuf, args: &Args, s: &Summary) -> anyhow::Result<()> {
+fn write_csv_row(
+    out_path: &PathBuf,
+    args: &Args,
+    rps_used: u64,
+    s: &Summary,
+) -> anyhow::Result<()> {
     let need_header = !out_path.exists();
 
     let mut f = OpenOptions::new()
@@ -376,7 +427,7 @@ fn write_csv_row(out_path: &PathBuf, args: &Args, s: &Summary) -> anyhow::Result
         "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         ts_ms,
         escape_csv(&args.url),
-        args.rps,
+        rps_used,
         args.duration,
         args.concurrency,
         s.samples_ok,
