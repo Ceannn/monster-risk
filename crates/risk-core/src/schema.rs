@@ -1,3 +1,4 @@
+// crates/risk-core/src/schema.rs
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -40,6 +41,7 @@ pub enum Decision {
     Allow,
     ManualReview,
     Deny,
+    /// 超时/预算不足时的“保守降级”：为了不误杀，直接放行
     DegradeAllow,
 }
 
@@ -48,7 +50,7 @@ pub struct ReasonItem {
     pub signal: String,
     pub value: f64,
     pub baseline_p95: f64,
-    pub direction: String, // "risk_up" / "risk_down"
+    pub direction: String, // "risk_up" / "risk_down" / "info"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

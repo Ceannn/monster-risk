@@ -61,3 +61,9 @@ impl Default for Models {
         Self { l1, l2 }
     }
 }
+
+impl Models {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}

@@ -17,3 +17,18 @@ Thumbs.db
 .vscode/
 .env
 .env.*
+
+/data/
+/models/
+*.zip
+*.diff
+
+# datasets & artifacts
+data/
+datasets/
+*.parquet
+
+*.tsv
+# local runtime
+results/
+target/

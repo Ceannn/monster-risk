@@ -15,3 +15,5 @@ metrics = "0.23"
 metrics-exporter-prometheus = "0.15"
 tower-http = { version = "0.6", features = ["trace"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }

@@ -1790,13 +1790,16 @@ dependencies = [
 name = "risk-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "dashmap",
+ "flate2",
  "metrics",
  "once_cell",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "uuid",
+ "xgb_ffi",
 ]
 
 [[package]]
@@ -1819,7 +1822,9 @@ dependencies = [
 name = "risk-server-tokio"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "clap",
  "metrics",
  "metrics-exporter-prometheus",
  "risk-core",
@@ -2896,6 +2901,13 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "xgb_ffi"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "yoke"
