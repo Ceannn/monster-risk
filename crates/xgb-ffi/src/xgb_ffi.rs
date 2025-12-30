@@ -29,6 +29,9 @@ extern "C" {
 
     fn XGBoosterFree(handle: BoosterHandle) -> c_int;
 
+    fn XGBoosterSetParam(handle: BoosterHandle, name: *const c_char, value: *const c_char)
+        -> c_int;
+
     fn XGBoosterLoadModel(handle: BoosterHandle, fname: *const c_char) -> c_int;
 
     fn XGBoosterPredictFromDMatrix(
@@ -151,6 +154,19 @@ impl Booster {
         self.handle
     }
 
+    /// ✅ 新增：设置 Booster 参数（比如 nthread=1）
+    pub fn set_param(&self, key: &str, val: &str) -> Result<(), String> {
+        let k = CString::new(key).map_err(|e| format!("CString param key '{key}': {e}"))?;
+        let v = CString::new(val).map_err(|e| format!("CString param val '{val}': {e}"))?;
+        unsafe {
+            xgb_check(
+                XGBoosterSetParam(self.handle, k.as_ptr(), v.as_ptr()),
+                "XGBoosterSetParam",
+            )?
+        };
+        Ok(())
+    }
+
     fn predict_from_dmatrix(
         &self,
         dmat: &DMatrix,
@@ -175,28 +191,31 @@ impl Booster {
                 "XGBoosterPredictFromDMatrix",
             )?;
 
-            if out_dim == 0 || out_shape_ptr.is_null() || out_result_ptr.is_null() {
-                return Err(format!(
-                    "predict: got null output (out_dim={out_dim}, out_shape_ptr={:?}, out_result_ptr={:?})",
-                    out_shape_ptr, out_result_ptr
-                ));
-            }
+            let shape = if out_dim == 0 || out_shape_ptr.is_null() {
+                vec![]
+            } else {
+                std::slice::from_raw_parts(out_shape_ptr, out_dim as usize)
+                    .iter()
+                    .map(|&x| x as usize)
+                    .collect::<Vec<_>>()
+            };
 
-            // ⚠️ 关键：shape/result 都是 XGBoost 内部指针，只能“立刻拷贝”，不能接管所有权
-            let shape_u64 = std::slice::from_raw_parts(out_shape_ptr, out_dim as usize);
-            let shape: Vec<usize> = shape_u64.iter().map(|&x| x as usize).collect();
+            let out_len = if shape.is_empty() {
+                0
+            } else {
+                shape.iter().product::<usize>()
+            };
+            let values = if out_len == 0 || out_result_ptr.is_null() {
+                vec![]
+            } else {
+                std::slice::from_raw_parts(out_result_ptr, out_len).to_vec()
+            };
 
-            let out_len: usize = shape.iter().copied().product();
-            let vals = std::slice::from_raw_parts(out_result_ptr, out_len).to_vec();
-
-            Ok(PredictOutput {
-                values: vals,
-                shape,
-            })
+            Ok(PredictOutput { values, shape })
         }
     }
 
-    /// type=0: normal prediction
+    /// type=0: normal prediction (probability)
     pub fn predict_proba_dense_1row(&self, row: &[f32]) -> Result<f32, String> {
         let dmat = DMatrix::from_dense(row, 1, row.len(), f32::NAN)?;
         // XGBoost 3.x 要求 iteration_begin / iteration_end 必须给
@@ -217,7 +236,9 @@ impl Drop for Booster {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             unsafe {
-                //let _ = XGBoosterFree(self.handle);
+                // 如果你确定不会踩 xgboost 的 unload/多线程坑，可以打开
+                // let _ = XGBoosterFree(self.handle);
+                let _ = XGBoosterFree(self.handle);
             }
             self.handle = ptr::null_mut();
         }

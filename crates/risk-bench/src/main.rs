@@ -1,4 +1,5 @@
 use anyhow::Context;
+use bytes::Bytes;
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -11,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -20,6 +22,10 @@ struct Args {
     /// Prometheus 文本暴露端点（可选；用于写入路由/降级计数器）
     #[arg(long, default_value = "http://127.0.0.1:8080/metrics")]
     metrics_url: String,
+
+    /// 当目标 URL 包含 /score_xgb 时使用的 JSON 请求体文件（默认 {}）
+    #[arg(long)]
+    xgb_body_file: Option<String>,
 
     #[arg(long, default_value_t = 1000)]
     rps: u64,
@@ -47,8 +53,8 @@ struct Args {
     sweep_pause_ms: u64,
 
     /// 目标列表：可重复传参
-    /// 用法：--target tokio,http://127.0.0.1:8080/score,http://127.0.0.1:8080/metrics
-    ///      --target glommio,http://127.0.0.1:8081/score,http://127.0.0.1:8081/metrics
+    /// 用法：--target tokio,http://127.0.0.1:8080/score_xgb,http://127.0.0.1:8080/metrics
+    ///      --target glommio,http://127.0.0.1:8081/score_xgb,http://127.0.0.1:8081/metrics
     #[arg(long, value_name = "NAME,SCORE_URL,METRICS_URL")]
     target: Vec<String>,
 
@@ -81,31 +87,6 @@ struct Target {
     metrics_url: String,
 }
 
-fn parse_targets(args: &Args) -> anyhow::Result<Vec<Target>> {
-    if args.target.is_empty() {
-        return Ok(vec![Target {
-            runtime: "default".to_string(),
-            url: args.url.clone(),
-            metrics_url: args.metrics_url.clone(),
-        }]);
-    }
-
-    let mut out = Vec::new();
-    for t in &args.target {
-        let parts: Vec<&str> = t.split(',').map(|x| x.trim()).collect();
-        anyhow::ensure!(
-            parts.len() == 3,
-            "invalid --target format: {t} (expect NAME,SCORE_URL,METRICS_URL)"
-        );
-        out.push(Target {
-            runtime: parts[0].to_string(),
-            url: parts[1].to_string(),
-            metrics_url: parts[2].to_string(),
-        });
-    }
-    Ok(out)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScoreRequest {
     trace_id: Option<String>,
@@ -123,13 +104,19 @@ struct ScoreRequest {
     is_3ds: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TimingsUs {
+    #[serde(default)]
     parse: u64,
+    #[serde(default)]
     feature: u64,
+    #[serde(default)]
     router: u64,
-    l1: u64,
+    #[serde(default, alias = "l1")]
+    xgb: u64,
+    #[serde(default)]
     l2: u64,
+    #[serde(default)]
     serialize: u64,
 }
 
@@ -147,13 +134,14 @@ struct Sample {
     e2e_us: u64,
 
     // server stage breakdown
+    parse_us: u64,
     feature_us: u64,
     router_us: u64,
-    l1_us: u64,
+    xgb_us: u64,
     l2_us: u64,
     serialize_us: u64,
 
-    // NEW: bench side schedule lag
+    // bench side schedule lag (actual - planned)
     bench_lag_us: u64,
 
     ok: bool,
@@ -169,16 +157,17 @@ struct Summary {
     p95: u64,
     p99: u64,
 
-    // NEW: bench-side lag stats
+    // bench-side lag stats
     bench_lag_p99_us: u64,
     bench_lag_max_us: u64,
     missed_ticks_total: u64,
 
-    // stage p99（你可以在论文里直接对比 Tokio vs Glommio 的 stage 尾巴）
+    // stage p99
     e2e_p99: u64,
+    parse_p99: u64,
     feature_p99: u64,
     router_p99: u64,
-    l1_p99: u64,
+    xgb_p99: u64,
     l2_p99: u64,
     serialize_p99: u64,
 
@@ -200,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let targets = parse_targets(&args)?;
+    let xgb_body = load_xgb_body(&args)?;
 
     // 生成 rps 序列
     let rps_list: Vec<u64> = if args.find_knee {
@@ -227,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
         let mut knee_reasons: Vec<String> = Vec::new();
 
         for t in &targets {
-            let summary = run_once(&args, rps, &t.url, &t.metrics_url).await?;
+            let summary = run_once(&args, rps, &t.url, &t.metrics_url, &xgb_body).await?;
 
             if summary.samples_ok == 0 {
                 println!(
@@ -247,12 +237,13 @@ async fn main() -> anyhow::Result<()> {
                     summary.p99
                 );
                 println!(
-                    "[runtime={} rps={}] stage_p99(us): feature={} router={} l1={} l2={} serialize={}",
+                    "[runtime={} rps={}] stage_p99(us): parse={} feature={} router={} xgb={} l2={} serialize={}",
                     t.runtime,
                     rps,
+                    summary.parse_p99,
                     summary.feature_p99,
                     summary.router_p99,
-                    summary.l1_p99,
+                    summary.xgb_p99,
                     summary.l2_p99,
                     summary.serialize_p99
                 );
@@ -284,18 +275,13 @@ async fn main() -> anyhow::Result<()> {
                         "{}: dropped>0 ({} drops)",
                         t.runtime, summary.dropped
                     ));
-                } else if summary.samples_ok > 0 {
+                } else {
                     let last = *prev_p99.get(&t.runtime).unwrap_or(&0);
-
                     if last > 0 {
-                        // 相对阈值
                         let threshold_rel =
                             (last as f64 * (1.0 + args.knee_rise_pct)).round() as u64;
-
-                        // 绝对阈值（需要你在 Args 里新增：knee_abs_us: u64，建议 default=200）
                         let threshold_abs = last.saturating_add(args.knee_abs_us);
 
-                        // 同时满足相对和绝对门槛才算“明显上扬”
                         if summary.p99 > threshold_rel && summary.p99 > threshold_abs {
                             knee_reasons.push(format!(
                                 "{}: p99 jump {}us -> {}us (> {}us and > {}us, +{:.0}%)",
@@ -345,45 +331,6 @@ fn percentile(sorted_us: &[u64], p: f64) -> u64 {
     sorted_us[rank.min(n - 1)]
 }
 
-fn gen_req(rng: &mut StdRng) -> ScoreRequest {
-    let user = rng.gen_range(1..=10_000);
-    let card = rng.gen_range(1..=50_000);
-    let merch = rng.gen_range(1..=2_000);
-    let mccs = [5411, 5732, 7995, 6011, 4812, 4829, 5311];
-    let mcc = mccs[rng.gen_range(0..mccs.len())];
-
-    let amount = (rng.gen::<f64>().powf(3.0) * 20000.0).max(1.0); // heavy tail
-    let country = if rng.gen::<f64>() < 0.92 { "JP" } else { "US" };
-    let channel = if rng.gen::<f64>() < 0.7 {
-        "ecom"
-    } else {
-        "pos"
-    };
-    let is_3ds = rng.gen::<f64>() < 0.6;
-
-    let now_ms = current_time_ms();
-
-    ScoreRequest {
-        trace_id: None,
-        event_time_ms: now_ms,
-        user_id: format!("u_{user}"),
-        card_id: format!("c_{card}"),
-        merchant_id: format!("m_{merch}"),
-        mcc,
-        amount,
-        currency: "JPY".into(),
-        country: country.into(),
-        channel: channel.into(),
-        device_id: format!("d_{}", rng.gen_range(1..=2000)),
-        ip_prefix: if rng.gen::<f64>() < 0.02 {
-            "198.51.100".into()
-        } else {
-            "203.0.113".into()
-        },
-        is_3ds,
-    }
-}
-
 fn parse_rps_list(s: &str) -> anyhow::Result<Vec<u64>> {
     let mut out = Vec::new();
     for part in s.split(',') {
@@ -403,36 +350,223 @@ fn parse_rps_list(s: &str) -> anyhow::Result<Vec<u64>> {
     Ok(out)
 }
 
-async fn run_once(args: &Args, rps: u64, url: &str, metrics_url: &str) -> anyhow::Result<Summary> {
+fn parse_targets(args: &Args) -> anyhow::Result<Vec<Target>> {
+    if args.target.is_empty() {
+        return Ok(vec![Target {
+            runtime: "default".to_string(),
+            url: args.url.clone(),
+            metrics_url: args.metrics_url.clone(),
+        }]);
+    }
+
+    let mut out = Vec::new();
+    for t in &args.target {
+        let parts: Vec<&str> = t.split(',').map(|x| x.trim()).collect();
+        anyhow::ensure!(
+            parts.len() == 3,
+            "invalid --target format: {t} (expect NAME,SCORE_URL,METRICS_URL)"
+        );
+        out.push(Target {
+            runtime: parts[0].to_string(),
+            url: parts[1].to_string(),
+            metrics_url: parts[2].to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn load_xgb_body(args: &Args) -> anyhow::Result<Bytes> {
+    if let Some(p) = &args.xgb_body_file {
+        let b = std::fs::read(p).with_context(|| format!("read --xgb-body-file: {}", p))?;
+        Ok(Bytes::from(b))
+    } else {
+        Ok(Bytes::from_static(b"{}"))
+    }
+}
+
+fn gen_req(rng: &mut StdRng) -> ScoreRequest {
+    let user = rng.gen_range(1..=10_000);
+    let card = rng.gen_range(1..=50_000);
+    let merch = rng.gen_range(1..=2_000);
+    let mccs = [5411, 5732, 7995, 6011, 4812, 4829, 5311];
+    let mcc = mccs[rng.gen_range(0..mccs.len())];
+
+    let amount = (rng.gen::<f64>().powf(3.0) * 20000.0).max(1.0); // heavy tail
+    let country = if rng.gen::<f64>() < 0.92 { "JP" } else { "US" };
+    let channel = if rng.gen::<f64>() < 0.7 {
+        "ecom"
+    } else {
+        "pos"
+    };
+    let is_3ds = rng.gen::<f64>() < 0.6;
+
+    ScoreRequest {
+        trace_id: None,
+        event_time_ms: current_time_ms(),
+        user_id: format!("u_{}", user),
+        card_id: format!("c_{}", card),
+        merchant_id: format!("m_{}", merch),
+        mcc,
+        amount,
+        currency: "JPY".into(),
+        country: country.into(),
+        channel: channel.into(),
+        device_id: format!("d_{}", rng.gen_range(1..=2000)),
+        ip_prefix: if rng.gen::<f64>() < 0.02 {
+            "198.51.100".into()
+        } else {
+            "203.0.113".into()
+        },
+        is_3ds,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Job {
+    req_id: u64,
+    bench_lag_us: u64,
+}
+
+static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+async fn run_once(
+    args: &Args,
+    rps: u64,
+    url: &str,
+    metrics_url: &str,
+    xgb_body: &Bytes,
+) -> anyhow::Result<Summary> {
     // 每次 run 独立 client，避免跨档位复用连接造成“状态污染”
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(args.concurrency)
+        .pool_max_idle_per_host(args.concurrency.max(1))
         .tcp_nodelay(true)
         .build()?;
 
-    // channel for samples
-    let (tx, mut rx) = mpsc::channel::<Sample>(1_000_000);
+    let is_xgb = url.contains("/score_xgb");
 
-    // collector task: gather into vectors
+    // ───────────────────────────────────────────────────────────────────────────
+    // 核心改造点：
+    // - 不再 “每请求 tokio::spawn”；
+    // - 改为：N=concurrency 个常驻 worker（每个 worker 串行处理请求 => 天然并发上限）
+    // - 每个 worker 有自己的有界队列：满了就算 dropped（含服务端 429 也计入 dropped）
+    // ───────────────────────────────────────────────────────────────────────────
+
+    let workers = args.concurrency.max(1);
+    let per_worker_q = 8usize; // 小缓冲，减少抖动，但仍然保持 open-loop 的“过载就丢”
+    let (sample_tx, mut sample_rx) = mpsc::channel::<Sample>((workers * 8).max(1024));
+
+    // dropped = 本地塞不进队列 + 服务端 429（都算过载）
+    let dropped_local = Arc::new(AtomicU64::new(0));
+    let dropped_429 = Arc::new(AtomicU64::new(0));
+
+    // worker tx list
+    let mut job_txs = Vec::with_capacity(workers);
+    let mut handles = Vec::with_capacity(workers);
+
+    let url_s = url.to_string();
+    let xgb_body = xgb_body.clone();
+
+    for wid in 0..workers {
+        let (tx, mut rx) = mpsc::channel::<Job>(per_worker_q);
+        job_txs.push(tx);
+
+        let client2 = client.clone();
+        let url2 = url_s.clone();
+        let sample_tx2 = sample_tx.clone();
+        let dropped_429_2 = dropped_429.clone();
+        let is_xgb2 = is_xgb;
+        let xgb_body2 = xgb_body.clone();
+
+        let handle = tokio::spawn(async move {
+            let seed = 42u64 ^ (wid as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            while let Some(job) = rx.recv().await {
+                let t0 = Instant::now();
+
+                let send_res = if is_xgb2 {
+                    client2
+                        .post(&url2)
+                        .header("content-type", "application/json")
+                        .body(xgb_body2.clone())
+                        .send()
+                        .await
+                } else {
+                    let mut rng = StdRng::seed_from_u64(seed ^ job.req_id);
+                    let req = gen_req(&mut rng);
+                    client2.post(&url2).json(&req).send().await
+                };
+
+                let mut sample = Sample::default();
+                sample.bench_lag_us = job.bench_lag_us;
+                sample.e2e_us = t0.elapsed().as_micros() as u64;
+
+                match send_res {
+                    Ok(resp) => {
+                        // 429：当作 dropped（过载），不计入 err_samples
+                        if resp.status().as_u16() == 429 {
+                            dropped_429_2.fetch_add(1, Ordering::Relaxed);
+                            let _ = resp.bytes().await;
+                            continue;
+                        }
+
+                        if !resp.status().is_success() {
+                            let _ = resp.bytes().await;
+                            sample.ok = false;
+                        } else {
+                            match resp.bytes().await {
+                                Ok(bytes) => {
+                                    if let Ok(sr) = serde_json::from_slice::<ScoreResponse>(&bytes)
+                                    {
+                                        sample.parse_us = sr.timings_us.parse;
+                                        sample.feature_us = sr.timings_us.feature;
+                                        sample.router_us = sr.timings_us.router;
+                                        sample.xgb_us = sr.timings_us.xgb;
+                                        sample.l2_us = sr.timings_us.l2;
+                                        sample.serialize_us = sr.timings_us.serialize;
+                                        sample.ok = true;
+                                    } else {
+                                        sample.ok = false;
+                                    }
+                                }
+                                Err(_) => sample.ok = false,
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        sample.ok = false;
+                    }
+                }
+
+                let _ = sample_tx2.send(sample).await;
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    drop(sample_tx);
+
+    // collector task：持续 drain samples，避免 sample channel 堵住 worker
     let collector = tokio::spawn(async move {
         let mut e2e = Vec::<u64>::with_capacity(200_000);
+        let mut parse = Vec::<u64>::with_capacity(200_000);
         let mut feature = Vec::<u64>::with_capacity(200_000);
         let mut router = Vec::<u64>::with_capacity(200_000);
-        let mut l1 = Vec::<u64>::with_capacity(200_000);
+        let mut xgb = Vec::<u64>::with_capacity(200_000);
         let mut l2 = Vec::<u64>::with_capacity(200_000);
         let mut serialize = Vec::<u64>::with_capacity(200_000);
 
         let mut ok = 0usize;
         let mut err = 0usize;
 
-        while let Some(s) = rx.recv().await {
+        while let Some(s) = sample_rx.recv().await {
             if s.ok {
                 ok += 1;
                 e2e.push(s.e2e_us);
+                parse.push(s.parse_us);
                 feature.push(s.feature_us);
                 router.push(s.router_us);
-                l1.push(s.l1_us);
+                xgb.push(s.xgb_us);
                 l2.push(s.l2_us);
                 serialize.push(s.serialize_us);
             } else {
@@ -440,41 +574,28 @@ async fn run_once(args: &Args, rps: u64, url: &str, metrics_url: &str) -> anyhow
             }
         }
 
-        (e2e, feature, router, l1, l2, serialize, ok, err)
+        (e2e, parse, feature, router, xgb, l2, serialize, ok, err)
     });
 
-    let start = Instant::now();
-    let end = start + Duration::from_secs(args.duration);
-
-    // fixed-rate launcher（用传入的 rps）
-    // 关键：禁止 interval “追赶补发”(burst)。我们用 interval_at + Delay：
-    // - 错过 tick 不会补发，只会整体往后平移，更接近真正的 open-loop 固定速率压测。
-    let ns = (1_000_000_000u64 / rps.max(1)).max(1);
-    let interval = Duration::from_nanos(ns);
-
+    // fixed-rate launcher（open-loop）
+    let interval = Duration::from_nanos((1_000_000_000u64 / rps.max(1)).max(1));
     let first_tick = tokio::time::Instant::now() + interval;
     let mut tick = tokio::time::interval_at(first_tick, interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // bench 侧“发包滞后”统计：actual - planned
+    let start = tokio::time::Instant::now();
+    let end = start + Duration::from_secs(args.duration);
+
     let interval_ns: u128 = interval.as_nanos().max(1);
     let mut seq: u64 = 0;
-    let mut bench_lag_us_vec: Vec<u64> = Vec::with_capacity(
-        ((args.duration as usize).saturating_mul(rps as usize)).min(2_000_000),
-    );
+
+    let mut bench_lag_us_vec: Vec<u64> =
+        Vec::with_capacity(((args.duration as usize).saturating_mul(rps as usize)).min(2_000_000));
     let mut missed_ticks_total: u64 = 0;
 
-    let sem = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
-
-    // tracking
-    let mut dropped: u64 = 0;
-    let seed = 42u64;
-    static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
-
-    while Instant::now() < end {
+    while tokio::time::Instant::now() < end {
         tick.tick().await;
 
-        // 计算本次 tick 的“理论时间点” planned，并记录 lag（实际开始 - planned）
         let off_ns: u128 = interval_ns.saturating_mul(seq as u128);
         let off_ns_u64: u64 = off_ns.min(u64::MAX as u128) as u64;
         let planned = first_tick + Duration::from_nanos(off_ns_u64);
@@ -484,82 +605,49 @@ async fn run_once(args: &Args, rps: u64, url: &str, metrics_url: &str) -> anyhow
         let lag_us: u64 = lag.as_micros() as u64;
         bench_lag_us_vec.push(lag_us);
 
-        // 粗略估计“落后了多少个 tick”
         if lag.as_nanos() > interval_ns {
             missed_ticks_total += (lag.as_nanos() / interval_ns) as u64;
         }
 
         seq = seq.wrapping_add(1);
 
-        let permit = match sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                dropped += 1;
-                continue;
-            }
+        let req_id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+        let job = Job {
+            req_id,
+            bench_lag_us: lag_us,
         };
 
-        let tx2 = tx.clone();
-        let client2 = client.clone();
-        let url = url.to_string();
-        let req_id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
-
-        tokio::spawn(async move {
-            let _permit = permit;
-
-            let mut rng = StdRng::seed_from_u64(seed ^ req_id);
-            let req = gen_req(&mut rng);
-
-            let t0 = Instant::now();
-            let mut sample = Sample::default();
-            sample.bench_lag_us = lag_us;
-
-            match client2.post(url).json(&req).send().await {
-                Ok(resp) => match resp.bytes().await {
-                    Ok(bytes) => {
-                        sample.e2e_us = t0.elapsed().as_micros() as u64;
-                        if let Ok(sr) = serde_json::from_slice::<ScoreResponse>(&bytes) {
-                            sample.feature_us = sr.timings_us.feature;
-                            sample.router_us = sr.timings_us.router;
-                            sample.l1_us = sr.timings_us.l1;
-                            sample.l2_us = sr.timings_us.l2;
-                            sample.serialize_us = sr.timings_us.serialize;
-                            sample.ok = true;
-                        } else {
-                            sample.ok = false;
-                        }
-                    }
-                    Err(_) => sample.ok = false,
-                },
-                Err(_) => sample.ok = false,
-            }
-
-            let _ = tx2.send(sample).await;
-        });
+        let wid = (req_id as usize) % workers;
+        if job_txs[wid].try_send(job).is_err() {
+            dropped_local.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    drop(tx);
+    drop(job_txs);
 
-    let (mut e2e, mut feature, mut router, mut l1, mut l2, mut serialize, ok, err) =
+    for h in handles {
+        let _ = h.await;
+    }
+
+    let (mut e2e, mut parse, mut feature, mut router, mut xgb, mut l2, mut serialize, ok, err) =
         collector.await?;
 
     let mut summary = Summary::default();
     summary.samples_ok = ok;
     summary.samples_err = err;
-    summary.dropped = dropped;
+    summary.dropped = dropped_local.load(Ordering::Relaxed) + dropped_429.load(Ordering::Relaxed);
 
-    // bench 侧滞后统计（包含 dropped 的 tick）
     bench_lag_us_vec.sort_unstable();
     summary.bench_lag_p99_us = percentile(&bench_lag_us_vec, 99.0);
     summary.bench_lag_max_us = *bench_lag_us_vec.last().unwrap_or(&0);
     summary.missed_ticks_total = missed_ticks_total;
 
     if ok > 0 {
-        // sort for percentiles
         e2e.sort_unstable();
+        parse.sort_unstable();
         feature.sort_unstable();
         router.sort_unstable();
-        l1.sort_unstable();
+        xgb.sort_unstable();
         l2.sort_unstable();
         serialize.sort_unstable();
 
@@ -567,10 +655,11 @@ async fn run_once(args: &Args, rps: u64, url: &str, metrics_url: &str) -> anyhow
         summary.p95 = percentile(&e2e, 95.0);
         summary.p99 = percentile(&e2e, 99.0);
 
-        summary.e2e_p99 = percentile(&e2e, 99.0);
+        summary.e2e_p99 = summary.p99;
+        summary.parse_p99 = percentile(&parse, 99.0);
         summary.feature_p99 = percentile(&feature, 99.0);
         summary.router_p99 = percentile(&router, 99.0);
-        summary.l1_p99 = percentile(&l1, 99.0);
+        summary.xgb_p99 = percentile(&xgb, 99.0);
         summary.l2_p99 = percentile(&l2, 99.0);
         summary.serialize_p99 = percentile(&serialize, 99.0);
     }
@@ -617,14 +706,14 @@ fn write_csv_row(
     if need_header {
         writeln!(
             f,
-            "ts_ms,runtime,url,metrics_url,rps,duration_s,concurrency,ok,err,dropped,p50_us,p95_us,p99_us,feature_p99_us,router_p99_us,l1_p99_us,l2_p99_us,serialize_p99_us,router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total,bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
+            "ts_ms,runtime,url,metrics_url,rps,duration_s,concurrency,ok_samples,err_samples,dropped,p50_us,p95_us,p99_us,parse_p99_us,feature_p99_us,router_p99_us,xgb_p99_us,l2_p99_us,serialize_p99_us,router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total,bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
         )?;
     }
 
     let ts_ms = current_time_ms();
     writeln!(
         f,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         ts_ms,
         escape_csv(runtime),
         escape_csv(url),
@@ -638,9 +727,10 @@ fn write_csv_row(
         s.p50,
         s.p95,
         s.p99,
+        s.parse_p99,
         s.feature_p99,
         s.router_p99,
-        s.l1_p99,
+        s.xgb_p99,
         s.l2_p99,
         s.serialize_p99,
         opt_f64(s.router_l2_trigger_total),
@@ -668,8 +758,6 @@ fn opt_f64(v: Option<f64>) -> String {
     v.map(|x| format!("{:.0}", x)).unwrap_or_default()
 }
 
-/// 从 Prometheus 文本格式中抓取几个关键 counter
-/// 从 Prometheus 文本格式中抓取几个关键 counter（无 regex 依赖）
 fn scrape_counters(text: &str) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
     let mut l2 = None;
     let mut miss = None;
@@ -682,16 +770,12 @@ fn scrape_counters(text: &str) -> (Option<f64>, Option<f64>, Option<f64>, Option
             continue;
         }
 
-        // 形如：metric_name 123
         let mut it = line.split_whitespace();
         let name = match it.next() {
             Some(x) => x,
             None => continue,
         };
-        let val = match it.next() {
-            Some(v) => v.parse::<f64>().ok(),
-            None => None,
-        };
+        let val = it.next().and_then(|x| x.parse::<f64>().ok());
         if val.is_none() {
             continue;
         }

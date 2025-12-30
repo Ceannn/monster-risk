@@ -68,7 +68,7 @@ pub struct TimingsUs {
     pub parse: u64,
     pub feature: u64,
     pub router: u64,
-    pub l1: u64,
+    pub xgb: u64,
     pub l2: u64,
     pub serialize: u64,
 }

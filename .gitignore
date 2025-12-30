@@ -32,3 +32,5 @@ datasets/
 # local runtime
 results/
 target/
+*.patch
+*.patch*

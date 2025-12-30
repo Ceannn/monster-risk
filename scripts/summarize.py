@@ -1,7 +1,6 @@
  import sys
  import pandas as pd
  import matplotlib.pyplot as plt
- from sklearn.metrics import roc_curve, precision_recall_curve
 
  path = sys.argv[1]
  df = pd.read_csv(path)

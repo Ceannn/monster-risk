@@ -1,9 +1,12 @@
+use clap::Parser;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use glommio::net::TcpListener;
 use glommio::{LocalExecutorBuilder, Placement};
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use risk_core::{config::Config, pipeline::AppCore, schema::ScoreRequest};
+
+use serde_json::{Map, Value};
 
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -14,8 +17,25 @@ struct AppState {
     prom: PrometheusHandle,
 }
 
-fn main() {
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Args {
+    /// 监听地址
+    #[arg(long, default_value = "127.0.0.1:8081")]
+    listen: String,
+
+    /// 可选：启用 XGB 在线推理（指向模型目录）
+    #[arg(long)]
+    model_dir: Option<String>,
+
+    /// 启动后预热次数（仅当启用 --model-dir 时生效；0=不预热）
+    #[arg(long, default_value_t = 100)]
+    warmup_iters: usize,
+}
+fn main() -> anyhow::Result<()> {
     // tracing
+
+    let args = Args::parse();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -28,15 +48,36 @@ fn main() {
     let prom = PrometheusBuilder::new()
         .install_recorder()
         .expect("failed to install prometheus recorder");
-
     let cfg = Config::default();
-    let core = Arc::new(AppCore::new(cfg));
+
+    let core = if let Some(dir) = args.model_dir.as_deref() {
+        tracing::info!("XGB enabled, loading model_dir={}", dir);
+        Arc::new(AppCore::new_with_xgb(cfg, dir)?)
+    } else {
+        tracing::info!("XGB disabled, baseline /score only");
+        Arc::new(AppCore::new(cfg))
+    };
+
     let state = AppState { core, prom };
 
     LocalExecutorBuilder::new(Placement::Unbound)
         .name("risk-glommio")
         .spawn(move || async move {
-            let addr = "127.0.0.1:8081";
+            let addr = args.listen.as_str();
+            if args.model_dir.is_some() && args.warmup_iters > 0 {
+                let t = std::time::Instant::now();
+                tracing::info!("warmup_xgb start iters={}", args.warmup_iters);
+                match state.core.warmup_xgb(args.warmup_iters) {
+                    Ok(()) => {
+                        tracing::info!("warmup_xgb done cost={}ms", t.elapsed().as_millis());
+                    }
+                    Err(e) => {
+                        tracing::error!("warmup_xgb failed: {:#}", e);
+                        return;
+                    }
+                }
+            }
+
             let listener = TcpListener::bind(addr).expect("bind failed");
             tracing::info!("risk-server-glommio listening on http://{}", addr);
 
@@ -63,6 +104,8 @@ fn main() {
         .unwrap()
         .join()
         .unwrap();
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +190,44 @@ async fn handle_conn(mut stream: glommio::net::TcpStream, st: AppState) -> anyho
             let resp = st.core.score(req);
             let out = serde_json::to_vec(&resp)?;
             write_http(&mut stream, 200, "application/json", &out).await?;
+        } else if meta.method == "POST" && meta.path == "/score_xgb" {
+            let t_parse = std::time::Instant::now();
+
+            let v: Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = format!("invalid json body: {}", e);
+                    write_http(&mut stream, 400, "text/plain", msg.as_bytes()).await?;
+                    continue;
+                }
+            };
+
+            let parse_us: u64 = t_parse.elapsed().as_micros() as u64;
+
+            let obj = match v {
+                Value::Object(m) => {
+                    if let Some(Value::Object(features)) = m.get("features") {
+                        features.clone()
+                    } else {
+                        m
+                    }
+                }
+                _ => {
+                    write_http(&mut stream, 400, "text/plain", b"expected json object").await?;
+                    continue;
+                }
+            };
+
+            match st.core.score_xgb(parse_us, &obj) {
+                Ok(resp) => {
+                    let out = serde_json::to_vec(&resp)?;
+                    write_http(&mut stream, 200, "application/json", &out).await?;
+                }
+                Err(e) => {
+                    let msg = format!("score_xgb failed: {:#}", e);
+                    write_http(&mut stream, 500, "text/plain", msg.as_bytes()).await?;
+                }
+            }
         } else if meta.method == "GET" && meta.path == "/metrics" {
             let text = st.prom.render();
             write_http(
@@ -225,7 +306,9 @@ async fn write_http(
 ) -> anyhow::Result<()> {
     let status = match code {
         200 => "OK",
+        400 => "Bad Request",
         404 => "Not Found",
+        500 => "Internal Server Error",
         _ => "OK",
     };
     let header = format!(

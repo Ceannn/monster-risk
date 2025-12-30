@@ -13,6 +13,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.23"
 metrics-exporter-prometheus = "0.15"
+tower = { version = "0.4", features = ["full"] } # 必须加 full，否则 limit/load_shed 还是找不到
 tower-http = { version = "0.6", features = ["trace"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"

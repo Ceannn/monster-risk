@@ -4,4 +4,5 @@ pub mod model;
 pub mod pipeline;
 pub mod schema;
 pub mod util;
+pub mod xgb_pool;
 pub mod xgb_runtime;
