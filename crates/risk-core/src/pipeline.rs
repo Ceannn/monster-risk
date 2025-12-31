@@ -158,7 +158,6 @@ impl AppCore {
                             let c = c as f64;
                             reasons.push(ReasonItem {
                                 signal: name,
-                                value: c,
                                 baseline_p95: 0.0,
                                 direction: if c >= 0.0 {
                                     "risk_up".into()
@@ -273,7 +272,6 @@ impl AppCore {
                         let c = c as f64;
                         reasons.push(ReasonItem {
                             signal: name,
-                            value: c,
                             baseline_p95: 0.0,
                             direction: if c >= 0.0 {
                                 "risk_up".into()
@@ -375,7 +373,6 @@ impl AppCore {
         if used_l2 {
             reason.push(ReasonItem {
                 signal: "layer2_used".into(),
-                value: 1.0,
                 baseline_p95: 1.0,
                 direction: "info".into(),
             });
@@ -458,7 +455,6 @@ impl AppCore {
         let amount_log = get("amount_log");
         out.push(ReasonItem {
             signal: "amount_log".into(),
-            value: amount_log,
             baseline_p95: 6.5,
             direction: (if amount_log > 6.5 {
                 "risk_up"
@@ -471,7 +467,6 @@ impl AppCore {
         let v60 = get("velocity_60s");
         out.push(ReasonItem {
             signal: "velocity_60s".into(),
-            value: v60,
             baseline_p95: 4.0,
             direction: (if v60 > 4.0 { "risk_up" } else { "risk_down" }).into(),
         });
@@ -479,7 +474,6 @@ impl AppCore {
         let foreign = get("is_foreign");
         out.push(ReasonItem {
             signal: "is_foreign".into(),
-            value: foreign,
             baseline_p95: 1.0,
             direction: (if foreign > 0.5 {
                 "risk_up"
@@ -492,7 +486,6 @@ impl AppCore {
         let mcc = get("mcc_risk");
         out.push(ReasonItem {
             signal: "mcc_risk".into(),
-            value: mcc,
             baseline_p95: 0.8,
             direction: (if mcc > 0.8 { "risk_up" } else { "risk_down" }).into(),
         });

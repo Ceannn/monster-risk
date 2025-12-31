@@ -18,3 +18,6 @@ xgb_ffi = { path = "../xgb-ffi" }
 crossbeam-channel = "0.5"
 futures-channel = "0.3"
 core_affinity = "0.8"
+tokio = "1"
+libc = "0.2"
+#xgb-ffi = { path = "../xgb-ffi" }

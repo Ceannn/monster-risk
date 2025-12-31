@@ -6,3 +6,4 @@ build = "build.rs"
 
 [dependencies]
 libc = "0.2"
+anyhow = "1"

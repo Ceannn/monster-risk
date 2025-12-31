@@ -33,6 +33,7 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     duration: u64,
 
+    /// 这里我们将 concurrency 解释为“bench 侧常驻 sender worker 数”（也等价于最大 in-flight）
     #[arg(long, default_value_t = 200)]
     concurrency: usize,
 
@@ -178,6 +179,12 @@ struct Summary {
     router_timeout_before_l2_total: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+struct Job {
+    req_id: u64,
+    bench_lag_us: u64,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -213,7 +220,6 @@ async fn main() -> anyhow::Result<()> {
     let mut prev_p99: HashMap<String, u64> = HashMap::new();
 
     for (i, rps) in rps_list.iter().copied().enumerate() {
-        // 收集所有 runtime 的 knee 触发原因（避免被最后一个覆盖）
         let mut knee_reasons: Vec<String> = Vec::new();
 
         for t in &targets {
@@ -257,7 +263,6 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            // 写同一个 CSV，但带 runtime 列
             write_csv_row(
                 &out_path,
                 &args,
@@ -268,14 +273,13 @@ async fn main() -> anyhow::Result<()> {
                 &summary,
             )?;
 
-            // 拐点判定：dropped>0 或 p99 相对上一档跳升（加绝对阈值，避免误报）
             if args.find_knee {
                 if summary.dropped > 0 {
                     knee_reasons.push(format!(
                         "{}: dropped>0 ({} drops)",
                         t.runtime, summary.dropped
                     ));
-                } else {
+                } else if summary.samples_ok > 0 {
                     let last = *prev_p99.get(&t.runtime).unwrap_or(&0);
                     if last > 0 {
                         let threshold_rel =
@@ -294,8 +298,6 @@ async fn main() -> anyhow::Result<()> {
                             ));
                         }
                     }
-
-                    // 更新上一档 p99
                     prev_p99.insert(t.runtime.clone(), summary.p99);
                 }
             }
@@ -310,7 +312,6 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // sweep / knee 档位间暂停（最后一个不暂停）
         if (args.find_knee || args.sweep_rps.is_some())
             && i + 1 < rps_list.len()
             && args.sweep_pause_ms > 0
@@ -329,6 +330,45 @@ fn percentile(sorted_us: &[u64], p: f64) -> u64 {
     let n = sorted_us.len();
     let rank = ((p / 100.0) * (n as f64 - 1.0)).round() as usize;
     sorted_us[rank.min(n - 1)]
+}
+
+fn gen_req(rng: &mut StdRng) -> ScoreRequest {
+    let user = rng.gen_range(1..=10_000);
+    let card = rng.gen_range(1..=50_000);
+    let merch = rng.gen_range(1..=2_000);
+    let mccs = [5411, 5732, 7995, 6011, 4812, 4829, 5311];
+    let mcc = mccs[rng.gen_range(0..mccs.len())];
+
+    let amount = (rng.gen::<f64>().powf(3.0) * 20000.0).max(1.0); // heavy tail
+    let country = if rng.gen::<f64>() < 0.92 { "JP" } else { "US" };
+    let channel = if rng.gen::<f64>() < 0.7 {
+        "ecom"
+    } else {
+        "pos"
+    };
+    let is_3ds = rng.gen::<f64>() < 0.6;
+
+    let now_ms = current_time_ms();
+
+    ScoreRequest {
+        trace_id: None,
+        event_time_ms: now_ms,
+        user_id: format!("u_{user}"),
+        card_id: format!("c_{card}"),
+        merchant_id: format!("m_{merch}"),
+        mcc,
+        amount,
+        currency: "JPY".into(),
+        country: country.into(),
+        channel: channel.into(),
+        device_id: format!("d_{}", rng.gen_range(1..=2000)),
+        ip_prefix: if rng.gen::<f64>() < 0.02 {
+            "198.51.100".into()
+        } else {
+            "203.0.113".into()
+        },
+        is_3ds,
+    }
 }
 
 fn parse_rps_list(s: &str) -> anyhow::Result<Vec<u64>> {
@@ -350,84 +390,27 @@ fn parse_rps_list(s: &str) -> anyhow::Result<Vec<u64>> {
     Ok(out)
 }
 
-fn parse_targets(args: &Args) -> anyhow::Result<Vec<Target>> {
-    if args.target.is_empty() {
-        return Ok(vec![Target {
-            runtime: "default".to_string(),
-            url: args.url.clone(),
-            metrics_url: args.metrics_url.clone(),
-        }]);
-    }
+fn build_client(args: &Args) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(args.concurrency.max(1))
+        .tcp_nodelay(true)
+        .build()
+        .context("build reqwest client")
+}
 
-    let mut out = Vec::new();
-    for t in &args.target {
-        let parts: Vec<&str> = t.split(',').map(|x| x.trim()).collect();
-        anyhow::ensure!(
-            parts.len() == 3,
-            "invalid --target format: {t} (expect NAME,SCORE_URL,METRICS_URL)"
-        );
-        out.push(Target {
-            runtime: parts[0].to_string(),
-            url: parts[1].to_string(),
-            metrics_url: parts[2].to_string(),
-        });
+fn prepare_score_bodies(seed: u64, n: usize) -> anyhow::Result<Vec<Bytes>> {
+    // 预生成 N 个请求体，避免压测过程中反复 serde_json 序列化造成噪声和抖动
+    // 不改变“字段集合”，只是把“每次生成”改成“提前生成 + 循环使用”
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(n.max(1));
+    for _ in 0..n.max(1) {
+        let req = gen_req(&mut rng);
+        let v = serde_json::to_vec(&req).context("serialize ScoreRequest")?;
+        out.push(Bytes::from(v));
     }
     Ok(out)
 }
-
-fn load_xgb_body(args: &Args) -> anyhow::Result<Bytes> {
-    if let Some(p) = &args.xgb_body_file {
-        let b = std::fs::read(p).with_context(|| format!("read --xgb-body-file: {}", p))?;
-        Ok(Bytes::from(b))
-    } else {
-        Ok(Bytes::from_static(b"{}"))
-    }
-}
-
-fn gen_req(rng: &mut StdRng) -> ScoreRequest {
-    let user = rng.gen_range(1..=10_000);
-    let card = rng.gen_range(1..=50_000);
-    let merch = rng.gen_range(1..=2_000);
-    let mccs = [5411, 5732, 7995, 6011, 4812, 4829, 5311];
-    let mcc = mccs[rng.gen_range(0..mccs.len())];
-
-    let amount = (rng.gen::<f64>().powf(3.0) * 20000.0).max(1.0); // heavy tail
-    let country = if rng.gen::<f64>() < 0.92 { "JP" } else { "US" };
-    let channel = if rng.gen::<f64>() < 0.7 {
-        "ecom"
-    } else {
-        "pos"
-    };
-    let is_3ds = rng.gen::<f64>() < 0.6;
-
-    ScoreRequest {
-        trace_id: None,
-        event_time_ms: current_time_ms(),
-        user_id: format!("u_{}", user),
-        card_id: format!("c_{}", card),
-        merchant_id: format!("m_{}", merch),
-        mcc,
-        amount,
-        currency: "JPY".into(),
-        country: country.into(),
-        channel: channel.into(),
-        device_id: format!("d_{}", rng.gen_range(1..=2000)),
-        ip_prefix: if rng.gen::<f64>() < 0.02 {
-            "198.51.100".into()
-        } else {
-            "203.0.113".into()
-        },
-        is_3ds,
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Job {
-    req_id: u64,
-    bench_lag_us: u64,
-}
-
-static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 async fn run_once(
     args: &Args,
@@ -436,117 +419,28 @@ async fn run_once(
     metrics_url: &str,
     xgb_body: &Bytes,
 ) -> anyhow::Result<Summary> {
-    // 每次 run 独立 client，避免跨档位复用连接造成“状态污染”
-    let client = reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(args.concurrency.max(1))
-        .tcp_nodelay(true)
-        .build()?;
+    use serde::Deserialize;
 
+    let client = build_client(args)?;
+
+    // 命中 /score_xgb /score_xgb_async /score_xgb_pool 等
     let is_xgb = url.contains("/score_xgb");
 
-    // ───────────────────────────────────────────────────────────────────────────
-    // 核心改造点：
-    // - 不再 “每请求 tokio::spawn”；
-    // - 改为：N=concurrency 个常驻 worker（每个 worker 串行处理请求 => 天然并发上限）
-    // - 每个 worker 有自己的有界队列：满了就算 dropped（含服务端 429 也计入 dropped）
-    // ───────────────────────────────────────────────────────────────────────────
+    // 预生成 score 的请求体池（仅在非 xgb 路径用）
+    let score_bodies = if is_xgb {
+        None
+    } else {
+        // 用一个固定池大小：至少 1024，最多 8192（够随机、内存也很小）
+        let n = args.concurrency.max(256).min(8192);
+        Some(Arc::new(
+            prepare_score_bodies(42u64, n).context("prepare score bodies")?,
+        ))
+    };
 
-    let workers = args.concurrency.max(1);
-    let per_worker_q = 8usize; // 小缓冲，减少抖动，但仍然保持 open-loop 的“过载就丢”
-    let (sample_tx, mut sample_rx) = mpsc::channel::<Sample>((workers * 8).max(1024));
+    // samples channel
+    let (sample_tx, mut sample_rx) = mpsc::channel::<Sample>(256_000);
 
-    // dropped = 本地塞不进队列 + 服务端 429（都算过载）
-    let dropped_local = Arc::new(AtomicU64::new(0));
-    let dropped_429 = Arc::new(AtomicU64::new(0));
-
-    // worker tx list
-    let mut job_txs = Vec::with_capacity(workers);
-    let mut handles = Vec::with_capacity(workers);
-
-    let url_s = url.to_string();
-    let xgb_body = xgb_body.clone();
-
-    for wid in 0..workers {
-        let (tx, mut rx) = mpsc::channel::<Job>(per_worker_q);
-        job_txs.push(tx);
-
-        let client2 = client.clone();
-        let url2 = url_s.clone();
-        let sample_tx2 = sample_tx.clone();
-        let dropped_429_2 = dropped_429.clone();
-        let is_xgb2 = is_xgb;
-        let xgb_body2 = xgb_body.clone();
-
-        let handle = tokio::spawn(async move {
-            let seed = 42u64 ^ (wid as u64).wrapping_mul(0x9e3779b97f4a7c15);
-            while let Some(job) = rx.recv().await {
-                let t0 = Instant::now();
-
-                let send_res = if is_xgb2 {
-                    client2
-                        .post(&url2)
-                        .header("content-type", "application/json")
-                        .body(xgb_body2.clone())
-                        .send()
-                        .await
-                } else {
-                    let mut rng = StdRng::seed_from_u64(seed ^ job.req_id);
-                    let req = gen_req(&mut rng);
-                    client2.post(&url2).json(&req).send().await
-                };
-
-                let mut sample = Sample::default();
-                sample.bench_lag_us = job.bench_lag_us;
-                sample.e2e_us = t0.elapsed().as_micros() as u64;
-
-                match send_res {
-                    Ok(resp) => {
-                        // 429：当作 dropped（过载），不计入 err_samples
-                        if resp.status().as_u16() == 429 {
-                            dropped_429_2.fetch_add(1, Ordering::Relaxed);
-                            let _ = resp.bytes().await;
-                            continue;
-                        }
-
-                        if !resp.status().is_success() {
-                            let _ = resp.bytes().await;
-                            sample.ok = false;
-                        } else {
-                            match resp.bytes().await {
-                                Ok(bytes) => {
-                                    if let Ok(sr) = serde_json::from_slice::<ScoreResponse>(&bytes)
-                                    {
-                                        sample.parse_us = sr.timings_us.parse;
-                                        sample.feature_us = sr.timings_us.feature;
-                                        sample.router_us = sr.timings_us.router;
-                                        sample.xgb_us = sr.timings_us.xgb;
-                                        sample.l2_us = sr.timings_us.l2;
-                                        sample.serialize_us = sr.timings_us.serialize;
-                                        sample.ok = true;
-                                    } else {
-                                        sample.ok = false;
-                                    }
-                                }
-                                Err(_) => sample.ok = false,
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        sample.ok = false;
-                    }
-                }
-
-                let _ = sample_tx2.send(sample).await;
-            }
-        });
-
-        handles.push(handle);
-    }
-
-    drop(sample_tx);
-
-    // collector task：持续 drain samples，避免 sample channel 堵住 worker
+    // collector: gather into vectors (依旧沿用你实验字段，不新增)
     let collector = tokio::spawn(async move {
         let mut e2e = Vec::<u64>::with_capacity(200_000);
         let mut parse = Vec::<u64>::with_capacity(200_000);
@@ -577,15 +471,155 @@ async fn run_once(
         (e2e, parse, feature, router, xgb, l2, serialize, ok, err)
     });
 
-    // fixed-rate launcher（open-loop）
-    let interval = Duration::from_nanos((1_000_000_000u64 / rps.max(1)).max(1));
+    // job queue：这是关键！有界队列 + try_send，满了就 dropped（避免制造突发洪峰）
+    let job_q_cap = (args.concurrency.max(1) * 4).max(1024).min(200_000);
+    let (job_tx, job_rx) = mpsc::channel::<Job>(job_q_cap);
+
+    // 固定 sender workers（替代 per-tick tokio::spawn）
+    let workers = args.concurrency.max(1);
+
+    // 仅解析 timings（bench 端不需要完整 ScoreResponse）
+    #[derive(Debug, Deserialize)]
+    struct RespXgb {
+        timings_us: TimingsXgb,
+    }
+    #[derive(Debug, Deserialize)]
+    struct TimingsXgb {
+        #[serde(default)]
+        parse: u64,
+        #[serde(default)]
+        feature: u64,
+        #[serde(default)]
+        router: u64,
+        #[serde(default)]
+        xgb: u64,
+        #[serde(default)]
+        l2: u64,
+        #[serde(default)]
+        serialize: u64,
+    }
+
+    // 兼容旧字段 l1
+    #[derive(Debug, Deserialize)]
+    struct RespL1 {
+        timings_us: TimingsL1,
+    }
+    #[derive(Debug, Deserialize)]
+    struct TimingsL1 {
+        #[serde(default)]
+        parse: u64,
+        #[serde(default)]
+        feature: u64,
+        #[serde(default)]
+        router: u64,
+        #[serde(default)]
+        l1: u64,
+        #[serde(default)]
+        l2: u64,
+        #[serde(default)]
+        serialize: u64,
+    }
+
+    // worker 共享 rx：用 Mutex 包装（tokio mpsc Receiver 不能 clone）
+    // 注意：这不是性能瓶颈，因为每个 job 只锁一次取任务；真正成本在网络/推理上
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+    static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+    let url_s = Arc::new(url.to_string());
+    let xgb_body = Arc::new(xgb_body.clone());
+    let client = Arc::new(client);
+
+    let mut worker_handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let rx = shared_rx.clone();
+        let tx = sample_tx.clone();
+        let client = client.clone();
+        let url = url_s.clone();
+        let xgb_body = xgb_body.clone();
+        let score_bodies = score_bodies.clone();
+
+        let h = tokio::spawn(async move {
+            loop {
+                let job = {
+                    let mut g = rx.lock().await;
+                    g.recv().await
+                };
+                let Some(job) = job else {
+                    break;
+                };
+
+                let t0 = Instant::now();
+                let mut sample = Sample::default();
+                sample.bench_lag_us = job.bench_lag_us;
+
+                let send_res = if is_xgb {
+                    client
+                        .post(url.as_str())
+                        .header("content-type", "application/json")
+                        .body((*xgb_body).clone())
+                        .send()
+                        .await
+                } else {
+                    // 从预生成池取一个 body（避免 serde+alloc 噪声）
+                    let bodies = score_bodies.as_ref().expect("score_bodies");
+                    let idx = (job.req_id as usize) % bodies.len();
+                    client
+                        .post(url.as_str())
+                        .header("content-type", "application/json")
+                        .body(bodies[idx].clone())
+                        .send()
+                        .await
+                };
+
+                match send_res {
+                    Ok(resp) => match resp.bytes().await {
+                        Ok(bytes) => {
+                            sample.e2e_us = t0.elapsed().as_micros() as u64;
+
+                            if let Ok(r) = serde_json::from_slice::<RespXgb>(&bytes) {
+                                sample.parse_us = r.timings_us.parse;
+                                sample.feature_us = r.timings_us.feature;
+                                sample.router_us = r.timings_us.router;
+                                sample.xgb_us = r.timings_us.xgb;
+                                sample.l2_us = r.timings_us.l2;
+                                sample.serialize_us = r.timings_us.serialize;
+                                sample.ok = true;
+                            } else if let Ok(r) = serde_json::from_slice::<RespL1>(&bytes) {
+                                sample.parse_us = r.timings_us.parse;
+                                sample.feature_us = r.timings_us.feature;
+                                sample.router_us = r.timings_us.router;
+                                sample.xgb_us = r.timings_us.l1;
+                                sample.l2_us = r.timings_us.l2;
+                                sample.serialize_us = r.timings_us.serialize;
+                                sample.ok = true;
+                            } else {
+                                sample.ok = false;
+                            }
+                        }
+                        Err(_) => sample.ok = false,
+                    },
+                    Err(_) => sample.ok = false,
+                }
+
+                let _ = tx.send(sample).await;
+            }
+        });
+        worker_handles.push(h);
+    }
+    drop(sample_tx); // collector 只要等所有 worker 退出即可结束
+
+    let start = Instant::now();
+    let end = start + Duration::from_secs(args.duration);
+
+    // 固定速率 open-loop（Delay：不追赶补发）
+    let ns = (1_000_000_000u64 / rps.max(1)).max(1);
+    let interval = Duration::from_nanos(ns);
+
     let first_tick = tokio::time::Instant::now() + interval;
     let mut tick = tokio::time::interval_at(first_tick, interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let start = tokio::time::Instant::now();
-    let end = start + Duration::from_secs(args.duration);
-
+    // bench 侧滞后统计：actual - planned
     let interval_ns: u128 = interval.as_nanos().max(1);
     let mut seq: u64 = 0;
 
@@ -593,9 +627,12 @@ async fn run_once(
         Vec::with_capacity(((args.duration as usize).saturating_mul(rps as usize)).min(2_000_000));
     let mut missed_ticks_total: u64 = 0;
 
-    while tokio::time::Instant::now() < end {
+    let mut dropped: u64 = 0;
+
+    while Instant::now() < end {
         tick.tick().await;
 
+        // planned tick 时间点 + lag
         let off_ns: u128 = interval_ns.saturating_mul(seq as u128);
         let off_ns_u64: u64 = off_ns.min(u64::MAX as u128) as u64;
         let planned = first_tick + Duration::from_nanos(off_ns_u64);
@@ -608,7 +645,6 @@ async fn run_once(
         if lag.as_nanos() > interval_ns {
             missed_ticks_total += (lag.as_nanos() / interval_ns) as u64;
         }
-
         seq = seq.wrapping_add(1);
 
         let req_id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -617,15 +653,15 @@ async fn run_once(
             bench_lag_us: lag_us,
         };
 
-        let wid = (req_id as usize) % workers;
-        if job_txs[wid].try_send(job).is_err() {
-            dropped_local.fetch_add(1, Ordering::Relaxed);
+        // 关键：try_send，队列满就 dropped（不阻塞，不补发，不制造 burst）
+        if job_tx.try_send(job).is_err() {
+            dropped += 1;
         }
     }
 
-    drop(job_txs);
+    drop(job_tx);
 
-    for h in handles {
+    for h in worker_handles {
         let _ = h.await;
     }
 
@@ -635,7 +671,7 @@ async fn run_once(
     let mut summary = Summary::default();
     summary.samples_ok = ok;
     summary.samples_err = err;
-    summary.dropped = dropped_local.load(Ordering::Relaxed) + dropped_429.load(Ordering::Relaxed);
+    summary.dropped = dropped;
 
     bench_lag_us_vec.sort_unstable();
     summary.bench_lag_p99_us = percentile(&bench_lag_us_vec, 99.0);
@@ -655,7 +691,7 @@ async fn run_once(
         summary.p95 = percentile(&e2e, 95.0);
         summary.p99 = percentile(&e2e, 99.0);
 
-        summary.e2e_p99 = summary.p99;
+        summary.e2e_p99 = percentile(&e2e, 99.0);
         summary.parse_p99 = percentile(&parse, 99.0);
         summary.feature_p99 = percentile(&feature, 99.0);
         summary.router_p99 = percentile(&router, 99.0);
@@ -665,7 +701,8 @@ async fn run_once(
     }
 
     if args.scrape_metrics {
-        if let Ok(resp) = client.get(metrics_url).send().await {
+        // 注意：这里用单独 client 抓 metrics 不会污染主压测连接池（这一点你之前就做对了）
+        if let Ok(resp) = build_client(args)?.get(metrics_url).send().await {
             if let Ok(text) = resp.text().await {
                 let (l2_trig, miss, skip, before_l2) = scrape_counters(&text);
                 summary.router_l2_trigger_total = l2_trig;
@@ -706,7 +743,7 @@ fn write_csv_row(
     if need_header {
         writeln!(
             f,
-            "ts_ms,runtime,url,metrics_url,rps,duration_s,concurrency,ok_samples,err_samples,dropped,p50_us,p95_us,p99_us,parse_p99_us,feature_p99_us,router_p99_us,xgb_p99_us,l2_p99_us,serialize_p99_us,router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total,bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
+            "ts_ms,runtime,url,metrics_url,rps,duration_s,concurrency,ok,err,dropped,p50_us,p95_us,p99_us,parse_p99_us,feature_p99_us,router_p99_us,xgb_p99_us,l2_p99_us,serialize_p99_us,router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total,bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
         )?;
     }
 
@@ -775,7 +812,10 @@ fn scrape_counters(text: &str) -> (Option<f64>, Option<f64>, Option<f64>, Option
             Some(x) => x,
             None => continue,
         };
-        let val = it.next().and_then(|x| x.parse::<f64>().ok());
+        let val = match it.next() {
+            Some(v) => v.parse::<f64>().ok(),
+            None => None,
+        };
         if val.is_none() {
             continue;
         }
@@ -791,4 +831,43 @@ fn scrape_counters(text: &str) -> (Option<f64>, Option<f64>, Option<f64>, Option
     }
 
     (l2, miss, skip, before)
+}
+
+fn load_xgb_body(args: &Args) -> anyhow::Result<Bytes> {
+    if let Some(p) = &args.xgb_body_file {
+        let b = std::fs::read(p).with_context(|| format!("read --xgb-body-file: {}", p))?;
+        Ok(Bytes::from(b))
+    } else {
+        Ok(Bytes::from_static(b"{}"))
+    }
+}
+
+fn parse_targets(args: &Args) -> anyhow::Result<Vec<Target>> {
+    if args.target.is_empty() {
+        return Ok(vec![Target {
+            runtime: "default".into(),
+            url: args.url.clone(),
+            metrics_url: args.metrics_url.clone(),
+        }]);
+    }
+
+    let mut out = Vec::new();
+    for t in &args.target {
+        let parts: Vec<&str> = t
+            .split(',')
+            .map(|x| x.trim())
+            .filter(|x| !x.is_empty())
+            .collect();
+        anyhow::ensure!(
+            parts.len() == 3,
+            "invalid --target '{}', expect NAME,SCORE_URL,METRICS_URL",
+            t
+        );
+        out.push(Target {
+            runtime: parts[0].to_string(),
+            url: parts[1].to_string(),
+            metrics_url: parts[2].to_string(),
+        });
+    }
+    Ok(out)
 }

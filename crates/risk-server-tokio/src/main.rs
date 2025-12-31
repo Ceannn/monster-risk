@@ -20,7 +20,7 @@ use tower::load_shed::LoadShedLayer;
 use tower::BoxError;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
-
+mod pin;
 use risk_core::{config::Config, pipeline::AppCore, schema::ScoreRequest};
 
 #[derive(Parser, Debug)]
@@ -47,7 +47,7 @@ struct AppState {
     xgb_blocking_sem: Arc<Semaphore>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     // logging（如果你项目里已有 tracing 初始化，可以删掉这段）
     if std::env::var_os("RUST_LOG").is_none() {
@@ -90,7 +90,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("XGB disabled, baseline /score only");
         Arc::new(AppCore::new(cfg))
     };
-
+    // IO 核：只放 Tokio runtime + HTTP/metrics/upkeep
+    pin::pin_tokio_runtime_workers(&[18, 20, 22, 24])?;
     let state = AppState {
         core,
         prom,

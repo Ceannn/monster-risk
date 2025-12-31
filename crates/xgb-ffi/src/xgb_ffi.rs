@@ -1,8 +1,16 @@
-use std::{
-    ffi::{CStr, CString},
-    os::raw::{c_char, c_int, c_void},
-    ptr,
-};
+//! Minimal, fast XGBoost C-API bindings for inference.
+//!
+//! Goals:
+//! - Safe-ish wrappers around XGBoost C-API
+//! - A reusable `__array_interface__` buffer for 1-row dense inputs
+//! - Helper methods used by `risk-core` (`predict_proba_dense_1row`, `predict_contribs_dense_1row`)
+
+use anyhow::{anyhow, bail, Context};
+use std::cell::RefCell;
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_uint, c_void};
+use std::path::Path;
+use std::ptr;
 
 pub type BstUlong = u64;
 pub type DMatrixHandle = *mut c_void;
@@ -11,236 +19,220 @@ pub type BoosterHandle = *mut c_void;
 extern "C" {
     fn XGBGetLastError() -> *const c_char;
 
-    fn XGDMatrixCreateFromMat(
-        data: *const f32,
-        nrow: BstUlong,
-        ncol: BstUlong,
-        missing: f32,
-        out: *mut DMatrixHandle,
-    ) -> c_int;
+    fn XGBoosterCreate(dmats: *const DMatrixHandle, len: BstUlong, out: *mut BoosterHandle) -> c_uint;
+    fn XGBoosterFree(handle: BoosterHandle) -> c_uint;
+    fn XGBoosterLoadModel(handle: BoosterHandle, fname: *const c_char) -> c_uint;
 
-    fn XGDMatrixFree(handle: DMatrixHandle) -> c_int;
-
-    fn XGBoosterCreate(
-        dmats: *const DMatrixHandle,
-        len: BstUlong,
-        out: *mut BoosterHandle,
-    ) -> c_int;
-
-    fn XGBoosterFree(handle: BoosterHandle) -> c_int;
-
-    fn XGBoosterSetParam(handle: BoosterHandle, name: *const c_char, value: *const c_char)
-        -> c_int;
-
-    fn XGBoosterLoadModel(handle: BoosterHandle, fname: *const c_char) -> c_int;
-
-    fn XGBoosterPredictFromDMatrix(
+    fn XGBoosterPredictFromDense(
         handle: BoosterHandle,
-        dmat: DMatrixHandle,
+        array_interface: *const c_char,
         config: *const c_char,
         out_shape: *mut *const BstUlong,
         out_dim: *mut BstUlong,
         out_result: *mut *const f32,
-    ) -> c_int;
+    ) -> c_uint;
 }
 
-fn last_error() -> String {
-    unsafe {
-        let p = XGBGetLastError();
-        if p.is_null() {
-            "XGBoost error: <null>".to_string()
-        } else {
-            CStr::from_ptr(p).to_string_lossy().into_owned()
-        }
+fn last_error() -> anyhow::Error {
+    let p = unsafe { XGBGetLastError() };
+    if p.is_null() {
+        anyhow!("xgboost: unknown error (XGBGetLastError returned null)")
+    } else {
+        let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+        anyhow!("xgboost: {s}")
     }
 }
 
-fn xgb_check(rc: c_int, what: &str) -> Result<(), String> {
+fn check(rc: c_uint) -> anyhow::Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(format!("{what}\n\nCaused by:\n    {}", last_error()))
+        Err(last_error())
     }
 }
 
-pub struct DMatrix {
-    handle: DMatrixHandle,
+/// Output of a predict call.
+#[derive(Debug, Clone)]
+pub struct PredictOutput {
+    pub shape: Vec<BstUlong>,
+    pub values: Vec<f32>,
 }
 
-impl DMatrix {
-    pub fn from_dense(
-        data: &[f32],
-        nrow: usize,
-        ncol: usize,
-        missing: f32,
-    ) -> Result<Self, String> {
-        if data.len() != nrow * ncol {
-            return Err(format!(
-                "DMatrix::from_dense: data.len()={} != nrow*ncol={}*{}={}",
-                data.len(),
-                nrow,
-                ncol,
-                nrow * ncol
-            ));
-        }
-        let mut h: DMatrixHandle = ptr::null_mut();
-        unsafe {
-            xgb_check(
-                XGDMatrixCreateFromMat(
-                    data.as_ptr(),
-                    nrow as BstUlong,
-                    ncol as BstUlong,
-                    missing,
-                    &mut h,
-                ),
-                "XGDMatrixCreateFromMat",
-            )?;
-        }
-        Ok(Self { handle: h })
-    }
-
-    #[inline]
-    pub fn handle(&self) -> DMatrixHandle {
-        self.handle
-    }
+#[derive(Debug)]
+pub struct Booster {
+    handle: BoosterHandle,
 }
 
-impl Drop for DMatrix {
+// Not safe for concurrent calls across threads; OK to move to a worker thread.
+unsafe impl Send for Booster {}
+
+impl Drop for Booster {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            unsafe {
-                let _ = XGDMatrixFree(self.handle);
-            }
+            let _ = unsafe { XGBoosterFree(self.handle) };
             self.handle = ptr::null_mut();
         }
     }
 }
 
-pub struct Booster {
-    handle: BoosterHandle,
-}
-
-#[derive(Debug, Clone)]
-pub struct PredictOutput {
-    pub values: Vec<f32>,
-    pub shape: Vec<usize>, // strict_shape=true 时是多维；false 时通常就是 [out_len]
-}
-
 impl Booster {
-    pub fn load_model(model_path: impl AsRef<std::path::Path>) -> Result<Self, String> {
-        // 为了保险：给一个“非空地址”的 dmats 指针，但 len=0
-        let dummy: [DMatrixHandle; 1] = [ptr::null_mut()];
-        let mut h: BoosterHandle = ptr::null_mut();
-
+    /// Create an empty booster and load model from file.
+    pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
+        let mut handle: BoosterHandle = ptr::null_mut();
         unsafe {
-            xgb_check(
-                XGBoosterCreate(dummy.as_ptr(), 0, &mut h),
-                "XGBoosterCreate",
-            )?;
+            check(XGBoosterCreate(ptr::null(), 0, &mut handle)).context("XGBoosterCreate")?;
+        }
+        if handle.is_null() {
+            bail!("xgboost: XGBoosterCreate returned null handle");
         }
 
-        let cpath = CString::new(model_path.as_ref().to_string_lossy().as_bytes().to_vec())
-            .map_err(|e| format!("CString model_path: {e}"))?;
+        let cpath = CString::new(
+            path.to_str()
+                .ok_or_else(|| anyhow!("model path is not valid UTF-8: {path:?}"))?,
+        )?;
 
-        unsafe {
-            xgb_check(XGBoosterLoadModel(h, cpath.as_ptr()), "XGBoosterLoadModel")?;
-        }
+        unsafe { check(XGBoosterLoadModel(handle, cpath.as_ptr())).context("XGBoosterLoadModel")? };
 
-        Ok(Self { handle: h })
+        Ok(Self { handle })
     }
 
-    #[inline]
-    pub fn handle(&self) -> BoosterHandle {
-        self.handle
+    /// Back-compat alias used by older `risk-core` code.
+    pub fn load_model(path: &Path) -> Result<Self, String> {
+        Self::load_from_file(path).map_err(|e| e.to_string())
     }
 
-    /// ✅ 新增：设置 Booster 参数（比如 nthread=1）
-    pub fn set_param(&self, key: &str, val: &str) -> Result<(), String> {
-        let k = CString::new(key).map_err(|e| format!("CString param key '{key}': {e}"))?;
-        let v = CString::new(val).map_err(|e| format!("CString param val '{val}': {e}"))?;
-        unsafe {
-            xgb_check(
-                XGBoosterSetParam(self.handle, k.as_ptr(), v.as_ptr()),
-                "XGBoosterSetParam",
-            )?
-        };
-        Ok(())
-    }
-
-    fn predict_from_dmatrix(
-        &self,
-        dmat: &DMatrix,
-        config_json: &str,
-    ) -> Result<PredictOutput, String> {
-        let cconfig = CString::new(config_json).map_err(|e| format!("CString config: {e}"))?;
-
+    /// Generic dense prediction entry point.
+    pub fn predict_from_dense(&self, array_interface: &CStr, config: &CStr) -> anyhow::Result<PredictOutput> {
         let mut out_shape_ptr: *const BstUlong = ptr::null();
         let mut out_dim: BstUlong = 0;
         let mut out_result_ptr: *const f32 = ptr::null();
 
         unsafe {
-            xgb_check(
-                XGBoosterPredictFromDMatrix(
-                    self.handle,
-                    dmat.handle(),
-                    cconfig.as_ptr(),
-                    &mut out_shape_ptr,
-                    &mut out_dim,
-                    &mut out_result_ptr,
-                ),
-                "XGBoosterPredictFromDMatrix",
-            )?;
-
-            let shape = if out_dim == 0 || out_shape_ptr.is_null() {
-                vec![]
-            } else {
-                std::slice::from_raw_parts(out_shape_ptr, out_dim as usize)
-                    .iter()
-                    .map(|&x| x as usize)
-                    .collect::<Vec<_>>()
-            };
-
-            let out_len = if shape.is_empty() {
-                0
-            } else {
-                shape.iter().product::<usize>()
-            };
-            let values = if out_len == 0 || out_result_ptr.is_null() {
-                vec![]
-            } else {
-                std::slice::from_raw_parts(out_result_ptr, out_len).to_vec()
-            };
-
-            Ok(PredictOutput { values, shape })
+            check(XGBoosterPredictFromDense(
+                self.handle,
+                array_interface.as_ptr(),
+                config.as_ptr(),
+                &mut out_shape_ptr,
+                &mut out_dim,
+                &mut out_result_ptr,
+            ))
+            .context("XGBoosterPredictFromDense")?;
         }
+
+        let shape = if out_dim == 0 || out_shape_ptr.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(out_shape_ptr, out_dim as usize) }.to_vec()
+        };
+
+        let n = shape
+            .iter()
+            .copied()
+            .fold(1u64, |acc, v| acc.saturating_mul(v))
+            as usize;
+
+        let values = if n == 0 || out_result_ptr.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(out_result_ptr, n) }.to_vec()
+        };
+
+        Ok(PredictOutput { shape, values })
     }
 
-    /// type=0: normal prediction (probability)
+    /// Fast helper: predict probability for a single dense row.
+    ///
+    /// Uses per-thread cached `DenseArrayInterface` + config.
     pub fn predict_proba_dense_1row(&self, row: &[f32]) -> Result<f32, String> {
-        let dmat = DMatrix::from_dense(row, 1, row.len(), f32::NAN)?;
-        // XGBoost 3.x 要求 iteration_begin / iteration_end 必须给
-        let cfg = r#"{"type":0,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":true}"#;
-        let out = self.predict_from_dmatrix(&dmat, cfg)?;
-        Ok(*out.values.get(0).unwrap_or(&0.0))
+        TLS_DENSE.with(|cell| {
+            let mut tls = cell.borrow_mut();
+            if tls.as_ref().map(|x| x.ncols) != Some(row.len()) {
+                *tls = Some(TlsDense::new(row.len())?);
+            }
+            let tls = tls.as_mut().expect("initialized");
+            tls.ai.data_mut().copy_from_slice(row);
+            let out = self.predict_from_dense(tls.ai.as_cstr(), tls.cfg_pred.as_c_str())?;
+            Ok(out.values.get(0).copied().unwrap_or(0.0))
+        }).map_err(|e| e.to_string())
     }
 
-    /// type=2: SHAP contributions（最后一列是 bias）
+    /// Fast helper: predict contribution vector for a single dense row.
+    ///
+    /// `values` length is typically `ncols + 1` (last element = bias).
     pub fn predict_contribs_dense_1row(&self, row: &[f32]) -> Result<PredictOutput, String> {
-        let dmat = DMatrix::from_dense(row, 1, row.len(), f32::NAN)?;
-        let cfg = r#"{"type":2,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":true}"#;
-        self.predict_from_dmatrix(&dmat, cfg)
+        TLS_DENSE.with(|cell| {
+            let mut tls = cell.borrow_mut();
+            if tls.as_ref().map(|x| x.ncols) != Some(row.len()) {
+                *tls = Some(TlsDense::new(row.len())?);
+            }
+            let tls = tls.as_mut().expect("initialized");
+            tls.ai.data_mut().copy_from_slice(row);
+            self.predict_from_dense(tls.ai.as_cstr(), tls.cfg_contrib.as_c_str())
+        }).map_err(|e| e.to_string())
     }
 }
 
-impl Drop for Booster {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe {
-                // 如果你确定不会踩 xgboost 的 unload/多线程坑，可以打开
-                // let _ = XGBoosterFree(self.handle);
-                let _ = XGBoosterFree(self.handle);
-            }
-            self.handle = ptr::null_mut();
-        }
+/// A reusable dense `__array_interface__` for **one row**.
+#[derive(Debug)]
+pub struct DenseArrayInterface {
+    data: Vec<f32>,
+    cstr: CString,
+}
+
+impl DenseArrayInterface {
+    pub fn new_1row(ncols: usize) -> anyhow::Result<Self> {
+        let mut data = vec![0.0f32; ncols];
+        // Pointer is stable as long as `data` is not reallocated (length fixed).
+        let ptr = data.as_mut_ptr() as usize;
+
+        // Numpy-style array interface (version 3). Little-endian f32.
+        // data: [ptr, read_only]
+        // shape: [rows, cols]
+        let s = format!(
+            r#"{{"data":[{},false],"shape":[1,{}],"typestr":"<f4","version":3}}"#,
+            ptr, ncols
+        );
+        let cstr = CString::new(s)?;
+
+        Ok(Self { data, cstr })
     }
+
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut [f32] {
+        &mut self.data
+    }
+
+    #[inline]
+    pub fn as_cstr(&self) -> &CStr {
+        &self.cstr
+    }
+}
+
+struct TlsDense {
+    ncols: usize,
+    ai: DenseArrayInterface,
+    cfg_pred: CString,
+    cfg_contrib: CString,
+}
+
+impl TlsDense {
+    fn new(ncols: usize) -> anyhow::Result<Self> {
+        let ai = DenseArrayInterface::new_1row(ncols)?;
+        let cfg_pred = CString::new(
+            r#"{"training":false,"type":0,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#,
+        )?;
+        let cfg_contrib = CString::new(
+            r#"{"training":false,"type":0,"iteration_begin":0,"iteration_end":0,"strict_shape":false,"pred_contribs":true}"#,
+        )?;
+        Ok(Self {
+            ncols,
+            ai,
+            cfg_pred,
+            cfg_contrib,
+        })
+    }
+}
+
+thread_local! {
+    static TLS_DENSE: RefCell<Option<TlsDense>> = const { RefCell::new(None) };
 }

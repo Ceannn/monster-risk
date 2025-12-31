@@ -1,34 +1,36 @@
-use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
-use std::thread;
-use std::time::{Duration, Instant};
+//! A dedicated inference pool for XGBoost.
+//!
+//! Why this exists:
+//! - XGBoost C-API is blocking and can be CPU heavy; running it on Tokio workers
+//!   causes head-of-line blocking and latency spikes.
+//! - We instead create N dedicated OS threads, each owning its own Booster.
+//! - Submission is non-blocking (`try_submit`); when all queues are full we fail fast.
+//!
+//! This file intentionally keeps the public API tiny and stable.
 
+use crate::xgb_runtime::XgbRuntime;
 use anyhow::Context;
-use crossbeam_channel as cb;
-use futures_channel::oneshot;
-
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Instant;
+use tokio::sync::{mpsc, oneshot};
 use xgb_ffi::Booster;
 
-/// 队列满 / 断开 / worker 返回错误等（用于 server 侧 downcast -> 429）
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum XgbPoolError {
     QueueFull,
-    Disconnected,
+    WorkerDown,
     Canceled,
-    Worker(String),
 }
 
-impl fmt::Display for XgbPoolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for XgbPoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             XgbPoolError::QueueFull => write!(f, "xgb pool queue full"),
-            XgbPoolError::Disconnected => write!(f, "xgb pool disconnected"),
-            XgbPoolError::Canceled => write!(f, "xgb pool response canceled"),
-            XgbPoolError::Worker(s) => write!(f, "xgb worker error: {s}"),
+            XgbPoolError::WorkerDown => write!(f, "xgb pool worker down"),
+            XgbPoolError::Canceled => write!(f, "xgb pool job canceled"),
         }
     }
 }
@@ -39,379 +41,225 @@ pub struct XgbOut {
     pub score: f32,
     pub queue_wait_us: u64,
     pub xgb_us: u64,
-    pub contrib_topk: Option<Vec<(String, f32)>>,
+    pub contrib_topk: Vec<(String, f32)>,
 }
 
 struct XgbJob {
+    enq_at: Instant,
     row: Vec<f32>,
-    topk: usize,
-    enq: Instant,
-    tx: oneshot::Sender<Result<XgbOut, XgbPoolError>>,
+    contrib_topk: usize,
+    resp_tx: oneshot::Sender<anyhow::Result<XgbOut>>,
+}
+
+struct WorkerHandle {
+    tx: mpsc::Sender<XgbJob>,
 }
 
 pub struct XgbPool {
-    tx: cb::Sender<XgbJob>,
-    q_depth: Arc<AtomicUsize>,
-    cap: usize,
-    feature_names: Arc<Vec<String>>,
-    _joins: Arc<Vec<thread::JoinHandle<()>>>,
+    workers: Vec<WorkerHandle>,
+    rr: AtomicUsize,
 }
-
-#[cfg(target_os = "linux")]
-fn parse_cpuset_env(name: &str) -> Option<Vec<usize>> {
-    let s = std::env::var(name).ok()?;
-    let mut out = Vec::new();
-    for part in s.split(',') {
-        let p = part.trim();
-        if p.is_empty() {
-            continue;
-        }
-        if let Ok(v) = p.parse::<usize>() {
-            out.push(v);
-        }
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn default_even_cpus() -> Vec<usize> {
-    // 7945HX/WSL2 常见 CPU 列表：0,1 是同一核 SMT；2,3 同一核；...
-    // 默认优先用偶数 CPU，减少 SMT 互抢
-    let mut v = Vec::new();
-    if let Some(ids) = core_affinity::get_core_ids() {
-        for c in ids {
-            let id = c.id;
-            if id % 2 == 0 {
-                v.push(id);
-            }
-        }
-    }
-    if v.is_empty() {
-        v.push(0);
-    }
-    v
-}
-
-#[cfg(target_os = "linux")]
-fn pin_current_thread(wid: usize) {
-    let cpus = parse_cpuset_env("XGB_POOL_CPUS").unwrap_or_else(default_even_cpus);
-    let pick = cpus[wid % cpus.len()];
-
-    if let Some(ids) = core_affinity::get_core_ids() {
-        if let Some(core) = ids.into_iter().find(|c| c.id == pick) {
-            core_affinity::set_for_current(core);
-            if std::env::var("XGB_POOL_AFFINITY_DEBUG").ok().as_deref() == Some("1") {
-                eprintln!("[xgb-worker-{wid}] pinned to cpu={pick}");
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pin_current_thread(_wid: usize) {}
 
 impl XgbPool {
-    /// - workers: OS 线程数（每线程一份 Booster）
-    /// - cap: 有界队列容量（满了直接 429）
-    /// - warmup_iters: 每个 worker 启动后做多少次 dummy predict（消掉冷启动尖刺）
+    /// Shorthand: build a pool without CPU pinning.
     pub fn new(
-        model_path: PathBuf,
-        feature_names: Arc<Vec<String>>,
-        workers: usize,
-        cap: usize,
-        warmup_iters: usize,
+        model_dir: impl AsRef<Path>,
+        n_workers: usize,
+        queue_cap: usize,
     ) -> anyhow::Result<Self> {
-        if workers == 0 {
-            anyhow::bail!("xgb pool workers must be > 0");
-        }
-        if cap == 0 {
-            anyhow::bail!("xgb pool cap must be > 0");
-        }
-        ensure_exists(&model_path)?;
+        Self::new_from_dir(model_dir, n_workers, queue_cap, None)
+    }
 
-        let (tx, rx) = cb::bounded::<XgbJob>(cap);
-        let q_depth = Arc::new(AtomicUsize::new(0));
+    /// Build an inference pool from a model directory (same format as `XgbRuntime::load_from_dir`).
+    ///
+    /// - `n_workers`: number of dedicated XGB threads.
+    /// - `queue_cap`: per-worker bounded queue size (fail-fast when saturated).
+    /// - `pin_cpus`: optional CPU ids to pin each worker to (linux only; extra ids ignored).
+    pub fn new_from_dir(
+        model_dir: impl AsRef<Path>,
+        n_workers: usize,
+        queue_cap: usize,
+        pin_cpus: Option<Vec<usize>>,
+    ) -> anyhow::Result<Self> {
+        let rt = XgbRuntime::load_from_dir(model_dir.as_ref())
+            .with_context(|| format!("load model dir: {}", model_dir.as_ref().display()))?;
 
-        // worker 启动回执：每个线程加载+warmup 完成后发一个 Ok(())
-        // 如果加载失败发 Err(msg)，new() 直接返回错误，避免“启动成功但池不可用”
-        let (ready_tx, ready_rx) = cb::bounded::<Result<(), String>>(workers);
+        let model_path = Arc::new(rt.model_path);
+        let feature_names = Arc::new(rt.feature_names);
 
-        let mut joins = Vec::with_capacity(workers);
-        for wid in 0..workers {
-            let rx = rx.clone();
-            let mp = model_path.clone();
-            let fnames = feature_names.clone();
-            let qd = q_depth.clone();
-            let rtx = ready_tx.clone();
+        let mut workers = Vec::with_capacity(n_workers);
+        let pin_cpus = pin_cpus.unwrap_or_default();
 
-            let j = thread::Builder::new()
+        for wid in 0..n_workers {
+            let (tx, mut rx) = mpsc::channel::<XgbJob>(queue_cap);
+            let model_path = Arc::clone(&model_path);
+            let feature_names = Arc::clone(&feature_names);
+            let cpu = pin_cpus.get(wid).copied();
+
+            thread::Builder::new()
                 .name(format!("xgb-worker-{wid}"))
-                .spawn(move || worker_loop(wid, rx, mp, fnames, qd, cap, warmup_iters, rtx))
+                .spawn(move || {
+                    if let Some(cpu) = cpu {
+                        #[cfg(target_os = "linux")]
+                        {
+                            if let Err(e) = pin_current_thread(cpu) {
+                                eprintln!("xgb-worker-{wid}: failed to pin to cpu {cpu}: {e}");
+                            } else {
+                                eprintln!("xgb-worker-{wid}: pinned to cpu={cpu}");
+                            }
+                        }
+                    }
+
+                    let bst = match Booster::load_model(model_path.as_ref()) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("xgb-worker-{wid}: failed to load model: {e}");
+                            return;
+                        }
+                    };
+
+                    // Main loop
+                    while let Some(job) = rx.blocking_recv() {
+                        let now = Instant::now();
+                        let queue_wait_us =
+                            now.duration_since(job.enq_at)
+                                .as_micros()
+                                .min(u128::from(u64::MAX)) as u64;
+
+                        histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
+
+                        let t0 = Instant::now();
+                        let score = match bst.predict_proba_dense_1row(&job.row) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
+                                continue;
+                            }
+                        };
+
+                        let mut contrib_topk = Vec::new();
+                        if job.contrib_topk > 0 {
+                            match bst.predict_contribs_dense_1row(&job.row) {
+                                Ok(out) => {
+                                    // Usually len = ncols + 1 (bias). We ignore bias for topk.
+                                    let n = feature_names.len().min(out.values.len());
+                                    let mut tmp: Vec<(usize, f32)> =
+                                        (0..n).map(|i| (i, out.values[i])).collect();
+                                    tmp.sort_by(|a, b| {
+                                        b.1.abs()
+                                            .partial_cmp(&a.1.abs())
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    });
+                                    contrib_topk = tmp
+                                        .into_iter()
+                                        .take(job.contrib_topk.min(n))
+                                        .map(|(i, v)| (feature_names[i].clone(), v))
+                                        .collect();
+                                }
+                                Err(e) => {
+                                    let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                        histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
+
+                        let _ = job.resp_tx.send(Ok(XgbOut {
+                            score,
+                            queue_wait_us,
+                            xgb_us,
+                            contrib_topk,
+                        }));
+                    }
+                })
                 .context("spawn xgb worker")?;
 
-            joins.push(j);
-        }
-
-        // 等待所有 worker ready（避免压测初期冷启动把队列顶满造成 dropped）
-        for _ in 0..workers {
-            match ready_rx.recv_timeout(Duration::from_secs(30)) {
-                Ok(Ok(())) => {}
-                Ok(Err(msg)) => anyhow::bail!("xgb pool worker init failed: {msg}"),
-                Err(cb::RecvTimeoutError::Timeout) => {
-                    anyhow::bail!("xgb pool init timeout waiting workers ready")
-                }
-                Err(cb::RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!("xgb pool init failed: ready channel disconnected")
-                }
-            }
+            workers.push(WorkerHandle { tx });
         }
 
         Ok(Self {
-            tx,
-            q_depth,
-            cap,
-            feature_names,
-            _joins: Arc::new(joins),
+            workers,
+            rr: AtomicUsize::new(0),
         })
     }
 
-    pub fn cap(&self) -> usize {
-        self.cap
-    }
-
-    pub fn q_depth(&self) -> usize {
-        self.q_depth.load(Ordering::Relaxed)
-    }
-
-    /// try_submit：满了直接 QueueFull（用于 429）
+    /// Non-blocking submission. Returns a oneshot receiver to await the result.
     pub fn try_submit(
         &self,
         row: Vec<f32>,
-        topk: usize,
-    ) -> Result<oneshot::Receiver<Result<XgbOut, XgbPoolError>>, XgbPoolError> {
-        // 用原子 q_depth 做快速拒绝（严格性由 bounded channel 保证）
-        let mut cur = self.q_depth.load(Ordering::Relaxed);
-        loop {
-            if cur >= self.cap {
-                metrics::counter!("xgb_pool_reject_full_total").increment(1);
-                return Err(XgbPoolError::QueueFull);
-            }
-            match self.q_depth.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(v) => cur = v,
-            }
+        contrib_topk: usize,
+    ) -> Result<oneshot::Receiver<anyhow::Result<XgbOut>>, XgbPoolError> {
+        let n = self.workers.len();
+        if n == 0 {
+            return Err(XgbPoolError::WorkerDown);
         }
 
-        let (tx, rx) = oneshot::channel();
-        let job = XgbJob {
+        let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
+        let mut job = XgbJob {
+            enq_at: Instant::now(),
             row,
-            topk,
-            enq: Instant::now(),
-            tx,
+            contrib_topk,
+            resp_tx,
         };
 
-        match self.tx.try_send(job) {
-            Ok(()) => {
-                metrics::counter!("xgb_pool_submit_total").increment(1);
-                metrics::gauge!("xgb_pool_q_depth").set(self.q_depth() as f64);
-                Ok(rx)
-            }
-            Err(cb::TrySendError::Full(_)) => {
-                // rollback
-                self.q_depth.fetch_sub(1, Ordering::Relaxed);
-                metrics::counter!("xgb_pool_reject_full_total").increment(1);
-                metrics::gauge!("xgb_pool_q_depth").set(self.q_depth() as f64);
-                Err(XgbPoolError::QueueFull)
-            }
-            Err(cb::TrySendError::Disconnected(_)) => {
-                self.q_depth.fetch_sub(1, Ordering::Relaxed);
-                metrics::gauge!("xgb_pool_q_depth").set(self.q_depth() as f64);
-                Err(XgbPoolError::Disconnected)
-            }
-        }
-    }
+        let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        let mut down = 0usize;
 
-    /// contrib topk 的默认实现（用于 debug 或测试）
-    pub fn topk_from_contrib_row_with_bias(
-        &self,
-        contrib_row_with_bias: &[f32],
-        k: usize,
-    ) -> Vec<(String, f32)> {
-        topk_contrib(&self.feature_names, contrib_row_with_bias, k)
-    }
-}
-
-fn ensure_exists(p: &Path) -> anyhow::Result<()> {
-    std::fs::metadata(p).with_context(|| format!("model_path not found: {}", p.display()))?;
-    Ok(())
-}
-
-fn worker_loop(
-    wid: usize,
-    rx: cb::Receiver<XgbJob>,
-    model_path: PathBuf,
-    feature_names: Arc<Vec<String>>,
-    q_depth: Arc<AtomicUsize>,
-    cap: usize,
-    warmup_iters: usize,
-    ready_tx: cb::Sender<Result<(), String>>,
-) {
-    // ✅ 0) 先绑核（减少迁移导致的推理抖动）
-    pin_current_thread(wid);
-
-    // 1) load model（每线程一份 Booster）
-    let booster = match Booster::load_model(&model_path) {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = ready_tx.send(Err(format!(
-                "[worker-{wid}] failed to load model {}: {e}",
-                model_path.display()
-            )));
-            return;
-        }
-    };
-
-    // ✅ 1.5) 强制单线程推理（1-row 推理非常关键）
-    let _ = booster.set_param("nthread", "1");
-    let _ = booster.set_param("predictor", "cpu_predictor");
-
-    // 2) warmup（每线程）
-    //   - clamp：避免 warmup_iters 设置过大导致启动极慢
-    //   - row 用 0.0：更温和，也能触发内部 lazy init
-    let iters = warmup_iters.min(50);
-    if iters > 0 {
-        let n = feature_names.len().max(1);
-        let row = vec![0.0f32; n];
-        let t = Instant::now();
-        for _ in 0..iters {
-            let _ = booster.predict_proba_dense_1row(&row);
-        }
-        let _ = booster.predict_contribs_dense_1row(&row);
-        eprintln!(
-            "[xgb-worker-{wid}] warmup done iters={iters} cost={}ms",
-            t.elapsed().as_millis()
-        );
-    } else {
-        eprintln!("[xgb-worker-{wid}] warmup skipped");
-    }
-
-    // 3) 通知主线程：我 ready 了
-    let _ = ready_tx.send(Ok(()));
-
-    // 4) 正常处理 job
-    while let Ok(job) = rx.recv() {
-        // 取走一个请求 -> q_depth-1
-        let prev = q_depth.fetch_sub(1, Ordering::Relaxed);
-        if prev == 0 {
-            q_depth.store(0, Ordering::Relaxed);
-        }
-        metrics::gauge!("xgb_pool_q_depth").set(q_depth.load(Ordering::Relaxed) as f64);
-
-        let queue_wait_us = job.enq.elapsed().as_micros() as u64;
-        metrics::histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
-
-        let t_xgb = Instant::now();
-        let score = match booster.predict_proba_dense_1row(&job.row) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = job.tx.send(Err(XgbPoolError::Worker(e)));
-                metrics::counter!("xgb_pool_done_err_total").increment(1);
-                continue;
-            }
-        };
-
-        let mut contrib_topk_out: Option<Vec<(String, f32)>> = None;
-        if job.topk > 0 {
-            match booster.predict_contribs_dense_1row(&job.row) {
-                Ok(out) => {
-                    let contrib_row_with_bias: Vec<f32> = match out.shape.as_slice() {
-                        [1, _groups, m] => out.values[..*m].to_vec(),
-                        [1, m] => out.values[..*m].to_vec(),
-                        _ => {
-                            let _ = job.tx.send(Err(XgbPoolError::Worker(format!(
-                                "unexpected contrib shape: {:?}",
-                                out.shape
-                            ))));
-                            metrics::counter!("xgb_pool_done_err_total").increment(1);
-                            continue;
-                        }
-                    };
-                    contrib_topk_out = Some(topk_contrib(
-                        &feature_names,
-                        &contrib_row_with_bias,
-                        job.topk,
-                    ));
+        for i in 0..n {
+            let idx = (start + i) % n;
+            match self.workers[idx].tx.try_send(job) {
+                Ok(()) => return Ok(resp_rx),
+                Err(mpsc::error::TrySendError::Full(j)) => {
+                    job = j;
+                    continue;
                 }
-                Err(e) => {
-                    let _ = job.tx.send(Err(XgbPoolError::Worker(e)));
-                    metrics::counter!("xgb_pool_done_err_total").increment(1);
+                Err(mpsc::error::TrySendError::Closed(j)) => {
+                    job = j;
+                    down += 1;
                     continue;
                 }
             }
         }
 
-        let xgb_us = t_xgb.elapsed().as_micros() as u64;
-        metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
-
-        let out = XgbOut {
-            score,
-            queue_wait_us,
-            xgb_us,
-            contrib_topk: contrib_topk_out,
-        };
-
-        let _ = job.tx.send(Ok(out));
-        metrics::counter!("xgb_pool_done_ok_total").increment(1);
-
-        // 健康性：cap 的边界提醒（debug 用）
-        let q = q_depth.load(Ordering::Relaxed);
-        if q > cap * 2 {
-            metrics::counter!("xgb_pool_q_depth_weird_total").increment(1);
+        if down == n {
+            Err(XgbPoolError::WorkerDown)
+        } else {
+            Err(XgbPoolError::QueueFull)
         }
     }
 
-    // channel 断开
-    let _ = ready_tx.send(Err(format!("[worker-{wid}] rx disconnected")));
+    /// Convenience async wrapper.
+    pub async fn submit(
+        &self,
+        row: Vec<f32>,
+        contrib_topk: usize,
+    ) -> Result<anyhow::Result<XgbOut>, XgbPoolError> {
+        let rx = self.try_submit(row, contrib_topk)?;
+        match rx.await {
+            Ok(v) => Ok(v),
+            Err(_) => Err(XgbPoolError::Canceled),
+        }
+    }
 }
 
-fn topk_contrib(
-    feature_names: &Arc<Vec<String>>,
-    contrib_row_with_bias: &[f32],
-    k: usize,
-) -> Vec<(String, f32)> {
-    if k == 0 || contrib_row_with_bias.is_empty() {
-        return vec![];
+#[cfg(target_os = "linux")]
+fn pin_current_thread(cpu: usize) -> std::io::Result<()> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        let tid = libc::pthread_self();
+        let rc = libc::pthread_setaffinity_np(tid, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc));
+        }
     }
+    Ok(())
+}
 
-    let m = contrib_row_with_bias.len();
-    let feat_maybe_bias = m.saturating_sub(1);
-
-    let mut top: Vec<(usize, f32, f32)> = Vec::with_capacity(feat_maybe_bias);
-    for idx in 0..feat_maybe_bias {
-        let v = contrib_row_with_bias[idx];
-        top.push((idx, v, v.abs()));
-    }
-
-    // 按 abs 降序
-    top.sort_by(|a, b| b.2.total_cmp(&a.2));
-    top.truncate(k);
-
-    top.into_iter()
-        .map(|(idx, v, _)| {
-            let name = feature_names
-                .get(idx)
-                .cloned()
-                .unwrap_or_else(|| format!("f{idx}"));
-            (name, v)
-        })
-        .collect()
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(_cpu: usize) -> std::io::Result<()> {
+    Ok(())
 }
