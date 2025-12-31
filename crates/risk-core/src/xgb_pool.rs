@@ -8,7 +8,6 @@
 //!
 //! This file intentionally keeps the public API tiny and stable.
 
-use crate::xgb_runtime::XgbRuntime;
 use anyhow::Context;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,40 +60,59 @@ pub struct XgbPool {
 }
 
 impl XgbPool {
-    /// Shorthand: build a pool without CPU pinning.
+    /// Build an inference pool.
+    ///
+    /// - `model_path`: path to the model file (e.g. ieee_xgb.ubj / xgb_model.json / ieee_xgb.bin)
+    /// - `feature_names`: feature order used by the model (for contrib top-k naming)
+    /// - `n_workers`: number of dedicated XGB threads
+    /// - `queue_cap_total`: total queue capacity across all workers (will be evenly split)
+    /// - `warmup_iters`: per-worker warmup iterations to eliminate cold-start spikes
     pub fn new(
-        model_dir: impl AsRef<Path>,
+        model_path: impl AsRef<Path>,
+        feature_names: Arc<Vec<String>>,
         n_workers: usize,
-        queue_cap: usize,
+        queue_cap_total: usize,
+        warmup_iters: usize,
     ) -> anyhow::Result<Self> {
-        Self::new_from_dir(model_dir, n_workers, queue_cap, None)
+        Self::new_with_pinning(
+            model_path,
+            feature_names,
+            n_workers,
+            queue_cap_total,
+            warmup_iters,
+            None,
+        )
     }
 
-    /// Build an inference pool from a model directory (same format as `XgbRuntime::load_from_dir`).
+    /// Same as [`XgbPool::new`], but pins each worker thread to a specific CPU id (linux only).
     ///
-    /// - `n_workers`: number of dedicated XGB threads.
-    /// - `queue_cap`: per-worker bounded queue size (fail-fast when saturated).
-    /// - `pin_cpus`: optional CPU ids to pin each worker to (linux only; extra ids ignored).
-    pub fn new_from_dir(
-        model_dir: impl AsRef<Path>,
+    /// `pin_cpus`: optional CPU ids to pin each worker to (extra ids ignored).
+    pub fn new_with_pinning(
+        model_path: impl AsRef<Path>,
+        feature_names: Arc<Vec<String>>,
         n_workers: usize,
-        queue_cap: usize,
+        queue_cap_total: usize,
+        warmup_iters: usize,
         pin_cpus: Option<Vec<usize>>,
     ) -> anyhow::Result<Self> {
-        let rt = XgbRuntime::load_from_dir(model_dir.as_ref())
-            .with_context(|| format!("load model dir: {}", model_dir.as_ref().display()))?;
+        anyhow::ensure!(n_workers > 0, "xgb pool n_workers must be > 0");
+        anyhow::ensure!(queue_cap_total > 0, "xgb pool queue_cap_total must be > 0");
 
-        let model_path = Arc::new(rt.model_path);
-        let feature_names = Arc::new(rt.feature_names);
+        // Split total cap across workers to keep admission-control semantics intuitive.
+        // Example: n_workers=8, queue_cap_total=512 => per_worker_cap=64.
+        let per_worker_cap = (queue_cap_total + n_workers - 1) / n_workers;
+
+        let model_path = Arc::new(model_path.as_ref().to_path_buf());
 
         let mut workers = Vec::with_capacity(n_workers);
         let pin_cpus = pin_cpus.unwrap_or_default();
 
         for wid in 0..n_workers {
-            let (tx, mut rx) = mpsc::channel::<XgbJob>(queue_cap);
+            let (tx, mut rx) = mpsc::channel::<XgbJob>(per_worker_cap);
             let model_path = Arc::clone(&model_path);
             let feature_names = Arc::clone(&feature_names);
             let cpu = pin_cpus.get(wid).copied();
+            let warmup_iters = warmup_iters;
 
             thread::Builder::new()
                 .name(format!("xgb-worker-{wid}"))
@@ -118,6 +136,18 @@ impl XgbPool {
                         }
                     };
 
+                    // Warmup: initialize thread-local buffers & JIT-ish internals.
+                    if warmup_iters > 0 {
+                        let ncols = feature_names.len();
+                        let row = vec![f32::NAN; ncols];
+                        for _ in 0..warmup_iters {
+                            let _ = bst.predict_proba_dense_1row(&row);
+                        }
+                        // Best-effort warmup for contrib path (usually colder).
+                        let _ = bst.predict_contribs_dense_1row(&row);
+                        eprintln!("xgb-worker-{wid}: warmup done iters={warmup_iters}");
+                    }
+
                     // Main loop
                     while let Some(job) = rx.blocking_recv() {
                         let now = Instant::now();
@@ -126,7 +156,7 @@ impl XgbPool {
                                 .as_micros()
                                 .min(u128::from(u64::MAX)) as u64;
 
-                        histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
+                        metrics::histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
 
                         let t0 = Instant::now();
                         let score = match bst.predict_proba_dense_1row(&job.row) {
@@ -164,7 +194,7 @@ impl XgbPool {
                         }
 
                         let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                        histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
+                        metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
 
                         let _ = job.resp_tx.send(Ok(XgbOut {
                             score,
@@ -183,6 +213,26 @@ impl XgbPool {
             workers,
             rr: AtomicUsize::new(0),
         })
+    }
+
+    /// Convenience: build a pool directly from a model directory (same format as `XgbRuntime::load_from_dir`).
+    pub fn new_from_dir(
+        model_dir: impl AsRef<Path>,
+        n_workers: usize,
+        queue_cap_total: usize,
+        warmup_iters: usize,
+        pin_cpus: Option<Vec<usize>>,
+    ) -> anyhow::Result<Self> {
+        let rt = crate::xgb_runtime::XgbRuntime::load_from_dir(model_dir.as_ref())
+            .with_context(|| format!("load model dir: {}", model_dir.as_ref().display()))?;
+        Self::new_with_pinning(
+            rt.model_path,
+            Arc::new(rt.feature_names),
+            n_workers,
+            queue_cap_total,
+            warmup_iters,
+            pin_cpus,
+        )
     }
 
     /// Non-blocking submission. Returns a oneshot receiver to await the result.

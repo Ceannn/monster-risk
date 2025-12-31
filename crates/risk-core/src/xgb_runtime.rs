@@ -174,11 +174,45 @@ impl XgbRuntime {
                 .map_err(|e: String| anyhow::anyhow!(e))
                 .context("predict_contribs_dense_1row")?;
 
-            // strict_shape=true 时通常是 3D: [1, groups, m]
-            // 有时也可能是 2D: [1, m]
             let contrib_row: Vec<f32> = match out.shape.as_slice() {
-                [1, _groups, m] => out.values[..*m].to_vec(),
-                [1, m] => out.values[..*m].to_vec(),
+                // strict_shape=true 常见： [1, groups, m]
+                [1, _groups, m] => {
+                    let m_u64 = *m;
+                    let m_usize: usize = m_u64
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("contrib shape dim overflow: {}", m_u64))?;
+
+                    if m_usize > out.values.len() {
+                        anyhow::bail!(
+                            "contrib shape {:?} implies m={}, but values.len()={}",
+                            out.shape,
+                            m_usize,
+                            out.values.len()
+                        );
+                    }
+
+                    out.values[..m_usize].to_vec()
+                }
+
+                // 有时也会是： [1, m]
+                [1, m] => {
+                    let m_u64 = *m;
+                    let m_usize: usize = m_u64
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("contrib shape dim overflow: {}", m_u64))?;
+
+                    if m_usize > out.values.len() {
+                        anyhow::bail!(
+                            "contrib shape {:?} implies m={}, but values.len()={}",
+                            out.shape,
+                            m_usize,
+                            out.values.len()
+                        );
+                    }
+
+                    out.values[..m_usize].to_vec()
+                }
+
                 _ => anyhow::bail!("unexpected contrib shape: {:?}", out.shape),
             };
 

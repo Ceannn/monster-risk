@@ -19,7 +19,11 @@ pub type BoosterHandle = *mut c_void;
 extern "C" {
     fn XGBGetLastError() -> *const c_char;
 
-    fn XGBoosterCreate(dmats: *const DMatrixHandle, len: BstUlong, out: *mut BoosterHandle) -> c_uint;
+    fn XGBoosterCreate(
+        dmats: *const DMatrixHandle,
+        len: BstUlong,
+        out: *mut BoosterHandle,
+    ) -> c_uint;
     fn XGBoosterFree(handle: BoosterHandle) -> c_uint;
     fn XGBoosterLoadModel(handle: BoosterHandle, fname: *const c_char) -> c_uint;
 
@@ -27,6 +31,7 @@ extern "C" {
         handle: BoosterHandle,
         array_interface: *const c_char,
         config: *const c_char,
+        m: DMatrixHandle, // ✅ 关键：必须有这个参数
         out_shape: *mut *const BstUlong,
         out_dim: *mut BstUlong,
         out_result: *mut *const f32,
@@ -102,16 +107,21 @@ impl Booster {
     }
 
     /// Generic dense prediction entry point.
-    pub fn predict_from_dense(&self, array_interface: &CStr, config: &CStr) -> anyhow::Result<PredictOutput> {
-        let mut out_shape_ptr: *const BstUlong = ptr::null();
+    pub fn predict_from_dense(
+        &self,
+        array_interface: &CStr,
+        config: &CStr,
+    ) -> anyhow::Result<PredictOutput> {
+        let mut out_shape_ptr: *const BstUlong = std::ptr::null();
         let mut out_dim: BstUlong = 0;
-        let mut out_result_ptr: *const f32 = ptr::null();
+        let mut out_result_ptr: *const f32 = std::ptr::null();
 
         unsafe {
             check(XGBoosterPredictFromDense(
                 self.handle,
                 array_interface.as_ptr(),
                 config.as_ptr(),
+                std::ptr::null_mut(), // ✅ m = NULL（和官方 inference.c 示例一致）
                 &mut out_shape_ptr,
                 &mut out_dim,
                 &mut out_result_ptr,
@@ -128,8 +138,7 @@ impl Booster {
         let n = shape
             .iter()
             .copied()
-            .fold(1u64, |acc, v| acc.saturating_mul(v))
-            as usize;
+            .fold(1u64, |acc, v| acc.saturating_mul(v)) as usize;
 
         let values = if n == 0 || out_result_ptr.is_null() {
             Vec::new()
@@ -144,31 +153,38 @@ impl Booster {
     ///
     /// Uses per-thread cached `DenseArrayInterface` + config.
     pub fn predict_proba_dense_1row(&self, row: &[f32]) -> Result<f32, String> {
-        TLS_DENSE.with(|cell| {
-            let mut tls = cell.borrow_mut();
-            if tls.as_ref().map(|x| x.ncols) != Some(row.len()) {
-                *tls = Some(TlsDense::new(row.len())?);
-            }
-            let tls = tls.as_mut().expect("initialized");
-            tls.ai.data_mut().copy_from_slice(row);
-            let out = self.predict_from_dense(tls.ai.as_cstr(), tls.cfg_pred.as_c_str())?;
-            Ok(out.values.get(0).copied().unwrap_or(0.0))
-        }).map_err(|e| e.to_string())
+        // Pin the closure return type so the compiler can infer the concrete error type.
+        // Otherwise `?` only constrains it to "something convertible from anyhow::Error",
+        // and the final `.map_err(|e| e.to_string())` becomes ambiguous (E0282).
+        TLS_DENSE
+            .with(|cell| -> anyhow::Result<f32> {
+                let mut tls = cell.borrow_mut();
+                if tls.as_ref().map(|x| x.ncols) != Some(row.len()) {
+                    *tls = Some(TlsDense::new(row.len())?);
+                }
+                let tls = tls.as_mut().expect("initialized");
+                tls.ai.data_mut().copy_from_slice(row);
+                let out = self.predict_from_dense(tls.ai.as_cstr(), tls.cfg_pred.as_c_str())?;
+                Ok(out.values.get(0).copied().unwrap_or(0.0))
+            })
+            .map_err(|e| e.to_string())
     }
 
     /// Fast helper: predict contribution vector for a single dense row.
     ///
     /// `values` length is typically `ncols + 1` (last element = bias).
     pub fn predict_contribs_dense_1row(&self, row: &[f32]) -> Result<PredictOutput, String> {
-        TLS_DENSE.with(|cell| {
-            let mut tls = cell.borrow_mut();
-            if tls.as_ref().map(|x| x.ncols) != Some(row.len()) {
-                *tls = Some(TlsDense::new(row.len())?);
-            }
-            let tls = tls.as_mut().expect("initialized");
-            tls.ai.data_mut().copy_from_slice(row);
-            self.predict_from_dense(tls.ai.as_cstr(), tls.cfg_contrib.as_c_str())
-        }).map_err(|e| e.to_string())
+        TLS_DENSE
+            .with(|cell| -> anyhow::Result<PredictOutput> {
+                let mut tls = cell.borrow_mut();
+                if tls.as_ref().map(|x| x.ncols) != Some(row.len()) {
+                    *tls = Some(TlsDense::new(row.len())?);
+                }
+                let tls = tls.as_mut().expect("initialized");
+                tls.ai.data_mut().copy_from_slice(row);
+                self.predict_from_dense(tls.ai.as_cstr(), tls.cfg_contrib.as_c_str())
+            })
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -218,12 +234,17 @@ struct TlsDense {
 impl TlsDense {
     fn new(ncols: usize) -> anyhow::Result<Self> {
         let ai = DenseArrayInterface::new_1row(ncols)?;
+
+        // 说明：
+        // - missing: NaN 这在官方 inference.c 里就是这么写的（不是标准 JSON，但 XGBoost 的配置解析支持）:contentReference[oaicite:1]{index=1}
+        // - cache_id: 0 允许 XGBoost 做内部缓存（m=NULL 也能用）
         let cfg_pred = CString::new(
-            r#"{"training":false,"type":0,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#,
+            r#"{"training":false,"type":0,"iteration_begin":0,"iteration_end":0,"strict_shape":false,"cache_id":0,"missing":NaN}"#,
         )?;
         let cfg_contrib = CString::new(
-            r#"{"training":false,"type":0,"iteration_begin":0,"iteration_end":0,"strict_shape":false,"pred_contribs":true}"#,
+            r#"{"training":false,"type":0,"iteration_begin":0,"iteration_end":0,"strict_shape":false,"pred_contribs":true,"cache_id":0,"missing":NaN}"#,
         )?;
+
         Ok(Self {
             ncols,
             ai,

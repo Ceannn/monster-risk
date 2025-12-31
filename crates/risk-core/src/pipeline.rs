@@ -63,15 +63,31 @@ impl AppCore {
             .and_then(|s| s.parse().ok())
             .unwrap_or(50);
 
+        // Optional CPU pinning for XGB workers.
+        // Example: XGB_POOL_PIN_CPUS="2,4,6,8" (linux only)
+        let pin_cpus: Option<Vec<usize>> = std::env::var("XGB_POOL_PIN_CPUS")
+            .ok()
+            .and_then(|s| {
+                let v: Vec<usize> = s
+                    .split(',')
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty())
+                    .map(|x| x.parse::<usize>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                if v.is_empty() { None } else { Some(v) }
+            });
+
         let xgb_pool = {
             let feature_names = Arc::new(xgb.feature_names.clone());
             let model_path = xgb.model_path.clone();
-            let pool = XgbPool::new(
+            let pool = XgbPool::new_with_pinning(
                 model_path,
                 feature_names,
                 pool_threads,
                 pool_cap,
                 warmup_iters,
+                pin_cpus,
             )?;
             Some(Arc::new(pool))
         };
@@ -158,6 +174,7 @@ impl AppCore {
                             let c = c as f64;
                             reasons.push(ReasonItem {
                                 signal: name,
+                                value: c,
                                 baseline_p95: 0.0,
                                 direction: if c >= 0.0 {
                                     "risk_up".into()
@@ -238,8 +255,7 @@ impl AppCore {
         metrics::histogram!("stage_xgb_us").record(timings.xgb as f64);
 
         // 额外拆分指标（论文图很好看）
-        metrics::histogram!("xgb_pool_queue_wait_us").record(out.queue_wait_us as f64);
-        metrics::histogram!("xgb_pool_xgb_compute_us").record(out.xgb_us as f64);
+        // queue_wait / compute 已在 pool worker 内记录，这里避免重复计数。
 
         let score_f32 = out.score;
         let decision: Decision = decision_from_str(xgb.decide(score_f32));
@@ -267,11 +283,11 @@ impl AppCore {
                 timings.l2 = now_us(t_l2_total);
                 metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
 
-                if let Some(top) = out2.contrib_topk {
-                    for (name, c) in top {
+                for (name, c) in out2.contrib_topk {
                         let c = c as f64;
                         reasons.push(ReasonItem {
                             signal: name,
+                            value: c,
                             baseline_p95: 0.0,
                             direction: if c >= 0.0 {
                                 "risk_up".into()
@@ -279,7 +295,6 @@ impl AppCore {
                                 "risk_down".into()
                             },
                         });
-                    }
                 }
             }
         }
@@ -373,25 +388,29 @@ impl AppCore {
         if used_l2 {
             reason.push(ReasonItem {
                 signal: "layer2_used".into(),
+                value: 1.0,
                 baseline_p95: 1.0,
                 direction: "info".into(),
             });
         }
 
-        // serialize（统计）
-        let ts0 = Instant::now();
-        timings.serialize = now_us(ts0);
-        metrics::histogram!("stage_serialize_us").record(timings.serialize as f64);
-
-        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
-
-        ScoreResponse {
+        let mut resp = ScoreResponse {
             trace_id,
             score,
             decision,
             reason,
             timings_us: timings,
-        }
+        };
+
+        // serialize（统计用；真正响应序列化在 server 层）
+        let ts0 = Instant::now();
+        let _ = serde_json::to_vec(&resp);
+        resp.timings_us.serialize = now_us(ts0);
+        metrics::histogram!("stage_serialize_us").record(resp.timings_us.serialize as f64);
+
+        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
+
+        resp
     }
 
     fn extract_features(&self, req: &ScoreRequest) -> Vec<(String, f64)> {
@@ -455,6 +474,7 @@ impl AppCore {
         let amount_log = get("amount_log");
         out.push(ReasonItem {
             signal: "amount_log".into(),
+            value: amount_log,
             baseline_p95: 6.5,
             direction: (if amount_log > 6.5 {
                 "risk_up"
@@ -467,6 +487,7 @@ impl AppCore {
         let v60 = get("velocity_60s");
         out.push(ReasonItem {
             signal: "velocity_60s".into(),
+            value: v60,
             baseline_p95: 4.0,
             direction: (if v60 > 4.0 { "risk_up" } else { "risk_down" }).into(),
         });
@@ -474,6 +495,7 @@ impl AppCore {
         let foreign = get("is_foreign");
         out.push(ReasonItem {
             signal: "is_foreign".into(),
+            value: foreign,
             baseline_p95: 1.0,
             direction: (if foreign > 0.5 {
                 "risk_up"
@@ -486,6 +508,7 @@ impl AppCore {
         let mcc = get("mcc_risk");
         out.push(ReasonItem {
             signal: "mcc_risk".into(),
+            value: mcc,
             baseline_p95: 0.8,
             direction: (if mcc > 0.8 { "risk_up" } else { "risk_down" }).into(),
         });

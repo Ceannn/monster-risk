@@ -18,6 +18,8 @@ xgb_ffi = { path = "../xgb-ffi" }
 crossbeam-channel = "0.5"
 futures-channel = "0.3"
 core_affinity = "0.8"
-tokio = "1"
+# risk-core only needs Tokio's sync primitives (mpsc/oneshot). Keep it minimal so
+# it builds cleanly even when the top-level binary is not Tokio-based (e.g. glommio).
+tokio = { version = "1", features = ["sync"] }
 libc = "0.2"
 #xgb-ffi = { path = "../xgb-ffi" }
