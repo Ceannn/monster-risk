@@ -65,18 +65,20 @@ impl AppCore {
 
         // Optional CPU pinning for XGB workers.
         // Example: XGB_POOL_PIN_CPUS="2,4,6,8" (linux only)
-        let pin_cpus: Option<Vec<usize>> = std::env::var("XGB_POOL_PIN_CPUS")
-            .ok()
-            .and_then(|s| {
-                let v: Vec<usize> = s
-                    .split(',')
-                    .map(|x| x.trim())
-                    .filter(|x| !x.is_empty())
-                    .map(|x| x.parse::<usize>())
-                    .collect::<Result<Vec<_>, _>>()
-                    .ok()?;
-                if v.is_empty() { None } else { Some(v) }
-            });
+        let pin_cpus: Option<Vec<usize>> = std::env::var("XGB_POOL_PIN_CPUS").ok().and_then(|s| {
+            let v: Vec<usize> = s
+                .split(',')
+                .map(|x| x.trim())
+                .filter(|x| !x.is_empty())
+                .map(|x| x.parse::<usize>())
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        });
 
         let xgb_pool = {
             let feature_names = Arc::new(xgb.feature_names.clone());
@@ -241,10 +243,39 @@ impl AppCore {
         timings.feature = now_us(t_feat);
         metrics::histogram!("stage_feature_us").record(timings.feature as f64);
 
-        // L1：score（pool）
+        // ---------- admission: dynamic queue-wait budget ----------
+        // 我们要控制的是 “排队等待(queue_wait)” 这部分：一旦等太久，p99 必炸。
+        //
+        // 做法：总预算 = cfg.slo_p99_ms
+        // - 先计算“还剩多少时间”
+        // - 再预留一段 “compute reserve”（用 pool 里滚动估出来的 compute p99 + safety）
+        // - 剩余 = queue_wait budget（交给 xgb_pool 的 deadline）
+        let remain_us: u64 = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+
+        let compute_p99_us = pool.xgb_compute_p99_est_us();
+        let safety_us: u64 = 400; // 经验值：给少量抖动留空间（WSL2/调度/缓存 miss）
+        let reserve_us: u64 = compute_p99_us.saturating_add(safety_us).clamp(800, 8_000);
+
+        // 可选：方便你调参时在 /metrics 里看预算变化
+        metrics::gauge!("xgb_pool_reserve_us").set(reserve_us as f64);
+
+        let budget_us: u64 = remain_us.saturating_sub(reserve_us);
+
+        // 如果已经没预算了：直接当作超期，交给 server 映射 429（早拒绝）
+        if budget_us == 0 {
+            metrics::counter!("router_deadline_miss_total").increment(1);
+            return Err(anyhow::Error::new(XgbPoolError::DeadlineExceeded));
+        }
+        // ---------------------------------------------------------
+
+        // L1：score（pool, with queue-wait budget）
         let t_l1_total = Instant::now();
         let rx = pool
-            .try_submit(row.clone(), 0)
+            .try_submit_with_budget(row.clone(), 0, budget_us)
             .map_err(|e| anyhow::Error::new(e))?;
 
         let out = rx
@@ -273,17 +304,32 @@ impl AppCore {
             } else {
                 metrics::counter!("router_l2_trigger_total").increment(1);
 
-                let t_l2_total = Instant::now();
-                let rx2 = pool.try_submit(row, 5).map_err(|e| anyhow::Error::new(e))?;
+                let remain2_us: u64 = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
 
-                let out2 = rx2
-                    .await
-                    .map_err(|_| anyhow::Error::new(XgbPoolError::Canceled))??;
+                // contrib 计算更重，reserve 更保守一点（避免把尾巴拉爆）
+                let reserve2_us = reserve_us.saturating_mul(4).clamp(2_000, 25_000);
+                let budget2_us = remain2_us.saturating_sub(reserve2_us);
 
-                timings.l2 = now_us(t_l2_total);
-                metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                if budget2_us == 0 {
+                    metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                } else {
+                    let t_l2_total = Instant::now();
+                    let rx2 = pool
+                        .try_submit_with_budget(row, 5, budget2_us)
+                        .map_err(|e| anyhow::Error::new(e))?;
 
-                for (name, c) in out2.contrib_topk {
+                    let out2 = rx2
+                        .await
+                        .map_err(|_| anyhow::Error::new(XgbPoolError::Canceled))??;
+
+                    timings.l2 = now_us(t_l2_total);
+                    metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+
+                    for (name, c) in out2.contrib_topk {
                         let c = c as f64;
                         reasons.push(ReasonItem {
                             signal: name,
@@ -295,6 +341,7 @@ impl AppCore {
                                 "risk_down".into()
                             },
                         });
+                    }
                 }
             }
         }

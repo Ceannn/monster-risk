@@ -7,8 +7,10 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use xgb_ffi::Booster;
-
+use xgb_ffi::PredictOutput;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Policy {
     pub review_threshold: f32,
@@ -175,44 +177,8 @@ impl XgbRuntime {
                 .context("predict_contribs_dense_1row")?;
 
             let contrib_row: Vec<f32> = match out.shape.as_slice() {
-                // strict_shape=true 常见： [1, groups, m]
-                [1, _groups, m] => {
-                    let m_u64 = *m;
-                    let m_usize: usize = m_u64
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("contrib shape dim overflow: {}", m_u64))?;
-
-                    if m_usize > out.values.len() {
-                        anyhow::bail!(
-                            "contrib shape {:?} implies m={}, but values.len()={}",
-                            out.shape,
-                            m_usize,
-                            out.values.len()
-                        );
-                    }
-
-                    out.values[..m_usize].to_vec()
-                }
-
-                // 有时也会是： [1, m]
-                [1, m] => {
-                    let m_u64 = *m;
-                    let m_usize: usize = m_u64
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("contrib shape dim overflow: {}", m_u64))?;
-
-                    if m_usize > out.values.len() {
-                        anyhow::bail!(
-                            "contrib shape {:?} implies m={}, but values.len()={}",
-                            out.shape,
-                            m_usize,
-                            out.values.len()
-                        );
-                    }
-
-                    out.values[..m_usize].to_vec()
-                }
-
+                [1, _groups, m] => slice_contrib(&out, *m)?,
+                [1, m] => slice_contrib(&out, *m)?,
                 _ => anyhow::bail!("unexpected contrib shape: {:?}", out.shape),
             };
 
@@ -229,7 +195,6 @@ impl XgbRuntime {
         }
 
         let contrib = self.contrib_row_with_bias(row)?;
-
         if contrib.len() < n {
             anyhow::bail!(
                 "contrib too short: got {}, expected >= {}",
@@ -238,15 +203,13 @@ impl XgbRuntime {
             );
         }
 
-        // 只取前 n 个（忽略 bias）
-        let mut pairs: Vec<(usize, f32)> = (0..n).map(|i| (i, contrib[i])).collect();
-        pairs.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+        //  topk 选择：O(n log k)，避免全量 sort
+        let idx_vals = topk_abs_idx_vals(&contrib[..n], k);
 
-        Ok(pairs
+        Ok(idx_vals
             .into_iter()
-            .take(k.min(n))
             .map(|(i, c)| (self.feature_names[i].clone(), c))
-            .collect::<Vec<(String, f32)>>())
+            .collect())
     }
 
     pub fn decide(&self, score: f32) -> &'static str {
@@ -258,6 +221,85 @@ impl XgbRuntime {
             "allow"
         }
     }
+}
+#[inline]
+fn slice_contrib(out: &PredictOutput, m: u64) -> anyhow::Result<Vec<f32>> {
+    let m_usize: usize = m
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("contrib shape dim overflow: {}", m))?;
+
+    if m_usize > out.values.len() {
+        anyhow::bail!(
+            "contrib shape {:?} implies m={}, but values.len()={}",
+            out.shape,
+            m_usize,
+            out.values.len()
+        );
+    }
+
+    Ok(out.values[..m_usize].to_vec())
+}
+
+#[derive(Copy, Clone, Debug)]
+struct TopkItem {
+    abs: f32,
+    idx: usize,
+    val: f32,
+}
+impl PartialEq for TopkItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.abs.to_bits() == other.abs.to_bits() && self.idx == other.idx
+    }
+}
+impl Eq for TopkItem {}
+impl PartialOrd for TopkItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TopkItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.abs
+            .total_cmp(&other.abs)
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+/// Return top-k indices/values by absolute value, in descending abs order.
+fn topk_abs_idx_vals(values: &[f32], k: usize) -> Vec<(usize, f32)> {
+    if k == 0 || values.is_empty() {
+        return Vec::new();
+    }
+
+    let k = k.min(values.len());
+    let mut heap: BinaryHeap<Reverse<TopkItem>> = BinaryHeap::with_capacity(k + 1);
+
+    for (idx, &val) in values.iter().enumerate() {
+        let item = TopkItem {
+            abs: val.abs(),
+            idx,
+            val,
+        };
+
+        if heap.len() < k {
+            heap.push(Reverse(item));
+            continue;
+        }
+
+        if let Some(Reverse(min_item)) = heap.peek() {
+            if item.abs > min_item.abs {
+                let _ = heap.pop();
+                heap.push(Reverse(item));
+            }
+        }
+    }
+
+    let mut out: Vec<(usize, f32)> = heap
+        .into_iter()
+        .map(|Reverse(it)| (it.idx, it.val))
+        .collect();
+    out.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+    out
 }
 
 fn read_gz_json_map(path: &Path) -> anyhow::Result<HashMap<String, HashMap<String, f32>>> {

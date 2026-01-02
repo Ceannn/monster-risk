@@ -4,16 +4,22 @@
 //! - XGBoost C-API is blocking and can be CPU heavy; running it on Tokio workers
 //!   causes head-of-line blocking and latency spikes.
 //! - We instead create N dedicated OS threads, each owning its own Booster.
-//! - Submission is non-blocking (`try_submit`); when all queues are full we fail fast.
+//! - Submission is non-blocking (`try_submit*`); when all queues are full we fail fast.
 //!
-//! This file intentionally keeps the public API tiny and stable.
+//! Extras in this version:
+//! - Optional **queue-wait budget**: if a job sits in the queue longer than `budget_us`,
+//!   the worker replies with `DeadlineExceeded` without running inference.
+//! - A lightweight **compute p99 estimator** (per-worker rolling window), exposed via
+//!   `xgb_compute_p99_est_us()` so the pipeline can set smarter budgets.
 
 use anyhow::Context;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use xgb_ffi::Booster;
 
@@ -22,6 +28,7 @@ pub enum XgbPoolError {
     QueueFull,
     WorkerDown,
     Canceled,
+    DeadlineExceeded,
 }
 
 impl std::fmt::Display for XgbPoolError {
@@ -30,6 +37,7 @@ impl std::fmt::Display for XgbPoolError {
             XgbPoolError::QueueFull => write!(f, "xgb pool queue full"),
             XgbPoolError::WorkerDown => write!(f, "xgb pool worker down"),
             XgbPoolError::Canceled => write!(f, "xgb pool job canceled"),
+            XgbPoolError::DeadlineExceeded => write!(f, "xgb pool deadline exceeded"),
         }
     }
 }
@@ -45,6 +53,7 @@ pub struct XgbOut {
 
 struct XgbJob {
     enq_at: Instant,
+    deadline_at: Option<Instant>,
     row: Vec<f32>,
     contrib_topk: usize,
     resp_tx: oneshot::Sender<anyhow::Result<XgbOut>>,
@@ -57,6 +66,9 @@ struct WorkerHandle {
 pub struct XgbPool {
     workers: Vec<WorkerHandle>,
     rr: AtomicUsize,
+
+    // Rolling estimate of compute p99 (microseconds), updated by workers.
+    compute_p99_est_us: Arc<AtomicU64>,
 }
 
 impl XgbPool {
@@ -107,12 +119,16 @@ impl XgbPool {
         let mut workers = Vec::with_capacity(n_workers);
         let pin_cpus = pin_cpus.unwrap_or_default();
 
+        let compute_p99_est_us = Arc::new(AtomicU64::new(0));
+
         for wid in 0..n_workers {
             let (tx, mut rx) = mpsc::channel::<XgbJob>(per_worker_cap);
             let model_path = Arc::clone(&model_path);
             let feature_names = Arc::clone(&feature_names);
             let cpu = pin_cpus.get(wid).copied();
             let warmup_iters = warmup_iters;
+
+            let compute_p99_est_us_w = Arc::clone(&compute_p99_est_us);
 
             thread::Builder::new()
                 .name(format!("xgb-worker-{wid}"))
@@ -148,6 +164,16 @@ impl XgbPool {
                         eprintln!("xgb-worker-{wid}: warmup done iters={warmup_iters}");
                     }
 
+                    // ---- rolling compute p99 estimator (per worker) ----
+                    // Using a small fixed window keeps overhead negligible and avoids extra deps.
+                    const P99_WIN: usize = 2048; // power of two; ~tiny memory, fast copy
+                    const UPDATE_EVERY: u64 = 1024;
+
+                    let mut ring: Vec<u32> = vec![0; P99_WIN];
+                    let mut scratch: Vec<u32> = vec![0; P99_WIN];
+                    let mut seen: u64 = 0;
+                    let mut idx: usize = 0;
+
                     // Main loop
                     while let Some(job) = rx.blocking_recv() {
                         let now = Instant::now();
@@ -157,6 +183,16 @@ impl XgbPool {
                                 .min(u128::from(u64::MAX)) as u64;
 
                         metrics::histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
+
+                        if let Some(deadline_at) = job.deadline_at {
+                            if now >= deadline_at {
+                                metrics::counter!("xgb_pool_deadline_miss_total").increment(1);
+                                let _ = job
+                                    .resp_tx
+                                    .send(Err(anyhow::Error::new(XgbPoolError::DeadlineExceeded)));
+                                continue;
+                            }
+                        }
 
                         let t0 = Instant::now();
                         let score = match bst.predict_proba_dense_1row(&job.row) {
@@ -173,18 +209,11 @@ impl XgbPool {
                                 Ok(out) => {
                                     // Usually len = ncols + 1 (bias). We ignore bias for topk.
                                     let n = feature_names.len().min(out.values.len());
-                                    let mut tmp: Vec<(usize, f32)> =
-                                        (0..n).map(|i| (i, out.values[i])).collect();
-                                    tmp.sort_by(|a, b| {
-                                        b.1.abs()
-                                            .partial_cmp(&a.1.abs())
-                                            .unwrap_or(std::cmp::Ordering::Equal)
-                                    });
-                                    contrib_topk = tmp
-                                        .into_iter()
-                                        .take(job.contrib_topk.min(n))
-                                        .map(|(i, v)| (feature_names[i].clone(), v))
-                                        .collect();
+                                    contrib_topk = topk_abs_named(
+                                        &out.values[..n],
+                                        &feature_names,
+                                        job.contrib_topk,
+                                    );
                                 }
                                 Err(e) => {
                                     let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
@@ -195,6 +224,22 @@ impl XgbPool {
 
                         let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                         metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
+
+                        // update rolling p99 estimate
+                        seen += 1;
+                        ring[idx] = xgb_us.min(u64::from(u32::MAX)) as u32;
+                        idx = (idx + 1) & (P99_WIN - 1);
+
+                        if seen >= P99_WIN as u64 && (seen % UPDATE_EVERY == 0) {
+                            scratch.copy_from_slice(&ring);
+                            let k = (P99_WIN * 99) / 100;
+                            let (_, p99, _) = scratch.select_nth_unstable(k);
+                            let p99u = *p99 as u64;
+
+                            compute_p99_est_us_w.store(p99u, Ordering::Relaxed);
+                            // Optional: export as gauge for debugging.
+                            metrics::gauge!("xgb_pool_xgb_compute_p99_est_us").set(p99u as f64);
+                        }
 
                         let _ = job.resp_tx.send(Ok(XgbOut {
                             score,
@@ -212,6 +257,7 @@ impl XgbPool {
         Ok(Self {
             workers,
             rr: AtomicUsize::new(0),
+            compute_p99_est_us,
         })
     }
 
@@ -235,6 +281,18 @@ impl XgbPool {
         )
     }
 
+    /// Approximate compute p99 (microseconds) for `predict_proba_dense_1row`.
+    ///
+    /// - Returns a conservative default (1500us) until the estimator warms up.
+    pub fn xgb_compute_p99_est_us(&self) -> u64 {
+        let v = self.compute_p99_est_us.load(Ordering::Relaxed);
+        if v == 0 {
+            1_500
+        } else {
+            v
+        }
+    }
+
     /// Non-blocking submission. Returns a oneshot receiver to await the result.
     pub fn try_submit(
         &self,
@@ -249,6 +307,7 @@ impl XgbPool {
         let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
         let mut job = XgbJob {
             enq_at: Instant::now(),
+            deadline_at: None,
             row,
             contrib_topk,
             resp_tx,
@@ -280,6 +339,79 @@ impl XgbPool {
         }
     }
 
+    /// Non-blocking submission with a queue-wait budget (microseconds).
+    ///
+    /// - `budget_us = 0` disables the budget.
+    /// - If the job waits in the queue longer than `budget_us`, the worker will
+    ///   reply with an `XgbPoolError::DeadlineExceeded` without running inference.
+    pub fn try_submit_with_budget(
+        &self,
+        row: Vec<f32>,
+        contrib_topk: usize,
+        budget_us: u64,
+    ) -> Result<oneshot::Receiver<anyhow::Result<XgbOut>>, XgbPoolError> {
+        if budget_us == 0 {
+            return self.try_submit(row, contrib_topk);
+        }
+
+        let n = self.workers.len();
+        if n == 0 {
+            return Err(XgbPoolError::WorkerDown);
+        }
+
+        let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
+
+        let enq_at = Instant::now();
+        let deadline_at = enq_at + Duration::from_micros(budget_us);
+
+        let mut job = XgbJob {
+            enq_at,
+            deadline_at: Some(deadline_at),
+            row,
+            contrib_topk,
+            resp_tx,
+        };
+
+        let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        let mut down = 0usize;
+
+        for i in 0..n {
+            let idx = (start + i) % n;
+            match self.workers[idx].tx.try_send(job) {
+                Ok(()) => return Ok(resp_rx),
+                Err(mpsc::error::TrySendError::Full(j)) => {
+                    job = j;
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(j)) => {
+                    job = j;
+                    down += 1;
+                    continue;
+                }
+            }
+        }
+
+        if down == n {
+            Err(XgbPoolError::WorkerDown)
+        } else {
+            Err(XgbPoolError::QueueFull)
+        }
+    }
+
+    /// Convenience async wrapper with budget.
+    pub async fn submit_with_budget(
+        &self,
+        row: Vec<f32>,
+        contrib_topk: usize,
+        budget_us: u64,
+    ) -> Result<anyhow::Result<XgbOut>, XgbPoolError> {
+        let rx = self.try_submit_with_budget(row, contrib_topk, budget_us)?;
+        match rx.await {
+            Ok(v) => Ok(v),
+            Err(_) => Err(XgbPoolError::Canceled),
+        }
+    }
+
     /// Convenience async wrapper.
     pub async fn submit(
         &self,
@@ -292,6 +424,76 @@ impl XgbPool {
             Err(_) => Err(XgbPoolError::Canceled),
         }
     }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct TopkItem {
+    abs: f32,
+    idx: usize,
+    val: f32,
+}
+
+impl PartialEq for TopkItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.abs.to_bits() == other.abs.to_bits() && self.idx == other.idx
+    }
+}
+impl Eq for TopkItem {}
+
+impl PartialOrd for TopkItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TopkItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.abs
+            .total_cmp(&other.abs)
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+/// Select top-k contributions by absolute value, returning named pairs.
+///
+/// Complexity: O(n log k). This avoids allocating and sorting a full `Vec` of length `n`.
+fn topk_abs_named(values: &[f32], feature_names: &[String], k: usize) -> Vec<(String, f32)> {
+    if k == 0 || values.is_empty() {
+        return Vec::new();
+    }
+
+    let n = values.len().min(feature_names.len());
+    let k = k.min(n);
+
+    let mut heap: BinaryHeap<Reverse<TopkItem>> = BinaryHeap::with_capacity(k + 1);
+    for i in 0..n {
+        let v = values[i];
+        let item = TopkItem {
+            abs: v.abs(),
+            idx: i,
+            val: v,
+        };
+
+        if heap.len() < k {
+            heap.push(Reverse(item));
+            continue;
+        }
+
+        if let Some(Reverse(min_item)) = heap.peek() {
+            if item.abs > min_item.abs {
+                let _ = heap.pop();
+                heap.push(Reverse(item));
+            }
+        }
+    }
+
+    let mut out: Vec<TopkItem> = heap.into_iter().map(|Reverse(it)| it).collect();
+    out.sort_by(|a, b| b.abs.total_cmp(&a.abs));
+
+    let mut named = Vec::with_capacity(out.len());
+    for it in out {
+        named.push((feature_names[it.idx].clone(), it.val));
+    }
+    named
 }
 
 #[cfg(target_os = "linux")]

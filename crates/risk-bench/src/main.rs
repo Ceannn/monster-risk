@@ -1,6 +1,6 @@
 use anyhow::Context;
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PacerMode {
+    /// Fixed interval per shard (+ optional jitter).
+    Periodic,
+    /// Poisson arrivals (exponential inter-arrival time) per shard.
+    Poisson,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -19,11 +27,11 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8080/score")]
     url: String,
 
-    /// Prometheus 文本暴露端点（可选；用于写入路由/降级计数器）
+    /// Prometheus text endpoint (optional; for counters columns)
     #[arg(long, default_value = "http://127.0.0.1:8080/metrics")]
     metrics_url: String,
 
-    /// 当目标 URL 包含 /score_xgb 时使用的 JSON 请求体文件（默认 {}）
+    /// JSON body file for /score_xgb* endpoints (default {})
     #[arg(long)]
     xgb_body_file: Option<String>,
 
@@ -33,33 +41,32 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     duration: u64,
 
-    /// 这里我们将 concurrency 解释为“bench 侧常驻 sender worker 数”（也等价于最大 in-flight）
+    /// Max in-flight. In open-loop mode, if full we drop immediately (no queueing).
     #[arg(long, default_value_t = 200)]
     concurrency: usize,
 
-    /// 输出 CSV（默认写到 results/bench_summary.csv）
+    /// CSV output path
     #[arg(long, default_value = "results/bench_summary.csv")]
     out: String,
 
-    /// 是否抓取 /metrics 写入计数器列
+    /// Scrape /metrics and write counters
     #[arg(long, default_value_t = true)]
     scrape_metrics: bool,
 
-    /// 逗号分隔的 RPS 列表，如：1000,2000,4000,8000
+    /// Comma-separated RPS list, e.g. 1000,2000,4000,8000
     #[arg(long)]
     sweep_rps: Option<String>,
 
-    /// sweep 时每个档位之间休息 N ms（让系统冷却一下）
+    /// Pause between sweep points (ms)
     #[arg(long, default_value_t = 500)]
     sweep_pause_ms: u64,
 
-    /// 目标列表：可重复传参
-    /// 用法：--target tokio,http://127.0.0.1:8080/score_xgb,http://127.0.0.1:8080/metrics
-    ///      --target glommio,http://127.0.0.1:8081/score_xgb,http://127.0.0.1:8081/metrics
+    /// Multiple targets:
+    /// --target tokio,http://127.0.0.1:8080/score_xgb_pool,http://127.0.0.1:8080/metrics
     #[arg(long, value_name = "NAME,SCORE_URL,METRICS_URL")]
     target: Vec<String>,
 
-    /// 自动找拐点：从 start 开始，每次 +step，直到 dropped>0 或 p99 明显上扬
+    /// Find knee automatically
     #[arg(long, default_value_t = false)]
     find_knee: bool,
 
@@ -72,13 +79,36 @@ struct Args {
     #[arg(long, default_value_t = 64000)]
     knee_max_rps: u64,
 
-    /// “明显上扬”的阈值：本档 p99 > 上一档 p99 * (1 + knee_rise_pct)
+    /// Relative jump threshold: p99 > last_p99 * (1 + pct)
     #[arg(long, default_value_t = 0.30)]
     knee_rise_pct: f64,
 
-    /// “明显上扬”的绝对门槛：本档 p99 必须至少比上一档高 knee_abs_us 才算拐点
+    /// Absolute jump threshold: p99 > last_p99 + abs_us
     #[arg(long, default_value_t = 200)]
     knee_abs_us: u64,
+
+    // -------------------------
+    // Pacer controls
+    // -------------------------
+    /// Arrival process: poisson (default) or periodic
+    #[arg(long, value_enum, default_value_t = PacerMode::Poisson)]
+    pacer: PacerMode,
+
+    /// Number of pacer shards (0 = auto)
+    #[arg(long, default_value_t = 0)]
+    pacer_shards: usize,
+
+    /// Periodic-only: add 0..jitter_us microseconds to each interval
+    #[arg(long, default_value_t = 0)]
+    pacer_jitter_us: u64,
+
+    /// RNG seed for reproducibility (0 = time-based)
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+
+    /// Request timeout (ms)
+    #[arg(long, default_value_t = 2000)]
+    req_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +118,7 @@ struct Target {
     metrics_url: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScoreRequest {
     trace_id: Option<String>,
@@ -121,6 +152,7 @@ struct TimingsUs {
     serialize: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScoreResponse {
     trace_id: String,
@@ -142,7 +174,7 @@ struct Sample {
     l2_us: u64,
     serialize_us: u64,
 
-    // bench side schedule lag (actual - planned)
+    // bench side schedule lag / oversleep (microseconds)
     bench_lag_us: u64,
 
     ok: bool,
@@ -153,6 +185,12 @@ struct Summary {
     samples_ok: usize,
     samples_err: usize,
     dropped: u64,
+
+    // HTTP status breakdown for attempted requests (early-drop not counted here)
+    http_2xx: u64,
+    http_429: u64,
+    http_5xx: u64,
+    http_timeout: u64,
 
     p50: u64,
     p95: u64,
@@ -177,13 +215,15 @@ struct Summary {
     router_deadline_miss_total: Option<f64>,
     router_l2_skipped_budget_total: Option<f64>,
     router_timeout_before_l2_total: Option<f64>,
+
+    // xgb_pool metrics (scraped from /metrics if available)
+    xgb_pool_deadline_miss_total: Option<u64>,
+    xgb_pool_xgb_compute_p99_est_us: Option<u64>,
+    xgb_pool_queue_wait_p99_us: Option<u64>,
+    xgb_pool_xgb_compute_p99_us: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
-struct Job {
-    req_id: u64,
-    bench_lag_us: u64,
-}
+static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -198,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
     let targets = parse_targets(&args)?;
     let xgb_body = load_xgb_body(&args)?;
 
-    // 生成 rps 序列
+    // RPS sequence
     let rps_list: Vec<u64> = if args.find_knee {
         let mut v = Vec::new();
         let mut r = args.knee_start_rps.max(1);
@@ -216,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
         vec![args.rps]
     };
 
-    // 记录每个 runtime 的上一档 p99（用于判断“明显上扬”）
+    // previous p99 by runtime
     let mut prev_p99: HashMap<String, u64> = HashMap::new();
 
     for (i, rps) in rps_list.iter().copied().enumerate() {
@@ -231,8 +271,26 @@ async fn main() -> anyhow::Result<()> {
                     t.runtime, rps, summary.samples_err, summary.dropped
                 );
             } else {
+                let dur_s = args.duration.max(1) as f64;
+
+                let ok_u64 = summary.samples_ok as u64;
+                let err_u64 = summary.samples_err as u64;
+                let dropped_u64 = summary.dropped;
+
+                let attempted = ok_u64 + err_u64 + dropped_u64;
+
+                let attempted_rps = attempted as f64 / dur_s;
+                let ok_rps = ok_u64 as f64 / dur_s;
+                let drop_rps = dropped_u64 as f64 / dur_s;
+
+                let drop_pct = if attempted > 0 {
+                    (dropped_u64 as f64) * 100.0 / (attempted as f64)
+                } else {
+                    0.0
+                };
+
                 println!(
-                    "[runtime={} rps={}] ok_samples={} err_samples={} dropped={}  p50={}us  p95={}us  p99={}us",
+                    "[runtime={} rps={}] ok_samples={} err_samples={} dropped={}  p50={}us  p95={}us  p99={}us  attempted_rps={:.1} ok_rps={:.1} drop_rps={:.1} drop_pct={:.3}%",
                     t.runtime,
                     rps,
                     summary.samples_ok,
@@ -240,8 +298,23 @@ async fn main() -> anyhow::Result<()> {
                     summary.dropped,
                     summary.p50,
                     summary.p95,
-                    summary.p99
+                    summary.p99,
+                    attempted_rps,
+                    ok_rps,
+                    drop_rps,
+                    drop_pct,
                 );
+
+                println!(
+                    "[runtime={} rps={}] http: 2xx={} 429={} 5xx={} timeout={}",
+                    t.runtime,
+                    rps,
+                    summary.http_2xx,
+                    summary.http_429,
+                    summary.http_5xx,
+                    summary.http_timeout
+                );
+
                 println!(
                     "[runtime={} rps={}] stage_p99(us): parse={} feature={} router={} xgb={} l2={} serialize={}",
                     t.runtime,
@@ -253,6 +326,22 @@ async fn main() -> anyhow::Result<()> {
                     summary.l2_p99,
                     summary.serialize_p99
                 );
+
+                if summary.xgb_pool_deadline_miss_total.is_some()
+                    || summary.xgb_pool_xgb_compute_p99_est_us.is_some()
+                    || summary.xgb_pool_queue_wait_p99_us.is_some()
+                    || summary.xgb_pool_xgb_compute_p99_us.is_some()
+                {
+                    let miss = summary.xgb_pool_deadline_miss_total.unwrap_or(0);
+                    let est = summary.xgb_pool_xgb_compute_p99_est_us.unwrap_or(0);
+                    let q = summary.xgb_pool_queue_wait_p99_us.unwrap_or(0);
+                    let c = summary.xgb_pool_xgb_compute_p99_us.unwrap_or(0);
+                    println!(
+                        "[runtime={} rps={}] xgb_pool: deadline_miss_total={} compute_p99_est_us={} queue_wait_p99_us={} compute_p99_us={}",
+                        t.runtime, rps, miss, est, q, c
+                    );
+                }
+
                 println!(
                     "[runtime={} rps={}] bench_lag_p99={}us bench_lag_max={}us missed_ticks_total={}",
                     t.runtime,
@@ -304,7 +393,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if args.find_knee && !knee_reasons.is_empty() {
-            println!("\n=== KNEE HIT at rps={} ===", rps);
+            println!(
+                "
+=== KNEE HIT at rps={} ===",
+                rps
+            );
             for r in knee_reasons {
                 println!(" - {}", r);
             }
@@ -332,6 +425,7 @@ fn percentile(sorted_us: &[u64], p: f64) -> u64 {
     sorted_us[rank.min(n - 1)]
 }
 
+#[allow(dead_code)]
 fn gen_req(rng: &mut StdRng) -> ScoreRequest {
     let user = rng.gen_range(1..=10_000);
     let card = rng.gen_range(1..=50_000);
@@ -391,7 +485,11 @@ fn parse_rps_list(s: &str) -> anyhow::Result<Vec<u64>> {
 }
 
 fn build_client(args: &Args) -> anyhow::Result<reqwest::Client> {
+    let timeout = Duration::from_millis(args.req_timeout_ms.max(1));
+
     reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_millis(500))
         .pool_idle_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(args.concurrency.max(1))
         .tcp_nodelay(true)
@@ -399,9 +497,9 @@ fn build_client(args: &Args) -> anyhow::Result<reqwest::Client> {
         .context("build reqwest client")
 }
 
+#[allow(dead_code)]
 fn prepare_score_bodies(seed: u64, n: usize) -> anyhow::Result<Vec<Bytes>> {
-    // 预生成 N 个请求体，避免压测过程中反复 serde_json 序列化造成噪声和抖动
-    // 不改变“字段集合”，只是把“每次生成”改成“提前生成 + 循环使用”
+    // Pre-generate request bodies to avoid serde/alloc noise during benchmark
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Vec::with_capacity(n.max(1));
     for _ in 0..n.max(1) {
@@ -412,6 +510,14 @@ fn prepare_score_bodies(seed: u64, n: usize) -> anyhow::Result<Vec<Bytes>> {
     Ok(out)
 }
 
+/// inter-arrival ~ Exp(rate)
+fn sample_exp_interval(rng: &mut StdRng, rate_per_sec: f64) -> Duration {
+    let u: f64 = 1.0 - rng.gen::<f64>(); // (0,1]
+    let dt_s = -u.ln() / rate_per_sec.max(1e-12);
+    let ns = (dt_s * 1_000_000_000.0).ceil() as u64;
+    Duration::from_nanos(ns.max(1))
+}
+
 async fn run_once(
     args: &Args,
     rps: u64,
@@ -419,28 +525,36 @@ async fn run_once(
     metrics_url: &str,
     xgb_body: &Bytes,
 ) -> anyhow::Result<Summary> {
-    use serde::Deserialize;
+    // seed=0 => time-based (less deterministic but closer to reality)
+    let seed = if args.seed == 0 {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        t.as_nanos() as u64
+    } else {
+        args.seed
+    };
 
-    let client = build_client(args)?;
+    let client = Arc::new(build_client(args)?);
 
-    // 命中 /score_xgb /score_xgb_async /score_xgb_pool 等
+    // /score_xgb /score_xgb_async /score_xgb_pool etc
     let is_xgb = url.contains("/score_xgb");
 
-    // 预生成 score 的请求体池（仅在非 xgb 路径用）
+    // Pre-generated bodies only for non-xgb endpoints
     let score_bodies = if is_xgb {
         None
     } else {
-        // 用一个固定池大小：至少 1024，最多 8192（够随机、内存也很小）
         let n = args.concurrency.max(256).min(8192);
         Some(Arc::new(
             prepare_score_bodies(42u64, n).context("prepare score bodies")?,
         ))
     };
 
-    // samples channel
-    let (sample_tx, mut sample_rx) = mpsc::channel::<Sample>(256_000);
+    // Unbounded to avoid backpressure deadlocks inside the bench itself.
+    let (sample_tx, mut sample_rx) = mpsc::unbounded_channel::<Sample>();
+    let (lag_tx, mut lag_rx) = mpsc::unbounded_channel::<u64>();
 
-    // collector: gather into vectors (依旧沿用你实验字段，不新增)
+    // Collector task
     let collector = tokio::spawn(async move {
         let mut e2e = Vec::<u64>::with_capacity(200_000);
         let mut parse = Vec::<u64>::with_capacity(200_000);
@@ -471,198 +585,222 @@ async fn run_once(
         (e2e, parse, feature, router, xgb, l2, serialize, ok, err)
     });
 
-    // job queue：这是关键！有界队列 + try_send，满了就 dropped（避免制造突发洪峰）
-    let job_q_cap = (args.concurrency.max(1) * 4).max(1024).min(200_000);
-    let (job_tx, job_rx) = mpsc::channel::<Job>(job_q_cap);
-
-    // 固定 sender workers（替代 per-tick tokio::spawn）
+    // In-flight limit
     let workers = args.concurrency.max(1);
+    let inflight = Arc::new(Semaphore::new(workers));
 
-    // 仅解析 timings（bench 端不需要完整 ScoreResponse）
+    // Only parse timings
     #[derive(Debug, Deserialize)]
-    struct RespXgb {
-        timings_us: TimingsXgb,
-    }
-    #[derive(Debug, Deserialize)]
-    struct TimingsXgb {
-        #[serde(default)]
-        parse: u64,
-        #[serde(default)]
-        feature: u64,
-        #[serde(default)]
-        router: u64,
-        #[serde(default)]
-        xgb: u64,
-        #[serde(default)]
-        l2: u64,
-        #[serde(default)]
-        serialize: u64,
+    struct RespTimings {
+        timings_us: TimingsUs,
     }
 
-    // 兼容旧字段 l1
-    #[derive(Debug, Deserialize)]
-    struct RespL1 {
-        timings_us: TimingsL1,
-    }
-    #[derive(Debug, Deserialize)]
-    struct TimingsL1 {
-        #[serde(default)]
-        parse: u64,
-        #[serde(default)]
-        feature: u64,
-        #[serde(default)]
-        router: u64,
-        #[serde(default)]
-        l1: u64,
-        #[serde(default)]
-        l2: u64,
-        #[serde(default)]
-        serialize: u64,
-    }
-
-    // worker 共享 rx：用 Mutex 包装（tokio mpsc Receiver 不能 clone）
-    // 注意：这不是性能瓶颈，因为每个 job 只锁一次取任务；真正成本在网络/推理上
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
-
-    static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
     let url_s = Arc::new(url.to_string());
     let xgb_body = Arc::new(xgb_body.clone());
-    let client = Arc::new(client);
 
-    let mut worker_handles = Vec::with_capacity(workers);
-    for _ in 0..workers {
-        let rx = shared_rx.clone();
-        let tx = sample_tx.clone();
+    let start = tokio::time::Instant::now();
+    let end = start + Duration::from_secs(args.duration);
+
+    // pacer shards
+    let mut shards = if args.pacer_shards == 0 {
+        args.concurrency.max(1).clamp(32, 256)
+    } else {
+        args.pacer_shards.max(1).min(4096)
+    };
+    shards = shards.min(rps.max(1) as usize).max(1);
+
+    let dropped = Arc::new(AtomicU64::new(0));
+    // HTTP status counters (attempted requests only; early-drop not counted)
+    let http_2xx = Arc::new(AtomicU64::new(0));
+    let http_429 = Arc::new(AtomicU64::new(0));
+    let http_5xx = Arc::new(AtomicU64::new(0));
+    let http_timeout = Arc::new(AtomicU64::new(0));
+
+    // ✅ missed threshold: >= 5ms (only count real pauses)
+    let missed = Arc::new(AtomicU64::new(0));
+    let miss_threshold_us: u64 = 5_000;
+
+    let mut pacers = Vec::with_capacity(shards);
+
+    for shard_idx in 0..shards {
+        // Split RPS across shards as evenly as possible
+        let base = rps / shards as u64;
+        let extra = (shard_idx as u64) < (rps % shards as u64);
+        let my_rps = base + if extra { 1 } else { 0 };
+        if my_rps == 0 {
+            continue;
+        }
+
+        let rate = my_rps as f64;
+
         let client = client.clone();
         let url = url_s.clone();
         let xgb_body = xgb_body.clone();
         let score_bodies = score_bodies.clone();
+        let inflight = inflight.clone();
+        let sample_tx = sample_tx.clone();
+        let lag_tx = lag_tx.clone();
+        let dropped = dropped.clone();
+        let missed = missed.clone();
+        let http_2xx = http_2xx.clone();
+        let http_429 = http_429.clone();
+        let http_5xx = http_5xx.clone();
+        let http_timeout = http_timeout.clone();
+
+        let mut rng = StdRng::seed_from_u64(
+            seed.wrapping_add((shard_idx as u64).wrapping_mul(0x9E3779B97F4A7C15)),
+        );
+
+        let pacer_mode = args.pacer;
+        let jitter_us = args.pacer_jitter_us;
 
         let h = tokio::spawn(async move {
-            loop {
-                let job = {
-                    let mut g = rx.lock().await;
-                    g.recv().await
-                };
-                let Some(job) = job else {
-                    break;
-                };
+            while tokio::time::Instant::now() < end {
+                let now = tokio::time::Instant::now();
 
-                let t0 = Instant::now();
-                let mut sample = Sample::default();
-                sample.bench_lag_us = job.bench_lag_us;
-
-                let send_res = if is_xgb {
-                    client
-                        .post(url.as_str())
-                        .header("content-type", "application/json")
-                        .body((*xgb_body).clone())
-                        .send()
-                        .await
-                } else {
-                    // 从预生成池取一个 body（避免 serde+alloc 噪声）
-                    let bodies = score_bodies.as_ref().expect("score_bodies");
-                    let idx = (job.req_id as usize) % bodies.len();
-                    client
-                        .post(url.as_str())
-                        .header("content-type", "application/json")
-                        .body(bodies[idx].clone())
-                        .send()
-                        .await
+                // Next inter-arrival
+                let mut dt = match pacer_mode {
+                    PacerMode::Poisson => sample_exp_interval(&mut rng, rate),
+                    PacerMode::Periodic => {
+                        let ns = (1_000_000_000u64 / my_rps.max(1)).max(1);
+                        Duration::from_nanos(ns)
+                    }
                 };
 
-                match send_res {
-                    Ok(resp) => match resp.bytes().await {
-                        Ok(bytes) => {
-                            sample.e2e_us = t0.elapsed().as_micros() as u64;
-
-                            if let Ok(r) = serde_json::from_slice::<RespXgb>(&bytes) {
-                                sample.parse_us = r.timings_us.parse;
-                                sample.feature_us = r.timings_us.feature;
-                                sample.router_us = r.timings_us.router;
-                                sample.xgb_us = r.timings_us.xgb;
-                                sample.l2_us = r.timings_us.l2;
-                                sample.serialize_us = r.timings_us.serialize;
-                                sample.ok = true;
-                            } else if let Ok(r) = serde_json::from_slice::<RespL1>(&bytes) {
-                                sample.parse_us = r.timings_us.parse;
-                                sample.feature_us = r.timings_us.feature;
-                                sample.router_us = r.timings_us.router;
-                                sample.xgb_us = r.timings_us.l1;
-                                sample.l2_us = r.timings_us.l2;
-                                sample.serialize_us = r.timings_us.serialize;
-                                sample.ok = true;
-                            } else {
-                                sample.ok = false;
-                            }
-                        }
-                        Err(_) => sample.ok = false,
-                    },
-                    Err(_) => sample.ok = false,
+                // Optional jitter for periodic
+                if matches!(pacer_mode, PacerMode::Periodic) && jitter_us > 0 {
+                    let j = rng.gen_range(0..=jitter_us) as u64;
+                    dt += Duration::from_micros(j);
                 }
 
-                let _ = tx.send(sample).await;
+                if now + dt >= end {
+                    break;
+                }
+
+                // Delay semantics: do not catch up (avoids self-inflicted burst)
+                let sleep_start = tokio::time::Instant::now();
+                tokio::time::sleep(dt).await;
+                let actual = sleep_start.elapsed();
+                let lag = actual.saturating_sub(dt);
+                let lag_us = lag.as_micros() as u64;
+
+                let _ = lag_tx.send(lag_us);
+                if lag_us >= miss_threshold_us {
+                    missed.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // early drop if in-flight is full
+                let permit = match inflight.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                let req_id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+                let body: Bytes = if is_xgb {
+                    (*xgb_body).clone()
+                } else {
+                    let bodies = score_bodies.as_ref().expect("score_bodies");
+                    let idx = (req_id as usize) % bodies.len();
+                    bodies[idx].clone()
+                };
+
+                let client2 = client.clone();
+                let url2 = url.clone();
+                let tx2 = sample_tx.clone();
+                let http_2xx2 = http_2xx.clone();
+                let http_4292 = http_429.clone();
+                let http_5xx2 = http_5xx.clone();
+                let http_timeout2 = http_timeout.clone();
+
+                tokio::spawn(async move {
+                    let _permit = permit; // released on drop
+
+                    let t0 = Instant::now();
+                    let mut sample = Sample::default();
+                    sample.bench_lag_us = lag_us;
+
+                    let send_res = client2
+                        .post(url2.as_str())
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .send()
+                        .await;
+
+                    match send_res {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let code = status.as_u16();
+                            if (200..=299).contains(&code) {
+                                http_2xx2.fetch_add(1, Ordering::Relaxed);
+                            } else if code == 429 {
+                                http_4292.fetch_add(1, Ordering::Relaxed);
+                            } else if (500..=599).contains(&code) {
+                                http_5xx2.fetch_add(1, Ordering::Relaxed);
+                            }
+
+                            let status_ok = status.is_success();
+                            match resp.bytes().await {
+                                Ok(bytes) => {
+                                    sample.e2e_us = t0.elapsed().as_micros() as u64;
+                                    if status_ok {
+                                        if let Ok(r) = serde_json::from_slice::<RespTimings>(&bytes)
+                                        {
+                                            sample.parse_us = r.timings_us.parse;
+                                            sample.feature_us = r.timings_us.feature;
+                                            sample.router_us = r.timings_us.router;
+                                            sample.xgb_us = r.timings_us.xgb;
+                                            sample.l2_us = r.timings_us.l2;
+                                            sample.serialize_us = r.timings_us.serialize;
+                                            sample.ok = true;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    sample.e2e_us = t0.elapsed().as_micros() as u64;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if e.is_timeout() {
+                                http_timeout2.fetch_add(1, Ordering::Relaxed);
+                            }
+                            sample.e2e_us = t0.elapsed().as_micros() as u64;
+                        }
+                    }
+
+                    let _ = tx2.send(sample);
+                });
             }
         });
-        worker_handles.push(h);
-    }
-    drop(sample_tx); // collector 只要等所有 worker 退出即可结束
 
-    let start = Instant::now();
-    let end = start + Duration::from_secs(args.duration);
-
-    // 固定速率 open-loop（Delay：不追赶补发）
-    let ns = (1_000_000_000u64 / rps.max(1)).max(1);
-    let interval = Duration::from_nanos(ns);
-
-    let first_tick = tokio::time::Instant::now() + interval;
-    let mut tick = tokio::time::interval_at(first_tick, interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    // bench 侧滞后统计：actual - planned
-    let interval_ns: u128 = interval.as_nanos().max(1);
-    let mut seq: u64 = 0;
-
-    let mut bench_lag_us_vec: Vec<u64> =
-        Vec::with_capacity(((args.duration as usize).saturating_mul(rps as usize)).min(2_000_000));
-    let mut missed_ticks_total: u64 = 0;
-
-    let mut dropped: u64 = 0;
-
-    while Instant::now() < end {
-        tick.tick().await;
-
-        // planned tick 时间点 + lag
-        let off_ns: u128 = interval_ns.saturating_mul(seq as u128);
-        let off_ns_u64: u64 = off_ns.min(u64::MAX as u128) as u64;
-        let planned = first_tick + Duration::from_nanos(off_ns_u64);
-
-        let now = tokio::time::Instant::now();
-        let lag = now.saturating_duration_since(planned);
-        let lag_us: u64 = lag.as_micros() as u64;
-        bench_lag_us_vec.push(lag_us);
-
-        if lag.as_nanos() > interval_ns {
-            missed_ticks_total += (lag.as_nanos() / interval_ns) as u64;
-        }
-        seq = seq.wrapping_add(1);
-
-        let req_id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
-        let job = Job {
-            req_id,
-            bench_lag_us: lag_us,
-        };
-
-        // 关键：try_send，队列满就 dropped（不阻塞，不补发，不制造 burst）
-        if job_tx.try_send(job).is_err() {
-            dropped += 1;
-        }
+        pacers.push(h);
     }
 
-    drop(job_tx);
-
-    for h in worker_handles {
+    // wait for pacers
+    for h in pacers {
         let _ = h.await;
+    }
+
+    // wait for all in-flight requests to finish
+    let mut permits = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        if let Ok(p) = inflight.clone().acquire_owned().await {
+            permits.push(p);
+        }
+    }
+    drop(permits);
+
+    // close channels
+    drop(sample_tx);
+    drop(lag_tx);
+
+    // collect lag samples
+    let mut bench_lag_us_vec: Vec<u64> = Vec::new();
+    while let Some(v) = lag_rx.recv().await {
+        bench_lag_us_vec.push(v);
     }
 
     let (mut e2e, mut parse, mut feature, mut router, mut xgb, mut l2, mut serialize, ok, err) =
@@ -671,12 +809,16 @@ async fn run_once(
     let mut summary = Summary::default();
     summary.samples_ok = ok;
     summary.samples_err = err;
-    summary.dropped = dropped;
+    summary.dropped = dropped.load(Ordering::Relaxed);
+    summary.http_2xx = http_2xx.load(Ordering::Relaxed);
+    summary.http_429 = http_429.load(Ordering::Relaxed);
+    summary.http_5xx = http_5xx.load(Ordering::Relaxed);
+    summary.http_timeout = http_timeout.load(Ordering::Relaxed);
 
     bench_lag_us_vec.sort_unstable();
     summary.bench_lag_p99_us = percentile(&bench_lag_us_vec, 99.0);
     summary.bench_lag_max_us = *bench_lag_us_vec.last().unwrap_or(&0);
-    summary.missed_ticks_total = missed_ticks_total;
+    summary.missed_ticks_total = missed.load(Ordering::Relaxed);
 
     if ok > 0 {
         e2e.sort_unstable();
@@ -701,14 +843,18 @@ async fn run_once(
     }
 
     if args.scrape_metrics {
-        // 注意：这里用单独 client 抓 metrics 不会污染主压测连接池（这一点你之前就做对了）
+        // use a separate client to avoid disturbing main pool
         if let Ok(resp) = build_client(args)?.get(metrics_url).send().await {
             if let Ok(text) = resp.text().await {
-                let (l2_trig, miss, skip, before_l2) = scrape_counters(&text);
-                summary.router_l2_trigger_total = l2_trig;
-                summary.router_deadline_miss_total = miss;
-                summary.router_l2_skipped_budget_total = skip;
-                summary.router_timeout_before_l2_total = before_l2;
+                let snap = scrape_metrics_snapshot(&text);
+                summary.router_l2_trigger_total = snap.router_l2_trigger_total;
+                summary.router_deadline_miss_total = snap.router_deadline_miss_total;
+                summary.router_l2_skipped_budget_total = snap.router_l2_skipped_budget_total;
+                summary.router_timeout_before_l2_total = snap.router_timeout_before_l2_total;
+                summary.xgb_pool_deadline_miss_total = snap.xgb_pool_deadline_miss_total;
+                summary.xgb_pool_xgb_compute_p99_est_us = snap.xgb_pool_xgb_compute_p99_est_us;
+                summary.xgb_pool_queue_wait_p99_us = snap.xgb_pool_queue_wait_p99_us;
+                summary.xgb_pool_xgb_compute_p99_us = snap.xgb_pool_xgb_compute_p99_us;
             }
         }
     }
@@ -743,43 +889,88 @@ fn write_csv_row(
     if need_header {
         writeln!(
             f,
-            "ts_ms,runtime,url,metrics_url,rps,duration_s,concurrency,ok,err,dropped,p50_us,p95_us,p99_us,parse_p99_us,feature_p99_us,router_p99_us,xgb_p99_us,l2_p99_us,serialize_p99_us,router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total,bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
+            "ts_ms,runtime,url,metrics_url,target_rps,duration_s,concurrency,\
+attempted,attempted_rps,ok,ok_rps,err,err_rps,dropped,drop_rps,drop_pct,\
+http_2xx,http_429,http_5xx,http_timeout,\
+p50_us,p95_us,p99_us,\
+parse_p99_us,feature_p99_us,router_p99_us,xgb_p99_us,l2_p99_us,serialize_p99_us,\
+router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total,\
+xgb_pool_deadline_miss_total,xgb_pool_xgb_compute_p99_est_us,xgb_pool_queue_wait_p99_us,xgb_pool_xgb_compute_p99_us,\
+bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
         )?;
     }
 
-    let ts_ms = current_time_ms();
-    writeln!(
-        f,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        ts_ms,
-        escape_csv(runtime),
-        escape_csv(url),
-        escape_csv(metrics_url),
-        rps_used,
-        args.duration,
-        args.concurrency,
-        s.samples_ok,
-        s.samples_err,
-        s.dropped,
-        s.p50,
-        s.p95,
-        s.p99,
-        s.parse_p99,
-        s.feature_p99,
-        s.router_p99,
-        s.xgb_p99,
-        s.l2_p99,
-        s.serialize_p99,
-        opt_f64(s.router_l2_trigger_total),
-        opt_f64(s.router_deadline_miss_total),
-        opt_f64(s.router_l2_skipped_budget_total),
-        opt_f64(s.router_timeout_before_l2_total),
-        s.bench_lag_p99_us,
-        s.bench_lag_max_us,
-        s.missed_ticks_total,
-    )?;
+    let dur_s_u64 = args.duration.max(1);
+    let dur_s = dur_s_u64 as f64;
 
-    println!("csv appended: {}", out_path.display());
+    let ok_u64 = s.samples_ok as u64;
+    let err_u64 = s.samples_err as u64;
+    let dropped_u64 = s.dropped;
+    let attempted = ok_u64 + err_u64 + dropped_u64;
+
+    let attempted_rps = attempted as f64 / dur_s;
+    let ok_rps = ok_u64 as f64 / dur_s;
+    let err_rps = err_u64 as f64 / dur_s;
+    let drop_rps = dropped_u64 as f64 / dur_s;
+
+    let drop_pct = if attempted > 0 {
+        (dropped_u64 as f64) * 100.0 / (attempted as f64)
+    } else {
+        0.0
+    };
+
+    let ts_ms = current_time_ms();
+
+    let mut row: Vec<String> = Vec::with_capacity(64);
+    row.push(ts_ms.to_string());
+    row.push(escape_csv(runtime));
+    row.push(escape_csv(url));
+    row.push(escape_csv(metrics_url));
+    row.push(rps_used.to_string());
+    row.push(dur_s_u64.to_string());
+    row.push(args.concurrency.to_string());
+
+    row.push(attempted.to_string());
+    row.push(format!("{:.3}", attempted_rps));
+    row.push(ok_u64.to_string());
+    row.push(format!("{:.3}", ok_rps));
+    row.push(err_u64.to_string());
+    row.push(format!("{:.3}", err_rps));
+    row.push(dropped_u64.to_string());
+    row.push(format!("{:.3}", drop_rps));
+    row.push(format!("{:.6}", drop_pct));
+
+    row.push(s.http_2xx.to_string());
+    row.push(s.http_429.to_string());
+    row.push(s.http_5xx.to_string());
+    row.push(s.http_timeout.to_string());
+
+    row.push(s.p50.to_string());
+    row.push(s.p95.to_string());
+    row.push(s.p99.to_string());
+
+    row.push(s.parse_p99.to_string());
+    row.push(s.feature_p99.to_string());
+    row.push(s.router_p99.to_string());
+    row.push(s.xgb_p99.to_string());
+    row.push(s.l2_p99.to_string());
+    row.push(s.serialize_p99.to_string());
+
+    row.push(opt_f64(s.router_l2_trigger_total));
+    row.push(opt_f64(s.router_deadline_miss_total));
+    row.push(opt_f64(s.router_l2_skipped_budget_total));
+    row.push(opt_f64(s.router_timeout_before_l2_total));
+
+    row.push(opt_u64(s.xgb_pool_deadline_miss_total));
+    row.push(opt_u64(s.xgb_pool_xgb_compute_p99_est_us));
+    row.push(opt_u64(s.xgb_pool_queue_wait_p99_us));
+    row.push(opt_u64(s.xgb_pool_xgb_compute_p99_us));
+
+    row.push(s.bench_lag_p99_us.to_string());
+    row.push(s.bench_lag_max_us.to_string());
+    row.push(s.missed_ticks_total.to_string());
+
+    writeln!(f, "{}", row.join(","))?;
     Ok(())
 }
 
@@ -795,11 +986,36 @@ fn opt_f64(v: Option<f64>) -> String {
     v.map(|x| format!("{:.0}", x)).unwrap_or_default()
 }
 
-fn scrape_counters(text: &str) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
-    let mut l2 = None;
-    let mut miss = None;
-    let mut skip = None;
-    let mut before = None;
+fn opt_u64(v: Option<u64>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_default()
+}
+
+#[derive(Debug, Default, Clone)]
+struct MetricsSnapshot {
+    // counters from router layer (may be absent)
+    router_l2_trigger_total: Option<f64>,
+    router_deadline_miss_total: Option<f64>,
+    router_l2_skipped_budget_total: Option<f64>,
+    router_timeout_before_l2_total: Option<f64>,
+
+    // xgb_pool counters/gauges (may be absent)
+    xgb_pool_deadline_miss_total: Option<u64>,
+    xgb_pool_xgb_compute_p99_est_us: Option<u64>,
+
+    // xgb_pool quantiles (prefer quantile label form; fall back to *_p99 gauges)
+    xgb_pool_queue_wait_p99_us: Option<u64>,
+    xgb_pool_xgb_compute_p99_us: Option<u64>,
+}
+
+fn scrape_metrics_snapshot(text: &str) -> MetricsSnapshot {
+    fn set_u64(dst: &mut Option<u64>, v: f64) {
+        if v.is_finite() {
+            let v = if v < 0.0 { 0.0 } else { v };
+            *dst = Some(v.round() as u64);
+        }
+    }
+
+    let mut out = MetricsSnapshot::default();
 
     for line in text.lines() {
         let line = line.trim();
@@ -807,30 +1023,78 @@ fn scrape_counters(text: &str) -> (Option<f64>, Option<f64>, Option<f64>, Option
             continue;
         }
 
+        // Format: <name{labels}> <value> [timestamp]
         let mut it = line.split_whitespace();
-        let name = match it.next() {
-            Some(x) => x,
+        let name_labels = match it.next() {
+            Some(v) => v,
             None => continue,
         };
-        let val = match it.next() {
-            Some(v) => v.parse::<f64>().ok(),
-            None => None,
+        let val_str = match it.next() {
+            Some(v) => v,
+            None => continue,
         };
-        if val.is_none() {
-            continue;
-        }
-        let val = val.unwrap();
+        let val = match val_str.parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
-        match name {
-            "router_l2_trigger_total" => l2 = Some(val),
-            "router_deadline_miss_total" => miss = Some(val),
-            "router_l2_skipped_budget_total" => skip = Some(val),
-            "router_timeout_before_l2_total" => before = Some(val),
+        // Split base name and labels (if any)
+        let (base, labels_opt) = if let Some(brace) = name_labels.find('{') {
+            let base = &name_labels[..brace];
+            let labels = name_labels
+                .get(brace + 1..name_labels.rfind('}').unwrap_or(name_labels.len()))
+                .unwrap_or("");
+            (base, Some(labels))
+        } else {
+            (name_labels, None)
+        };
+
+        // Router counters (no labels)
+        match base {
+            "router_l2_trigger_total" => out.router_l2_trigger_total = Some(val),
+            "router_deadline_miss_total" => out.router_deadline_miss_total = Some(val),
+            "router_l2_skipped_budget_total" => out.router_l2_skipped_budget_total = Some(val),
+            "router_timeout_before_l2_total" => out.router_timeout_before_l2_total = Some(val),
+            _ => {}
+        }
+
+        // xgb_pool counters/gauges (no labels)
+        match base {
+            "xgb_pool_deadline_miss_total" => set_u64(&mut out.xgb_pool_deadline_miss_total, val),
+            "xgb_pool_xgb_compute_p99_est_us" => {
+                set_u64(&mut out.xgb_pool_xgb_compute_p99_est_us, val)
+            }
+            _ => {}
+        }
+
+        // xgb_pool quantiles - label form
+        if let Some(labels) = labels_opt {
+            let is_p99 =
+                labels.contains("quantile=\"0.99\"") || labels.contains("quantile=\"0.990\"");
+            if is_p99 {
+                if base == "xgb_pool_queue_wait_us" {
+                    set_u64(&mut out.xgb_pool_queue_wait_p99_us, val);
+                    continue;
+                }
+                if base == "xgb_pool_xgb_compute_us" {
+                    set_u64(&mut out.xgb_pool_xgb_compute_p99_us, val);
+                    continue;
+                }
+            }
+        }
+
+        // xgb_pool quantiles - gauge fallback (common pattern)
+        match name_labels {
+            "xgb_pool_queue_wait_us_p99" => set_u64(&mut out.xgb_pool_queue_wait_p99_us, val),
+            "xgb_pool_xgb_compute_us_p99" => set_u64(&mut out.xgb_pool_xgb_compute_p99_us, val),
+            // some exporters use p99 suffix without underscore
+            "xgb_pool_queue_wait_us99" => set_u64(&mut out.xgb_pool_queue_wait_p99_us, val),
+            "xgb_pool_xgb_compute_us99" => set_u64(&mut out.xgb_pool_xgb_compute_p99_us, val),
             _ => {}
         }
     }
 
-    (l2, miss, skip, before)
+    out
 }
 
 fn load_xgb_body(args: &Args) -> anyhow::Result<Bytes> {

@@ -1,6 +1,4 @@
- import sys
- import pandas as pd
- import matplotlib.pyplot as plt
+
 
  path = sys.argv[1]
  df = pd.read_csv(path)
@@ -51,5 +49,3 @@
  plt.legend()
  plt.tight_layout()
  png2 = path.replace(".csv","_p99_max.png")
- plt.savefig(png2)
- print("Wrote:", png2)

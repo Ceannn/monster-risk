@@ -31,7 +31,7 @@ extern "C" {
         handle: BoosterHandle,
         array_interface: *const c_char,
         config: *const c_char,
-        m: DMatrixHandle, // ✅ 关键：必须有这个参数
+        m: DMatrixHandle,
         out_shape: *mut *const BstUlong,
         out_dim: *mut BstUlong,
         out_result: *mut *const f32,
@@ -112,16 +112,16 @@ impl Booster {
         array_interface: &CStr,
         config: &CStr,
     ) -> anyhow::Result<PredictOutput> {
-        let mut out_shape_ptr: *const BstUlong = std::ptr::null();
+        let mut out_shape_ptr: *const BstUlong = ptr::null();
         let mut out_dim: BstUlong = 0;
-        let mut out_result_ptr: *const f32 = std::ptr::null();
+        let mut out_result_ptr: *const f32 = ptr::null();
 
         unsafe {
             check(XGBoosterPredictFromDense(
                 self.handle,
                 array_interface.as_ptr(),
                 config.as_ptr(),
-                std::ptr::null_mut(), // ✅ m = NULL（和官方 inference.c 示例一致）
+                ptr::null_mut(),
                 &mut out_shape_ptr,
                 &mut out_dim,
                 &mut out_result_ptr,
@@ -149,13 +149,61 @@ impl Booster {
         Ok(PredictOutput { shape, values })
     }
 
+    /// Scalar fast-path: call `XGBoosterPredictFromDense` and return only the **first** value.
+    ///
+    /// This avoids allocating `shape: Vec<_>` and `values: Vec<_>` for the common case
+    /// where you only need a single probability.
+    pub fn predict_scalar_from_dense(
+        &self,
+        array_interface: &CStr,
+        config: &CStr,
+    ) -> anyhow::Result<f32> {
+        let mut out_shape_ptr: *const BstUlong = ptr::null();
+        let mut out_dim: BstUlong = 0;
+        let mut out_result_ptr: *const f32 = ptr::null();
+
+        unsafe {
+            check(XGBoosterPredictFromDense(
+                self.handle,
+                array_interface.as_ptr(),
+                config.as_ptr(),
+                ptr::null_mut(),
+                &mut out_shape_ptr,
+                &mut out_dim,
+                &mut out_result_ptr,
+            ))
+            .context("XGBoosterPredictFromDense")?;
+        }
+
+        if out_result_ptr.is_null() {
+            bail!("xgboost: predict returned null out_result");
+        }
+
+        // Sanity: ensure output has at least 1 element.
+        let n: u64 = if out_dim == 0 || out_shape_ptr.is_null() {
+            // Some builds might omit shape for scalar. Assume at least 1.
+            1
+        } else {
+            let shape = unsafe { std::slice::from_raw_parts(out_shape_ptr, out_dim as usize) };
+            shape
+                .iter()
+                .copied()
+                .fold(1u64, |acc, v| acc.saturating_mul(v))
+                .max(1)
+        };
+
+        if n == 0 {
+            bail!("xgboost: predict returned zero-sized output");
+        }
+
+        // Read only the first element.
+        Ok(unsafe { *out_result_ptr })
+    }
+
     /// Fast helper: predict probability for a single dense row.
     ///
     /// Uses per-thread cached `DenseArrayInterface` + config.
     pub fn predict_proba_dense_1row(&self, row: &[f32]) -> Result<f32, String> {
-        // Pin the closure return type so the compiler can infer the concrete error type.
-        // Otherwise `?` only constrains it to "something convertible from anyhow::Error",
-        // and the final `.map_err(|e| e.to_string())` becomes ambiguous (E0282).
         TLS_DENSE
             .with(|cell| -> anyhow::Result<f32> {
                 let mut tls = cell.borrow_mut();
@@ -163,9 +211,10 @@ impl Booster {
                     *tls = Some(TlsDense::new(row.len())?);
                 }
                 let tls = tls.as_mut().expect("initialized");
+                // ✅ per-thread reusable dense buffer: overwrite only, no allocation.
                 tls.ai.data_mut().copy_from_slice(row);
-                let out = self.predict_from_dense(tls.ai.as_cstr(), tls.cfg_pred.as_c_str())?;
-                Ok(out.values.get(0).copied().unwrap_or(0.0))
+                // ✅ scalar fast-path: no `Vec` allocations.
+                self.predict_scalar_from_dense(tls.ai.as_cstr(), tls.cfg_pred.as_c_str())
             })
             .map_err(|e| e.to_string())
     }
@@ -234,17 +283,15 @@ struct TlsDense {
 impl TlsDense {
     fn new(ncols: usize) -> anyhow::Result<Self> {
         let ai = DenseArrayInterface::new_1row(ncols)?;
-
-        // 说明：
-        // - missing: NaN 这在官方 inference.c 里就是这么写的（不是标准 JSON，但 XGBoost 的配置解析支持）:contentReference[oaicite:1]{index=1}
-        // - cache_id: 0 允许 XGBoost 做内部缓存（m=NULL 也能用）
+        // Keep configs in TLS to avoid per-request allocations.
+        // - cache_id:0 lets XGBoost reuse internal workspace
+        // - missing:NaN matches our dense row default for missing values
         let cfg_pred = CString::new(
             r#"{"training":false,"type":0,"iteration_begin":0,"iteration_end":0,"strict_shape":false,"cache_id":0,"missing":NaN}"#,
         )?;
         let cfg_contrib = CString::new(
             r#"{"training":false,"type":0,"iteration_begin":0,"iteration_end":0,"strict_shape":false,"pred_contribs":true,"cache_id":0,"missing":NaN}"#,
         )?;
-
         Ok(Self {
             ncols,
             ai,

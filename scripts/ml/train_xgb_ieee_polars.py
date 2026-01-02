@@ -3,16 +3,6 @@ import gzip
 import json
 from pathlib import Path
 
-import numpy as np
-import polars as pl
-import xgboost as xgb
-from sklearn.metrics import (
-    average_precision_score,
-    precision_recall_curve,
-    roc_auc_score,
-    roc_curve,
-)
-
 
 def select_cols(all_cols):
     # v0：先选一批“强且常见”的列，避免一上来全量把内存炸穿
@@ -112,10 +102,6 @@ def main():
     use_cols = ["TransactionID", "TransactionDT", "isFraud"] + feat_cols
 
     df = lf.select([pl.col(c) for c in use_cols]).collect()
-
-    # 3) 时间切分（按 TransactionDT 分位点）
-    dt = df.select(pl.col("TransactionDT").cast(pl.Int64))
-    df = df.with_columns(pl.col("TransactionDT").cast(pl.Int64))
 
     cut = df.select(
         pl.col("TransactionDT").quantile(1.0 - args.valid_frac, "nearest")
