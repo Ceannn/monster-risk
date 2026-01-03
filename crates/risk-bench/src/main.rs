@@ -55,6 +55,15 @@ struct Args {
     #[arg(long, default_value_t = 20000)]
     xgb_body_max: usize,
 
+    /// Dense f32 corpus file (concatenated records). When set, bench sends application/octet-stream.
+    /// Record format: raw little-endian f32 array, length = --xgb-dense-dim.
+    #[arg(long)]
+    xgb_dense_file: Option<String>,
+
+    /// Dense vector dimension (required when using --xgb-dense-file)
+    #[arg(long, default_value_t = 0)]
+    xgb_dense_dim: usize,
+
     #[arg(long, default_value_t = 1000)]
     rps: u64,
 
@@ -68,6 +77,10 @@ struct Args {
     /// CSV output path
     #[arg(long, default_value = "results/bench_summary.csv")]
     out: String,
+
+    /// Optional label column for CSV (e.g. "l2_pct=10" or "l2_budget=1400")
+    #[arg(long, default_value = "")]
+    label: String,
 
     /// Scrape /metrics and write counters
     #[arg(long, default_value_t = true)]
@@ -172,6 +185,36 @@ struct TimingsUs {
     serialize: u64,
 }
 
+/// Parse RSK1 binary response (48 bytes) and extract timings.
+/// Layout: magic 'RSK1', ver(u16)=1, flags(u16), trace_id(u64), score(f32), decision(u8), pad[3], timings[6](u32).
+fn try_parse_rsk1_timings(buf: &[u8]) -> Option<TimingsUs> {
+    if buf.len() < 48 {
+        return None;
+    }
+    if &buf[0..4] != b"RSK1" {
+        return None;
+    }
+    let ver = u16::from_le_bytes([buf[4], buf[5]]);
+    if ver != 1 {
+        return None;
+    }
+
+    #[inline]
+    fn read_u32_le(b: &[u8], off: usize) -> u64 {
+        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]) as u64
+    }
+
+    // timings start at offset 24
+    Some(TimingsUs {
+        parse: read_u32_le(buf, 24),
+        feature: read_u32_le(buf, 28),
+        router: read_u32_le(buf, 32),
+        xgb: read_u32_le(buf, 36),
+        l2: read_u32_le(buf, 40),
+        serialize: read_u32_le(buf, 44),
+    })
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScoreResponse {
@@ -235,9 +278,23 @@ struct Summary {
     router_deadline_miss_total: Option<f64>,
     router_l2_skipped_budget_total: Option<f64>,
     router_timeout_before_l2_total: Option<f64>,
+    // more router counters (may be absent)
+    router_l2_skipped_rate_total: Option<f64>,
+    router_l2_skipped_waterline_total: Option<f64>,
+    router_l2_skipped_deadline_budget_total: Option<f64>,
+
+    // per-run deltas (end - start; useful when not restarting server between runs)
+    router_l2_trigger_delta: Option<f64>,
+    router_deadline_miss_delta: Option<f64>,
+    router_l2_skipped_budget_delta: Option<f64>,
+    router_l2_skipped_rate_delta: Option<f64>,
+    router_l2_skipped_waterline_delta: Option<f64>,
+    router_l2_skipped_deadline_budget_delta: Option<f64>,
+    router_timeout_before_l2_delta: Option<f64>,
 
     // xgb_pool metrics (scraped from /metrics if available)
     xgb_pool_deadline_miss_total: Option<u64>,
+    xgb_pool_deadline_miss_delta: Option<u64>,
     xgb_pool_xgb_compute_p99_est_us: Option<u64>,
     xgb_pool_queue_wait_p99_us: Option<u64>,
     xgb_pool_xgb_compute_p99_us: Option<u64>,
@@ -256,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let targets = parse_targets(&args)?;
-    let xgb_bodies = load_xgb_bodies(&args)?;
+    let (xgb_bodies, xgb_content_type) = load_xgb_bodies(&args)?;
 
     // RPS sequence
     let rps_list: Vec<u64> = if args.find_knee {
@@ -283,7 +340,15 @@ async fn main() -> anyhow::Result<()> {
         let mut knee_reasons: Vec<String> = Vec::new();
 
         for t in &targets {
-            let summary = run_once(&args, rps, &t.url, &t.metrics_url, &xgb_bodies).await?;
+            let summary = run_once(
+                &args,
+                rps,
+                &t.url,
+                &t.metrics_url,
+                &xgb_bodies,
+                xgb_content_type,
+            )
+            .await?;
 
             if summary.samples_ok == 0 {
                 println!(
@@ -544,6 +609,7 @@ async fn run_once(
     url: &str,
     metrics_url: &str,
     xgb_bodies: &Arc<Vec<Bytes>>,
+    xgb_content_type: &str,
 ) -> anyhow::Result<Summary> {
     // seed=0 => time-based (less deterministic but closer to reality)
     let seed = if args.seed == 0 {
@@ -558,7 +624,8 @@ async fn run_once(
     let client = Arc::new(build_client(args)?);
 
     // /score_xgb /score_xgb_async /score_xgb_pool etc
-    let is_xgb = url.contains("/score_xgb");
+    let is_xgb =
+        url.contains("/score_xgb") || url.contains("/score_dense") || args.xgb_dense_file.is_some();
 
     // Pre-generated bodies only for non-xgb endpoints
     let score_bodies = if is_xgb {
@@ -616,7 +683,14 @@ async fn run_once(
     }
 
     let url_s = Arc::new(url.to_string());
+    let xgb_ct = Arc::new(xgb_content_type.to_string());
     let xgb_bodies = xgb_bodies.clone();
+
+    let snap_before = if args.scrape_metrics {
+        fetch_metrics_snapshot(args, metrics_url).await
+    } else {
+        None
+    };
 
     let start = tokio::time::Instant::now();
     let end = start + Duration::from_secs(args.duration);
@@ -655,9 +729,11 @@ async fn run_once(
 
         let client = client.clone();
         let url = url_s.clone();
+        // `tokio::spawn(async move { .. })` below would otherwise move `xgb_ct`.
+        // Clone per-shard so the outer loop can keep spawning shards.
+        let xgb_ct = xgb_ct.clone();
         let xgb_bodies = xgb_bodies.clone();
         let score_bodies = score_bodies.clone();
-        let xgb_bodies = xgb_bodies.clone();
         let inflight = inflight.clone();
         let sample_tx = sample_tx.clone();
         let lag_tx = lag_tx.clone();
@@ -735,6 +811,7 @@ async fn run_once(
                 let client2 = client.clone();
                 let url2 = url.clone();
                 let tx2 = sample_tx.clone();
+                let xgb_ct2 = xgb_ct.clone();
                 let http_2xx2 = http_2xx.clone();
                 let http_4292 = http_429.clone();
                 let http_5xx2 = http_5xx.clone();
@@ -749,7 +826,14 @@ async fn run_once(
 
                     let send_res = client2
                         .post(url2.as_str())
-                        .header("content-type", "application/json")
+                        .header(
+                            "content-type",
+                            if is_xgb {
+                                xgb_ct2.as_str()
+                            } else {
+                                "application/json"
+                            },
+                        )
                         .body(body)
                         .send()
                         .await;
@@ -771,7 +855,16 @@ async fn run_once(
                                 Ok(bytes) => {
                                     sample.e2e_us = t0.elapsed().as_micros() as u64;
                                     if status_ok {
-                                        if let Ok(r) = serde_json::from_slice::<RespTimings>(&bytes)
+                                        if let Some(t) = try_parse_rsk1_timings(&bytes) {
+                                            sample.parse_us = t.parse;
+                                            sample.feature_us = t.feature;
+                                            sample.router_us = t.router;
+                                            sample.xgb_us = t.xgb;
+                                            sample.l2_us = t.l2;
+                                            sample.serialize_us = t.serialize;
+                                            sample.ok = true;
+                                        } else if let Ok(r) =
+                                            serde_json::from_slice::<RespTimings>(&bytes)
                                         {
                                             sample.parse_us = r.timings_us.parse;
                                             sample.feature_us = r.timings_us.feature;
@@ -868,23 +961,102 @@ async fn run_once(
     }
 
     if args.scrape_metrics {
-        // use a separate client to avoid disturbing main pool
-        if let Ok(resp) = build_client(args)?.get(metrics_url).send().await {
-            if let Ok(text) = resp.text().await {
-                let snap = scrape_metrics_snapshot(&text);
-                summary.router_l2_trigger_total = snap.router_l2_trigger_total;
-                summary.router_deadline_miss_total = snap.router_deadline_miss_total;
-                summary.router_l2_skipped_budget_total = snap.router_l2_skipped_budget_total;
-                summary.router_timeout_before_l2_total = snap.router_timeout_before_l2_total;
-                summary.xgb_pool_deadline_miss_total = snap.xgb_pool_deadline_miss_total;
-                summary.xgb_pool_xgb_compute_p99_est_us = snap.xgb_pool_xgb_compute_p99_est_us;
-                summary.xgb_pool_queue_wait_p99_us = snap.xgb_pool_queue_wait_p99_us;
-                summary.xgb_pool_xgb_compute_p99_us = snap.xgb_pool_xgb_compute_p99_us;
-            }
+        let snap_after = fetch_metrics_snapshot(args, metrics_url).await;
+
+        // Totals
+        if let Some(snap) = &snap_after {
+            summary.router_l2_trigger_total = snap.router_l2_trigger_total;
+            summary.router_deadline_miss_total = snap.router_deadline_miss_total;
+            summary.router_l2_skipped_budget_total = snap.router_l2_skipped_budget_total;
+            summary.router_l2_skipped_rate_total = snap.router_l2_skipped_rate_total;
+            summary.router_l2_skipped_waterline_total = snap.router_l2_skipped_waterline_total;
+            summary.router_l2_skipped_deadline_budget_total =
+                snap.router_l2_skipped_deadline_budget_total;
+            summary.router_timeout_before_l2_total = snap.router_timeout_before_l2_total;
+
+            summary.xgb_pool_deadline_miss_total = snap.xgb_pool_deadline_miss_total;
+            summary.xgb_pool_xgb_compute_p99_est_us = snap.xgb_pool_xgb_compute_p99_est_us;
+            summary.xgb_pool_queue_wait_p99_us = snap.xgb_pool_queue_wait_p99_us;
+            summary.xgb_pool_xgb_compute_p99_us = snap.xgb_pool_xgb_compute_p99_us;
+        }
+
+        // Deltas (end - start): useful if you keep the same server process across a sweep.
+        if let Some(snap) = snap_after {
+            summary.router_l2_trigger_delta = diff_f64(
+                snap.router_l2_trigger_total,
+                snap_before.as_ref().and_then(|s| s.router_l2_trigger_total),
+            );
+            summary.router_deadline_miss_delta = diff_f64(
+                snap.router_deadline_miss_total,
+                snap_before
+                    .as_ref()
+                    .and_then(|s| s.router_deadline_miss_total),
+            );
+            summary.router_l2_skipped_budget_delta = diff_f64(
+                snap.router_l2_skipped_budget_total,
+                snap_before
+                    .as_ref()
+                    .and_then(|s| s.router_l2_skipped_budget_total),
+            );
+            summary.router_l2_skipped_rate_delta = diff_f64(
+                snap.router_l2_skipped_rate_total,
+                snap_before
+                    .as_ref()
+                    .and_then(|s| s.router_l2_skipped_rate_total),
+            );
+            summary.router_l2_skipped_waterline_delta = diff_f64(
+                snap.router_l2_skipped_waterline_total,
+                snap_before
+                    .as_ref()
+                    .and_then(|s| s.router_l2_skipped_waterline_total),
+            );
+            summary.router_l2_skipped_deadline_budget_delta = diff_f64(
+                snap.router_l2_skipped_deadline_budget_total,
+                snap_before
+                    .as_ref()
+                    .and_then(|s| s.router_l2_skipped_deadline_budget_total),
+            );
+            summary.router_timeout_before_l2_delta = diff_f64(
+                snap.router_timeout_before_l2_total,
+                snap_before
+                    .as_ref()
+                    .and_then(|s| s.router_timeout_before_l2_total),
+            );
+
+            summary.xgb_pool_deadline_miss_delta = diff_u64(
+                snap.xgb_pool_deadline_miss_total,
+                snap_before
+                    .as_ref()
+                    .and_then(|s| s.xgb_pool_deadline_miss_total),
+            );
         }
     }
 
     Ok(summary)
+}
+
+fn diff_f64(end: Option<f64>, start: Option<f64>) -> Option<f64> {
+    match (end, start) {
+        (Some(e), Some(s)) if e.is_finite() && s.is_finite() => Some((e - s).max(0.0)),
+        (Some(e), None) if e.is_finite() => Some(e.max(0.0)),
+        _ => None,
+    }
+}
+
+fn diff_u64(end: Option<u64>, start: Option<u64>) -> Option<u64> {
+    match (end, start) {
+        (Some(e), Some(s)) => Some(e.saturating_sub(s)),
+        (Some(e), None) => Some(e),
+        _ => None,
+    }
+}
+
+async fn fetch_metrics_snapshot(args: &Args, metrics_url: &str) -> Option<MetricsSnapshot> {
+    // use a separate client to avoid disturbing the main connection pool
+    let client = build_client(args).ok()?;
+    let resp = client.get(metrics_url).send().await.ok()?;
+    let text = resp.text().await.ok()?;
+    Some(scrape_metrics_snapshot(&text))
 }
 
 fn current_time_ms() -> i64 {
@@ -914,13 +1086,13 @@ fn write_csv_row(
     if need_header {
         writeln!(
             f,
-            "ts_ms,runtime,url,metrics_url,target_rps,duration_s,concurrency,\
+            "ts_ms,label,runtime,url,metrics_url,target_rps,duration_s,concurrency,\
 attempted,attempted_rps,ok,ok_rps,err,err_rps,dropped,drop_rps,drop_pct,\
 http_2xx,http_429,http_5xx,http_timeout,\
 p50_us,p95_us,p99_us,\
 parse_p99_us,feature_p99_us,router_p99_us,xgb_p99_us,l2_p99_us,serialize_p99_us,\
-router_l2_trigger_total,router_deadline_miss_total,router_l2_skipped_budget_total,router_timeout_before_l2_total,\
-xgb_pool_deadline_miss_total,xgb_pool_xgb_compute_p99_est_us,xgb_pool_queue_wait_p99_us,xgb_pool_xgb_compute_p99_us,\
+router_l2_trigger_total,router_l2_trigger_delta,router_deadline_miss_total,router_deadline_miss_delta,router_l2_skipped_budget_total,router_l2_skipped_budget_delta,router_l2_skipped_rate_total,router_l2_skipped_rate_delta,router_l2_skipped_waterline_total,router_l2_skipped_waterline_delta,router_l2_skipped_deadline_budget_total,router_l2_skipped_deadline_budget_delta,router_timeout_before_l2_total,router_timeout_before_l2_delta,\
+xgb_pool_deadline_miss_total,xgb_pool_deadline_miss_delta,xgb_pool_xgb_compute_p99_est_us,xgb_pool_queue_wait_p99_us,xgb_pool_xgb_compute_p99_us,\
 bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
         )?;
     }
@@ -948,6 +1120,7 @@ bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
 
     let mut row: Vec<String> = Vec::with_capacity(64);
     row.push(ts_ms.to_string());
+    row.push(escape_csv(&args.label));
     row.push(escape_csv(runtime));
     row.push(escape_csv(url));
     row.push(escape_csv(metrics_url));
@@ -982,11 +1155,22 @@ bench_lag_p99_us,bench_lag_max_us,missed_ticks_total"
     row.push(s.serialize_p99.to_string());
 
     row.push(opt_f64(s.router_l2_trigger_total));
+    row.push(opt_f64(s.router_l2_trigger_delta));
     row.push(opt_f64(s.router_deadline_miss_total));
+    row.push(opt_f64(s.router_deadline_miss_delta));
     row.push(opt_f64(s.router_l2_skipped_budget_total));
+    row.push(opt_f64(s.router_l2_skipped_budget_delta));
+    row.push(opt_f64(s.router_l2_skipped_rate_total));
+    row.push(opt_f64(s.router_l2_skipped_rate_delta));
+    row.push(opt_f64(s.router_l2_skipped_waterline_total));
+    row.push(opt_f64(s.router_l2_skipped_waterline_delta));
+    row.push(opt_f64(s.router_l2_skipped_deadline_budget_total));
+    row.push(opt_f64(s.router_l2_skipped_deadline_budget_delta));
     row.push(opt_f64(s.router_timeout_before_l2_total));
+    row.push(opt_f64(s.router_timeout_before_l2_delta));
 
     row.push(opt_u64(s.xgb_pool_deadline_miss_total));
+    row.push(opt_u64(s.xgb_pool_deadline_miss_delta));
     row.push(opt_u64(s.xgb_pool_xgb_compute_p99_est_us));
     row.push(opt_u64(s.xgb_pool_queue_wait_p99_us));
     row.push(opt_u64(s.xgb_pool_xgb_compute_p99_us));
@@ -1022,9 +1206,13 @@ struct MetricsSnapshot {
     router_deadline_miss_total: Option<f64>,
     router_l2_skipped_budget_total: Option<f64>,
     router_timeout_before_l2_total: Option<f64>,
+    router_l2_skipped_rate_total: Option<f64>,
+    router_l2_skipped_waterline_total: Option<f64>,
+    router_l2_skipped_deadline_budget_total: Option<f64>,
 
     // xgb_pool counters/gauges (may be absent)
     xgb_pool_deadline_miss_total: Option<u64>,
+    xgb_pool_deadline_miss_delta: Option<u64>,
     xgb_pool_xgb_compute_p99_est_us: Option<u64>,
 
     // xgb_pool quantiles (prefer quantile label form; fall back to *_p99 gauges)
@@ -1079,6 +1267,13 @@ fn scrape_metrics_snapshot(text: &str) -> MetricsSnapshot {
             "router_l2_trigger_total" => out.router_l2_trigger_total = Some(val),
             "router_deadline_miss_total" => out.router_deadline_miss_total = Some(val),
             "router_l2_skipped_budget_total" => out.router_l2_skipped_budget_total = Some(val),
+            "router_l2_skipped_rate_total" => out.router_l2_skipped_rate_total = Some(val),
+            "router_l2_skipped_waterline_total" => {
+                out.router_l2_skipped_waterline_total = Some(val)
+            }
+            "router_l2_skipped_deadline_budget_total" => {
+                out.router_l2_skipped_deadline_budget_total = Some(val)
+            }
             "router_timeout_before_l2_total" => out.router_timeout_before_l2_total = Some(val),
             _ => {}
         }
@@ -1154,11 +1349,47 @@ fn detect_xgb_body_format(path: &std::path::Path) -> XgbBodyFormat {
 /// - Json: single body (verbatim)
 /// - Jsonl: one body per non-empty line
 /// - Dir: one body per file
-fn load_xgb_bodies(args: &Args) -> anyhow::Result<Arc<Vec<Bytes>>> {
+fn load_xgb_bodies(args: &Args) -> anyhow::Result<(Arc<Vec<Bytes>>, &'static str)> {
     let max = args.xgb_body_max.max(1);
 
+    // --- Dense f32 corpus ---
+    if let Some(path_s) = args.xgb_dense_file.as_deref() {
+        let dim = args.xgb_dense_dim;
+        if dim == 0 {
+            anyhow::bail!("--xgb-dense-dim is required when using --xgb-dense-file");
+        }
+
+        let rec_len = dim.checked_mul(4).context("xgb_dense_dim too large")?;
+
+        let path = std::path::PathBuf::from(path_s);
+        let buf = Bytes::from(std::fs::read(&path)?);
+
+        let n_records = buf.len() / rec_len;
+        if n_records == 0 {
+            anyhow::bail!(
+                "dense corpus too small: file_len={} rec_len={}",
+                buf.len(),
+                rec_len
+            );
+        }
+
+        let take = n_records.min(max);
+        let mut out: Vec<Bytes> = Vec::with_capacity(take);
+        for i in 0..take {
+            let s = i * rec_len;
+            let e = s + rec_len;
+            out.push(buf.slice(s..e));
+        }
+
+        return Ok((Arc::new(out), "application/octet-stream"));
+    }
+
+    // --- JSON corpus (default / backwards compatible) ---
     let Some(path_s) = args.xgb_body_file.as_deref() else {
-        return Ok(Arc::new(vec![Bytes::from_static(b"{}")]));
+        return Ok((
+            Arc::new(vec![Bytes::from_static(b"{}")]),
+            "application/json",
+        ));
     };
 
     let path = std::path::PathBuf::from(path_s);
@@ -1236,7 +1467,7 @@ fn load_xgb_bodies(args: &Args) -> anyhow::Result<Arc<Vec<Bytes>>> {
         XgbBodyFormat::Auto => unreachable!("auto resolved above"),
     }
 
-    Ok(Arc::new(out))
+    Ok((Arc::new(out), "application/json"))
 }
 
 fn parse_targets(args: &Args) -> anyhow::Result<Vec<Target>> {

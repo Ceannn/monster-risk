@@ -36,3 +36,21 @@ cargo run -p risk-bench -- --rps 1000 --duration 20
 }
 ```
 
+
+## Paper experiments (L2 budget sweep)
+
+### Bench: add a label column
+
+`risk-bench` supports `--label` which will be written into the CSV (useful for sweeps).
+
+### Manual sweep helper
+
+If you prefer手动起服务 + 手动改 env，这个脚本会按顺序跑 bench，并把每次 run 以 label 写进同一个 CSV：
+
+```bash
+./scripts/bench/tokio_sweep_l2_budget_manual.sh 14000 "0 1 5 10 20"
+# 输出：results/l2_budget_sweep_*/sweep_l2_budget.csv
+# 可选：python3 scripts/plot/plot_l2_budget_sweep.py results/l2_budget_sweep_*/sweep_l2_budget.csv
+```
+
+The sweep is designed around the idea: keep RPS fixed, change L2 trigger budget, and observe the phase transition (ok_rps/p99/429 + queue_wait).

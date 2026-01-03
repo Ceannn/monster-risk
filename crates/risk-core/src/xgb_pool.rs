@@ -59,9 +59,49 @@ struct WorkerHandle {
     tx: mpsc::Sender<XgbJob>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct XgbPoolStats {
+    pub n_workers: usize,
+    /// Total queue capacity across all workers (rounded up by per-worker split).
+    pub cap_total: usize,
+    /// Jobs currently waiting in worker queues (does not include running jobs).
+    pub queued: usize,
+    /// Jobs currently executing inside workers.
+    pub running: usize,
+}
+
+impl XgbPoolStats {
+    #[inline]
+    pub fn inflight(&self) -> usize {
+        self.queued + self.running
+    }
+
+    #[inline]
+    pub fn queue_waterline(&self) -> f64 {
+        if self.cap_total == 0 {
+            0.0
+        } else {
+            (self.queued as f64) / (self.cap_total as f64)
+        }
+    }
+}
+
+/// Decrements `running` when dropped.
+struct RunningGuard(Arc<AtomicUsize>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct XgbPool {
     workers: Vec<WorkerHandle>,
     rr: AtomicUsize,
+
+    cap_total: usize,
+    queued: Arc<AtomicUsize>,
+    running: Arc<AtomicUsize>,
 }
 
 impl XgbPool {
@@ -106,8 +146,13 @@ impl XgbPool {
         // Split total cap across workers to keep admission-control semantics intuitive.
         // Example: n_workers=8, queue_cap_total=512 => per_worker_cap=64.
         let per_worker_cap = (queue_cap_total + n_workers - 1) / n_workers;
+        let cap_total = per_worker_cap * n_workers;
 
         let model_path = Arc::new(model_path.as_ref().to_path_buf());
+
+        // Track queue/running counts for admission control & debugging (best-effort).
+        let queued = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicUsize::new(0));
 
         let mut workers = Vec::with_capacity(n_workers);
         let pin_cpus = pin_cpus.unwrap_or_default();
@@ -118,6 +163,8 @@ impl XgbPool {
             let feature_names = Arc::clone(&feature_names);
             let cpu = pin_cpus.get(wid).copied();
             let warmup_iters = warmup_iters;
+            let queued = Arc::clone(&queued);
+            let running = Arc::clone(&running);
 
             thread::Builder::new()
                 .name(format!("xgb-worker-{wid}"))
@@ -155,6 +202,11 @@ impl XgbPool {
 
                     // Main loop
                     while let Some(job) = rx.blocking_recv() {
+                        // Best-effort counters (admission control / debug).
+                        queued.fetch_sub(1, Ordering::Relaxed);
+                        running.fetch_add(1, Ordering::Relaxed);
+                        let _running_guard = RunningGuard(Arc::clone(&running));
+
                         let now = Instant::now();
                         let queue_wait_us =
                             now.duration_since(job.enq_at)
@@ -220,6 +272,9 @@ impl XgbPool {
         Ok(Self {
             workers,
             rr: AtomicUsize::new(0),
+            cap_total,
+            queued,
+            running,
         })
     }
 
@@ -241,6 +296,17 @@ impl XgbPool {
             warmup_iters,
             pin_cpus,
         )
+    }
+
+    /// Snapshot stats for router-side admission control / debugging.
+    #[inline]
+    pub fn stats(&self) -> XgbPoolStats {
+        XgbPoolStats {
+            n_workers: self.workers.len(),
+            cap_total: self.cap_total,
+            queued: self.queued.load(Ordering::Relaxed),
+            running: self.running.load(Ordering::Relaxed),
+        }
     }
 
     /// Non-blocking submission. Returns a oneshot receiver to await the result.
@@ -268,13 +334,17 @@ impl XgbPool {
 
         for i in 0..n {
             let idx = (start + i) % n;
+            // NOTE: increment before enqueue to avoid underflow race with worker-side fetch_sub.
+            self.queued.fetch_add(1, Ordering::Relaxed);
             match self.workers[idx].tx.try_send(job) {
                 Ok(()) => return Ok(resp_rx),
                 Err(mpsc::error::TrySendError::Full(j)) => {
+                    self.queued.fetch_sub(1, Ordering::Relaxed);
                     job = j;
                     continue;
                 }
                 Err(mpsc::error::TrySendError::Closed(j)) => {
+                    self.queued.fetch_sub(1, Ordering::Relaxed);
                     job = j;
                     down += 1;
                     continue;
@@ -327,13 +397,17 @@ impl XgbPool {
 
         for i in 0..n {
             let idx = (start + i) % n;
+            // NOTE: increment before enqueue to avoid underflow race with worker-side fetch_sub.
+            self.queued.fetch_add(1, Ordering::Relaxed);
             match self.workers[idx].tx.try_send(job) {
                 Ok(()) => return Ok(resp_rx),
                 Err(mpsc::error::TrySendError::Full(j)) => {
+                    self.queued.fetch_sub(1, Ordering::Relaxed);
                     job = j;
                     continue;
                 }
                 Err(mpsc::error::TrySendError::Closed(j)) => {
+                    self.queued.fetch_sub(1, Ordering::Relaxed);
                     job = j;
                     down += 1;
                     continue;

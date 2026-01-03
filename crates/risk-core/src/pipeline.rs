@@ -11,9 +11,121 @@ use crate::{
 use anyhow::Context;
 use serde_json::{Map, Value};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// A very small per-second budget (rate limiter) for L2 triggers.
+///
+/// This is intentionally approximate and lock-free: good enough for overload control.
+#[derive(Debug)]
+struct RateBudget {
+    limit_per_sec: u64,
+    start: Instant,
+    sec: AtomicU64,
+    count: AtomicU64,
+}
+
+impl RateBudget {
+    fn new(limit_per_sec: u64) -> Self {
+        Self {
+            limit_per_sec,
+            start: Instant::now(),
+            sec: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn now_sec(&self) -> u64 {
+        self.start.elapsed().as_secs()
+    }
+
+    /// Returns true if a token is granted.
+    fn try_acquire(&self) -> bool {
+        if self.limit_per_sec == 0 {
+            return true;
+        }
+
+        let now = self.now_sec();
+        let cur = self.sec.load(Ordering::Relaxed);
+        if cur != now {
+            // Try to advance the window. If we win the CAS, reset count.
+            if self
+                .sec
+                .compare_exchange(cur, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.count.store(0, Ordering::Relaxed);
+            }
+        }
+
+        let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        n <= self.limit_per_sec
+    }
+}
+
+#[derive(Debug)]
+struct L2Control {
+    /// Hard cap: max L2 triggers per second (0 = unlimited).
+    #[allow(dead_code)]
+    max_triggers_per_sec: u64,
+    rate_budget: Option<RateBudget>,
+
+    /// If L2 pool queue waterline exceeds this threshold, skip L2 (1.0 = disable).
+    max_queue_waterline: f64,
+
+    /// Minimal remaining time budget (microseconds) required to attempt L2.
+    min_remaining_us: u64,
+
+    /// Optional queue-wait budget passed to XgbPool (microseconds). 0 disables.
+    queue_wait_budget_us: u64,
+}
+
+impl L2Control {
+    fn from_env(cfg: &Config) -> Self {
+        fn env_u64(key: &str) -> Option<u64> {
+            std::env::var(key).ok().and_then(|s| s.parse::<u64>().ok())
+        }
+        fn env_f64(key: &str) -> Option<f64> {
+            std::env::var(key).ok().and_then(|s| s.parse::<f64>().ok())
+        }
+
+        let max_triggers_per_sec = env_u64("ROUTER_L2_MAX_TRIGGERS_PER_SEC").unwrap_or(0);
+        let rate_budget = if max_triggers_per_sec > 0 {
+            Some(RateBudget::new(max_triggers_per_sec))
+        } else {
+            None
+        };
+
+        // 1.0 means disable waterline gating by default (keep old behavior unless configured).
+        let max_queue_waterline = env_f64("ROUTER_L2_MAX_QUEUE_WATERLINE").unwrap_or(1.0);
+
+        // Default: half of end-to-end SLO (in us), but at least 1000us.
+        let default_min_remaining_us = ((cfg.slo_p99_ms * 1000) / 2).max(1_000);
+        let min_remaining_us =
+            env_u64("ROUTER_L2_MIN_REMAINING_US").unwrap_or(default_min_remaining_us);
+
+        let queue_wait_budget_us = env_u64("ROUTER_L2_QUEUE_WAIT_BUDGET_US").unwrap_or(0);
+
+        Self {
+            max_triggers_per_sec,
+            rate_budget,
+            max_queue_waterline,
+            min_remaining_us,
+            queue_wait_budget_us,
+        }
+    }
+
+    #[inline]
+    fn allow_by_rate(&self) -> bool {
+        match &self.rate_budget {
+            Some(b) => b.try_acquire(),
+            None => true,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppCore {
@@ -30,11 +142,15 @@ pub struct AppCore {
 
     /// ✅ L2 专用推理池（隔离更重模型，可选）
     pub xgb_pool_l2: Option<Arc<XgbPool>>,
+
+    // Router-side overload control for L2 triggering (budget / waterline / etc).
+    l2_ctrl: Arc<L2Control>,
 }
 
 impl AppCore {
     pub fn new(cfg: Config) -> Self {
         let store = Arc::new(FeatureStore::new(cfg.win_60s, cfg.win_300s));
+        let l2_ctrl = Arc::new(L2Control::from_env(&cfg));
         Self {
             cfg,
             store,
@@ -43,12 +159,14 @@ impl AppCore {
             xgb_l2: None,
             xgb_pool: None,
             xgb_pool_l2: None,
+            l2_ctrl,
         }
     }
 
     pub fn new_with_xgb(cfg: Config, model_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
         let model_dir = model_dir.as_ref();
         let xgb = Arc::new(XgbRuntime::load_from_dir(model_dir)?);
+        let l2_ctrl = Arc::new(L2Control::from_env(&cfg));
 
         // ====== 专用推理池参数（不动 Config，靠 env 控制，实验很舒服）======
         let avail = std::thread::available_parallelism()
@@ -111,6 +229,7 @@ impl AppCore {
             xgb_l2: None,
             xgb_pool,
             xgb_pool_l2: None,
+            l2_ctrl,
         })
     }
 
@@ -153,6 +272,7 @@ impl AppCore {
         }
 
         let store = Arc::new(FeatureStore::new(cfg.win_60s, cfg.win_300s));
+        let l2_ctrl = Arc::new(L2Control::from_env(&cfg));
 
         let avail = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -252,6 +372,7 @@ impl AppCore {
             xgb_l2: xgb2,
             xgb_pool: xgb_pool1,
             xgb_pool_l2: xgb_pool2,
+            l2_ctrl,
         })
     }
 
@@ -319,10 +440,23 @@ impl AppCore {
         if matches!(decision, Decision::ManualReview) && l2_enabled {
             let xgb2 = self.xgb_l2.as_ref().unwrap();
 
-            let l2_budget = Duration::from_millis(((self.cfg.slo_p99_ms as u64) / 2).max(1));
             let now = Instant::now();
-            if now + l2_budget > deadline {
+            let remaining_us = deadline
+                .checked_duration_since(now)
+                .unwrap_or_else(|| Duration::from_micros(0))
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+
+            if remaining_us < self.l2_ctrl.min_remaining_us {
                 metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                if now >= deadline {
+                    metrics::counter!("router_timeout_before_l2_total").increment(1);
+                } else {
+                    metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                }
+            } else if !self.l2_ctrl.allow_by_rate() {
+                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                metrics::counter!("router_l2_skipped_rate_total").increment(1);
             } else {
                 metrics::counter!("router_l2_trigger_total").increment(1);
 
@@ -433,54 +567,105 @@ impl AppCore {
             let xgb2 = self.xgb_l2.as_ref().unwrap();
             let pool2 = self.xgb_pool_l2.as_ref().unwrap();
 
-            // 给 L2 留一点预算，避免拖炸整条链路（默认：SLO 的一半，你也可以后面再做成 env/flag）
-            let l2_budget = Duration::from_millis(((self.cfg.slo_p99_ms as u64) / 2).max(1));
-
+            // --- L2 admission control ---
             let now = Instant::now();
-            if now + l2_budget > deadline {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
-            } else {
-                metrics::counter!("router_l2_trigger_total").increment(1);
+            let remaining_us = deadline
+                .checked_duration_since(now)
+                .unwrap_or_else(|| Duration::from_micros(0))
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
 
-                // 只有真的要跑 L2 时才 build row2（两套模型特征顺序可能不同）
+            // 1) deadline / remaining budget
+            if remaining_us < self.l2_ctrl.min_remaining_us {
+                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                if now >= deadline {
+                    metrics::counter!("router_timeout_before_l2_total").increment(1);
+                } else {
+                    metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                }
+            }
+            // 2) per-second budget (rate limiter)
+            else if !self.l2_ctrl.allow_by_rate() {
+                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                metrics::counter!("router_l2_skipped_rate_total").increment(1);
+            }
+            // 3) queue waterline gate (avoid knee-cliff when L2 backlog grows)
+            else if self.l2_ctrl.max_queue_waterline < 1.0
+                && pool2.stats().queue_waterline() >= self.l2_ctrl.max_queue_waterline
+            {
+                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                metrics::counter!("router_l2_skipped_waterline_total").increment(1);
+            } else {
+                // Only build row2 when we really plan to run L2.
                 let row2: Vec<f32> = xgb2.build_row(obj);
 
                 let t_l2_total = Instant::now();
-                let rx2 = pool2
-                    .try_submit(row2, 5)
-                    .map_err(|e| anyhow::Error::new(e))?;
+
+                // Optional queue-wait budget for L2 pool.
+                let mut q_budget_us = self.l2_ctrl.queue_wait_budget_us;
+                if q_budget_us > 0 {
+                    q_budget_us = q_budget_us.min(remaining_us);
+                }
+
+                let rx2 = (if q_budget_us > 0 {
+                    pool2.try_submit_with_budget(row2, 5, q_budget_us)
+                } else {
+                    pool2.try_submit(row2, 5)
+                })
+                .map_err(|e| anyhow::Error::new(e))?;
+
+                // Count as triggered only after we successfully enqueued.
+                metrics::counter!("router_l2_trigger_total").increment(1);
 
                 match rx2.await {
-                    Ok(inner) => {
-                        let out2 = inner?;
-                        timings.l2 = now_us(t_l2_total);
-                        metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                    Ok(inner) => match inner {
+                        Ok(out2) => {
+                            timings.l2 = now_us(t_l2_total);
+                            metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
 
-                        score_final = out2.score;
-                        decision = decision_from_str(xgb2.decide(out2.score));
+                            score_final = out2.score;
+                            decision = decision_from_str(xgb2.decide(out2.score));
 
-                        for (name, c) in out2.contrib_topk {
-                            let c = c as f64;
+                            for (name, c) in out2.contrib_topk {
+                                let c = c as f64;
+                                reasons.push(ReasonItem {
+                                    signal: name,
+                                    value: c,
+                                    baseline_p95: 0.0,
+                                    direction: if c >= 0.0 {
+                                        "risk_up".into()
+                                    } else {
+                                        "risk_down".into()
+                                    },
+                                });
+                            }
+
+                            // 额外给一个信息项：让你线上 debug 更爽（不会影响排序/决策）
                             reasons.push(ReasonItem {
-                                signal: name,
-                                value: c,
+                                signal: "l1_score".into(),
+                                value: score1 as f64,
                                 baseline_p95: 0.0,
-                                direction: if c >= 0.0 {
-                                    "risk_up".into()
-                                } else {
-                                    "risk_down".into()
-                                },
+                                direction: "info".into(),
                             });
                         }
-
-                        // 额外给一个信息项：让你线上 debug 更爽（不会影响排序/决策）
-                        reasons.push(ReasonItem {
-                            signal: "l1_score".into(),
-                            value: score1 as f64,
-                            baseline_p95: 0.0,
-                            direction: "info".into(),
-                        });
-                    }
+                        Err(e) => {
+                            // If L2 missed its queue-wait budget, degrade to L1 result (200) rather than fail the whole request.
+                            if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
+                                match pe {
+                                    XgbPoolError::DeadlineExceeded => {
+                                        timings.l2 = now_us(t_l2_total);
+                                        metrics::histogram!("stage_l2_us")
+                                            .record(timings.l2 as f64);
+                                        metrics::counter!("router_deadline_miss_total")
+                                            .increment(1);
+                                    }
+                                    _ => return Err(e),
+                                }
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    },
                     Err(_) => {
                         // oneshot canceled（极少见）：回退到 L1 结果
                         metrics::counter!("router_deadline_miss_total").increment(1);
@@ -524,6 +709,95 @@ impl AppCore {
             }
         }
 
+        timings.router = now_us(t_router);
+        metrics::histogram!("stage_router_us").record(timings.router as f64);
+
+        let mut resp = ScoreResponse {
+            trace_id: Uuid::new_v4(),
+            score: score_final as f64,
+            decision,
+            reason: reasons,
+            timings_us: timings,
+        };
+
+        let t_ser = Instant::now();
+        let _ = serde_json::to_vec(&resp);
+        resp.timings_us.serialize = now_us(t_ser);
+        metrics::histogram!("stage_serialize_us").record(resp.timings_us.serialize as f64);
+
+        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
+
+        Ok(resp)
+    }
+
+    /// ✅ Dense 直传版本（async）
+    /// - 调用方直接给 dense row（f32，顺序必须与 feature_names.json 一致）
+    /// - 这条路径**不做 feature build**，用来把 JSON parse/Map lookup 的 CPU 和分配成本全部抹掉
+    /// - 当前实现默认只跑 L1（如果你打开了 L2，也会在 decision=review 时跳过并计数）
+    pub async fn score_xgb_pool_dense_async(
+        &self,
+        parse_us: u64,
+        row1: Vec<f32>,
+    ) -> anyhow::Result<ScoreResponse> {
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_millis(self.cfg.slo_p99_ms as u64);
+
+        let mut timings = TimingsUs::default();
+        timings.parse = parse_us;
+        timings.feature = 0;
+        metrics::histogram!("stage_feature_us").record(0.0);
+
+        let xgb1 = self
+            .xgb
+            .as_ref()
+            .context("xgb not enabled: start server with --model-dir")?;
+        let pool1 = self.xgb_pool.as_ref().context("xgb_pool not enabled")?;
+
+        // 维度校验：避免客户端/模型不匹配时 silent corruption
+        if row1.len() != xgb1.feature_names.len() {
+            anyhow::bail!(
+                "dense feature size mismatch: got {}, expected {}",
+                row1.len(),
+                xgb1.feature_names.len()
+            );
+        }
+
+        // L1：score（pool）
+        let t_l1_total = Instant::now();
+        let rx = pool1
+            .try_submit(row1, 0)
+            .map_err(|e| anyhow::Error::new(e))?;
+
+        let out1 = rx
+            .await
+            .map_err(|_| anyhow::Error::new(XgbPoolError::Canceled))??;
+
+        timings.xgb = now_us(t_l1_total);
+        metrics::histogram!("stage_xgb_us").record(timings.xgb as f64);
+
+        let score1 = out1.score;
+        let score_final = score1;
+        let decision: Decision = decision_from_str(xgb1.decide(score1));
+
+        let reasons: Vec<ReasonItem> = vec![];
+
+        // router：当前 dense 版本默认不跑 L2（因为缺少 obj，无法按 L2 的 feature_names 重建 row2）
+        let t_router = Instant::now();
+        if matches!(decision, Decision::ManualReview) && self.xgb_l2.is_some() {
+            metrics::counter!("router_l2_skipped_budget_total").increment(1);
+            metrics::counter!("router_l2_skipped_dense_unsupported_total").increment(1);
+
+            // 如果已经接近 deadline，就把原因单独记一笔（论文里很好解释）
+            let now = Instant::now();
+            let remaining_us = deadline
+                .checked_duration_since(now)
+                .unwrap_or_else(|| Duration::from_micros(0))
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            if remaining_us < self.l2_ctrl.min_remaining_us {
+                metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+            }
+        }
         timings.router = now_us(t_router);
         metrics::histogram!("stage_router_us").record(timings.router as f64);
 

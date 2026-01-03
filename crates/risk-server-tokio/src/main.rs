@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Instant};
 
 use anyhow::Context;
@@ -5,7 +6,7 @@ use axum::{
     body::Bytes,
     error_handling::HandleErrorLayer,
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -15,7 +16,7 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use risk_core::{
     config::Config,
     pipeline::AppCore,
-    schema::{ScoreRequest, ScoreResponse},
+    schema::{Decision, ScoreRequest, ScoreResponse},
     xgb_pool::XgbPoolError,
 };
 use tower::{BoxError, ServiceBuilder};
@@ -48,6 +49,8 @@ struct AppState {
     core: Arc<AppCore>,
     prom: PrometheusHandle,
 }
+
+static TRACE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn env_usize(name: &str, default_value: usize) -> usize {
     std::env::var(name)
@@ -174,6 +177,239 @@ async fn score_xgb_pool(State(st): State<AppState>, body: Bytes) -> Response {
 
 /// tower 的 load_shed / concurrency_limit 早拒绝会走到这里。
 /// 我们统一变成 429 overloaded（不再出现你日志里的 503 latency=0ms）。
+
+/// ✅ Dense f32 直传：Content-Type: application/octet-stream
+/// Body 格式：
+/// - 推荐（无 header）：连续 dim 个 f32（little-endian），总长度 = dim*4
+/// - 可选（带 header）：
+///   magic="RVEC"(4) + ver(u16=1) + flags(u16=0) + dim(u32) + reserved(u32) + payload(f32*dim)
+async fn score_dense_f32(State(st): State<AppState>, body: Bytes) -> Response {
+    let t0 = Instant::now();
+
+    let Some(xgb1) = st.core.xgb.as_ref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "xgb not enabled: start server with --model-dir",
+        )
+            .into_response();
+    };
+    let expected_dim = xgb1.feature_names.len();
+
+    let row = match parse_dense_f32le(&body, expected_dim) {
+        Ok(v) => v,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+
+    let parse_us = t0.elapsed().as_micros() as u64;
+    let res = st.core.score_xgb_pool_dense_async(parse_us, row).await;
+
+    match res {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(e) => {
+            if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
+                match pe {
+                    XgbPoolError::QueueFull => {
+                        return (StatusCode::TOO_MANY_REQUESTS, "QueueFull").into_response()
+                    }
+                    XgbPoolError::DeadlineExceeded => {
+                        return (StatusCode::TOO_MANY_REQUESTS, "DeadlineExceeded").into_response()
+                    }
+                    XgbPoolError::WorkerDown => {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "WorkerDown").into_response();
+                    }
+                    _ => {}
+                }
+            }
+            error!(error = %e, "score_dense_f32 failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+fn parse_dense_f32le(body: &Bytes, expected_dim: usize) -> Result<Vec<f32>, String> {
+    let b = body.as_ref();
+
+    // Fast path: raw payload (no header)
+    let raw_len = expected_dim
+        .checked_mul(4)
+        .ok_or_else(|| "expected_dim too large".to_string())?;
+    if b.len() == raw_len {
+        return Ok(bytes_to_f32_vec_le(b));
+    }
+
+    // Headered payload
+    if b.len() < 16 {
+        return Err(format!("body too short: {} < 16", b.len()));
+    }
+    if &b[0..4] != b"RVEC" {
+        return Err("invalid dense payload (missing magic RVEC)".into());
+    }
+    let ver = u16::from_le_bytes([b[4], b[5]]);
+    if ver != 1 {
+        return Err(format!("unsupported RVEC version: {}", ver));
+    }
+    let flags = u16::from_le_bytes([b[6], b[7]]);
+    if flags != 0 {
+        return Err(format!("unsupported RVEC flags: {}", flags));
+    }
+    let dim = u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize;
+    if dim != expected_dim {
+        return Err(format!(
+            "dense dim mismatch: got {}, expected {}",
+            dim, expected_dim
+        ));
+    }
+    let need = 16 + raw_len;
+    if b.len() != need {
+        return Err(format!(
+            "invalid payload size: got {}, expected {}",
+            b.len(),
+            need
+        ));
+    }
+    Ok(bytes_to_f32_vec_le(&b[16..]))
+}
+
+#[inline]
+fn bytes_to_f32_vec_le(data: &[u8]) -> Vec<f32> {
+    // Fast memcpy path when data is aligned and machine is little-endian (WSL2/x86_64).
+    if cfg!(target_endian = "little") {
+        // SAFETY: `align_to::<f32>()` is only used as a fast memcpy path.
+        // We only accept the `body` slice when both `head` and `tail` are empty,
+        // which implies `data` is properly aligned for `f32` and its length is a
+        // multiple of 4 bytes. All bit patterns are valid `f32` values, so this
+        // reinterpretation does not violate Rust's value validity rules.
+        let (head, body, tail) = unsafe { data.align_to::<f32>() };
+        if head.is_empty() && tail.is_empty() {
+            return body.to_vec();
+        }
+    }
+
+    // Fallback: safe per-chunk decode
+    let mut out = Vec::with_capacity(data.len() / 4);
+    for c in data.chunks_exact(4) {
+        out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    out
+}
+
+fn decision_to_u8(d: &Decision) -> u8 {
+    match d {
+        Decision::Allow => 0,
+        Decision::Deny => 1,
+        Decision::ManualReview => 2,
+        Decision::DegradeAllow => 3,
+    }
+}
+
+/// RSK1 binary response layout (48 bytes, little-endian):
+/// - magic[4] = "RSK1"
+/// - version(u16)=1
+/// - flags(u16): bit0=l2_path, bit1=degraded
+/// - trace_id(u64)
+/// - score(f32)
+/// - decision(u8)
+/// - pad[3]
+/// - timings_us[6](u32): parse/feature/router/xgb/l2/serialize
+fn encode_rsk1_response(trace_id: u64, resp: &ScoreResponse) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(b"RSK1");
+    out.extend_from_slice(&1u16.to_le_bytes());
+
+    let mut flags: u16 = 0;
+    if resp.timings_us.l2 > 0 {
+        flags |= 1 << 0;
+    }
+    if matches!(resp.decision, Decision::DegradeAllow) {
+        flags |= 1 << 1;
+    }
+    out.extend_from_slice(&flags.to_le_bytes());
+
+    out.extend_from_slice(&trace_id.to_le_bytes());
+    out.extend_from_slice(&(resp.score as f32).to_le_bytes());
+    out.push(decision_to_u8(&resp.decision));
+    out.extend_from_slice(&[0u8; 3]);
+
+    #[inline]
+    fn clamp_u32(x: u64) -> u32 {
+        if x > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            x as u32
+        }
+    }
+
+    let ts = &resp.timings_us;
+    for v in [ts.parse, ts.feature, ts.router, ts.xgb, ts.l2, ts.serialize] {
+        out.extend_from_slice(&clamp_u32(v).to_le_bytes());
+    }
+
+    debug_assert!(
+        out.len() == 48,
+        "RSK1 response must be 48 bytes, got {}",
+        out.len()
+    );
+    out
+}
+
+/// ✅ Dense f32 直传 + Binary response（application/octet-stream）
+/// 请求体同 /score_dense_f32（raw 或 RVEC header）。
+async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Response {
+    let t0 = Instant::now();
+
+    let Some(xgb1) = st.core.xgb.as_ref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "xgb not enabled: start server with --model-dir",
+        )
+            .into_response();
+    };
+    let expected_dim = xgb1.feature_names.len();
+
+    let row = match parse_dense_f32le(&body, expected_dim) {
+        Ok(v) => v,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+
+    let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let parse_us = t0.elapsed().as_micros() as u64;
+
+    let res = st.core.score_xgb_pool_dense_async(parse_us, row).await;
+
+    match res {
+        Ok(resp) => {
+            let bin = encode_rsk1_response(trace_id, &resp);
+            let mut r = Response::new(axum::body::Body::from(bin));
+            *r.status_mut() = StatusCode::OK;
+            r.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            // trace_id 只在错误时打日志，避免热路径噪声；客户端会拿到 trace_id。
+            r
+        }
+        Err(e) => {
+            if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
+                match pe {
+                    XgbPoolError::QueueFull => {
+                        return (StatusCode::TOO_MANY_REQUESTS, "QueueFull").into_response()
+                    }
+                    XgbPoolError::DeadlineExceeded => {
+                        return (StatusCode::TOO_MANY_REQUESTS, "DeadlineExceeded").into_response()
+                    }
+                    XgbPoolError::WorkerDown => {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "WorkerDown").into_response();
+                    }
+                    _ => {}
+                }
+            }
+
+            error!(error = %e, trace_id = trace_id, "score_dense_f32_bin failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
 async fn handle_tower_overload(err: BoxError) -> Response {
     warn!(error = %err, "request rejected by middleware");
     (StatusCode::TOO_MANY_REQUESTS, "overloaded").into_response()
@@ -217,6 +453,8 @@ async fn async_main(
         .route("/score", post(score))
         .route("/score_xgb", post(score_xgb))
         .route("/score_xgb_pool", post(score_xgb_pool))
+        .route("/score_dense_f32", post(score_dense_f32))
+        .route("/score_dense_f32_bin", post(score_dense_f32_bin))
         .with_state(st)
         .layer(
             ServiceBuilder::new()
