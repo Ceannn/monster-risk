@@ -4,19 +4,15 @@
 //! - XGBoost C-API is blocking and can be CPU heavy; running it on Tokio workers
 //!   causes head-of-line blocking and latency spikes.
 //! - We instead create N dedicated OS threads, each owning its own Booster.
-//! - Submission is non-blocking (`try_submit*`); when all queues are full we fail fast.
+//! - Submission is non-blocking (`try_submit`); when all queues are full we fail fast.
 //!
-//! Extras in this version:
-//! - Optional **queue-wait budget**: if a job sits in the queue longer than `budget_us`,
-//!   the worker replies with `DeadlineExceeded` without running inference.
-//! - A lightweight **compute p99 estimator** (per-worker rolling window), exposed via
-//!   `xgb_compute_p99_est_us()` so the pipeline can set smarter budgets.
+//! This file intentionally keeps the public API tiny and stable.
 
 use anyhow::Context;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -66,9 +62,6 @@ struct WorkerHandle {
 pub struct XgbPool {
     workers: Vec<WorkerHandle>,
     rr: AtomicUsize,
-
-    // Rolling estimate of compute p99 (microseconds), updated by workers.
-    compute_p99_est_us: Arc<AtomicU64>,
 }
 
 impl XgbPool {
@@ -119,16 +112,12 @@ impl XgbPool {
         let mut workers = Vec::with_capacity(n_workers);
         let pin_cpus = pin_cpus.unwrap_or_default();
 
-        let compute_p99_est_us = Arc::new(AtomicU64::new(0));
-
         for wid in 0..n_workers {
             let (tx, mut rx) = mpsc::channel::<XgbJob>(per_worker_cap);
             let model_path = Arc::clone(&model_path);
             let feature_names = Arc::clone(&feature_names);
             let cpu = pin_cpus.get(wid).copied();
             let warmup_iters = warmup_iters;
-
-            let compute_p99_est_us_w = Arc::clone(&compute_p99_est_us);
 
             thread::Builder::new()
                 .name(format!("xgb-worker-{wid}"))
@@ -163,16 +152,6 @@ impl XgbPool {
                         let _ = bst.predict_contribs_dense_1row(&row);
                         eprintln!("xgb-worker-{wid}: warmup done iters={warmup_iters}");
                     }
-
-                    // ---- rolling compute p99 estimator (per worker) ----
-                    // Using a small fixed window keeps overhead negligible and avoids extra deps.
-                    const P99_WIN: usize = 2048; // power of two; ~tiny memory, fast copy
-                    const UPDATE_EVERY: u64 = 1024;
-
-                    let mut ring: Vec<u32> = vec![0; P99_WIN];
-                    let mut scratch: Vec<u32> = vec![0; P99_WIN];
-                    let mut seen: u64 = 0;
-                    let mut idx: usize = 0;
 
                     // Main loop
                     while let Some(job) = rx.blocking_recv() {
@@ -225,22 +204,6 @@ impl XgbPool {
                         let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                         metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
 
-                        // update rolling p99 estimate
-                        seen += 1;
-                        ring[idx] = xgb_us.min(u64::from(u32::MAX)) as u32;
-                        idx = (idx + 1) & (P99_WIN - 1);
-
-                        if seen >= P99_WIN as u64 && (seen % UPDATE_EVERY == 0) {
-                            scratch.copy_from_slice(&ring);
-                            let k = (P99_WIN * 99) / 100;
-                            let (_, p99, _) = scratch.select_nth_unstable(k);
-                            let p99u = *p99 as u64;
-
-                            compute_p99_est_us_w.store(p99u, Ordering::Relaxed);
-                            // Optional: export as gauge for debugging.
-                            metrics::gauge!("xgb_pool_xgb_compute_p99_est_us").set(p99u as f64);
-                        }
-
                         let _ = job.resp_tx.send(Ok(XgbOut {
                             score,
                             queue_wait_us,
@@ -257,7 +220,6 @@ impl XgbPool {
         Ok(Self {
             workers,
             rr: AtomicUsize::new(0),
-            compute_p99_est_us,
         })
     }
 
@@ -279,18 +241,6 @@ impl XgbPool {
             warmup_iters,
             pin_cpus,
         )
-    }
-
-    /// Approximate compute p99 (microseconds) for `predict_proba_dense_1row`.
-    ///
-    /// - Returns a conservative default (1500us) until the estimator warms up.
-    pub fn xgb_compute_p99_est_us(&self) -> u64 {
-        let v = self.compute_p99_est_us.load(Ordering::Relaxed);
-        if v == 0 {
-            1_500
-        } else {
-            v
-        }
     }
 
     /// Non-blocking submission. Returns a oneshot receiver to await the result.

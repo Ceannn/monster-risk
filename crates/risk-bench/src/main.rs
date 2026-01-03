@@ -21,6 +21,18 @@ enum PacerMode {
     Poisson,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum XgbBodyFormat {
+    /// Decide based on path: dir => dir, *.jsonl/*.ndjson => jsonl, otherwise json.
+    Auto,
+    /// Treat --xgb-body-file as a single JSON blob (sent verbatim each request).
+    Json,
+    /// Treat --xgb-body-file as JSONL/NDJSON (one JSON object per line; sampled per request).
+    Jsonl,
+    /// Treat --xgb-body-file as a directory of JSON files (each file is one body; sampled per request).
+    Dir,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -34,6 +46,14 @@ struct Args {
     /// JSON body file for /score_xgb* endpoints (default {})
     #[arg(long)]
     xgb_body_file: Option<String>,
+
+    /// How to interpret --xgb-body-file (default: auto)
+    #[arg(long, value_enum, default_value_t = XgbBodyFormat::Auto)]
+    xgb_body_format: XgbBodyFormat,
+
+    /// Max number of request bodies to load from corpus (jsonl/dir). Helps cap RAM.
+    #[arg(long, default_value_t = 20000)]
+    xgb_body_max: usize,
 
     #[arg(long, default_value_t = 1000)]
     rps: u64,
@@ -236,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let targets = parse_targets(&args)?;
-    let xgb_body = load_xgb_body(&args)?;
+    let xgb_bodies = load_xgb_bodies(&args)?;
 
     // RPS sequence
     let rps_list: Vec<u64> = if args.find_knee {
@@ -263,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
         let mut knee_reasons: Vec<String> = Vec::new();
 
         for t in &targets {
-            let summary = run_once(&args, rps, &t.url, &t.metrics_url, &xgb_body).await?;
+            let summary = run_once(&args, rps, &t.url, &t.metrics_url, &xgb_bodies).await?;
 
             if summary.samples_ok == 0 {
                 println!(
@@ -523,7 +543,7 @@ async fn run_once(
     rps: u64,
     url: &str,
     metrics_url: &str,
-    xgb_body: &Bytes,
+    xgb_bodies: &Arc<Vec<Bytes>>,
 ) -> anyhow::Result<Summary> {
     // seed=0 => time-based (less deterministic but closer to reality)
     let seed = if args.seed == 0 {
@@ -596,7 +616,7 @@ async fn run_once(
     }
 
     let url_s = Arc::new(url.to_string());
-    let xgb_body = Arc::new(xgb_body.clone());
+    let xgb_bodies = xgb_bodies.clone();
 
     let start = tokio::time::Instant::now();
     let end = start + Duration::from_secs(args.duration);
@@ -635,8 +655,9 @@ async fn run_once(
 
         let client = client.clone();
         let url = url_s.clone();
-        let xgb_body = xgb_body.clone();
+        let xgb_bodies = xgb_bodies.clone();
         let score_bodies = score_bodies.clone();
+        let xgb_bodies = xgb_bodies.clone();
         let inflight = inflight.clone();
         let sample_tx = sample_tx.clone();
         let lag_tx = lag_tx.clone();
@@ -700,7 +721,11 @@ async fn run_once(
 
                 let req_id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
                 let body: Bytes = if is_xgb {
-                    (*xgb_body).clone()
+                    {
+                        let bodies = xgb_bodies.as_ref();
+                        let idx = rng.gen_range(0..bodies.len());
+                        bodies[idx].clone()
+                    }
                 } else {
                     let bodies = score_bodies.as_ref().expect("score_bodies");
                     let idx = (req_id as usize) % bodies.len();
@@ -1097,13 +1122,121 @@ fn scrape_metrics_snapshot(text: &str) -> MetricsSnapshot {
     out
 }
 
-fn load_xgb_body(args: &Args) -> anyhow::Result<Bytes> {
-    if let Some(p) = &args.xgb_body_file {
-        let b = std::fs::read(p).with_context(|| format!("read --xgb-body-file: {}", p))?;
-        Ok(Bytes::from(b))
-    } else {
-        Ok(Bytes::from_static(b"{}"))
+fn slice_trim_ascii(buf: &Bytes) -> Bytes {
+    let mut s = 0usize;
+    let mut e = buf.len();
+    while s < e && buf[s].is_ascii_whitespace() {
+        s += 1;
     }
+    while e > s && buf[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    buf.slice(s..e)
+}
+
+fn detect_xgb_body_format(path: &std::path::Path) -> XgbBodyFormat {
+    if path.is_dir() {
+        return XgbBodyFormat::Dir;
+    }
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "jsonl" || ext == "ndjson" {
+        XgbBodyFormat::Jsonl
+    } else {
+        XgbBodyFormat::Json
+    }
+}
+
+/// Load request bodies for xgb endpoints.
+/// - Json: single body (verbatim)
+/// - Jsonl: one body per non-empty line
+/// - Dir: one body per file
+fn load_xgb_bodies(args: &Args) -> anyhow::Result<Arc<Vec<Bytes>>> {
+    let max = args.xgb_body_max.max(1);
+
+    let Some(path_s) = args.xgb_body_file.as_deref() else {
+        return Ok(Arc::new(vec![Bytes::from_static(b"{}")]));
+    };
+
+    let path = std::path::PathBuf::from(path_s);
+    let fmt = match args.xgb_body_format {
+        XgbBodyFormat::Auto => detect_xgb_body_format(&path),
+        other => other,
+    };
+
+    let mut out: Vec<Bytes> = Vec::new();
+
+    match fmt {
+        XgbBodyFormat::Json => {
+            let buf = Bytes::from(std::fs::read(&path)?);
+            let body = slice_trim_ascii(&buf);
+            if body.is_empty() {
+                out.push(Bytes::from_static(b"{}"));
+            } else {
+                out.push(body);
+            }
+        }
+        XgbBodyFormat::Jsonl => {
+            let buf = Bytes::from(std::fs::read(&path)?);
+            let mut line_start = 0usize;
+            for i in 0..=buf.len() {
+                let at_end = i == buf.len();
+                if at_end || buf[i] == b'\n' {
+                    let mut s = line_start;
+                    let mut e = i;
+                    while s < e && buf[s].is_ascii_whitespace() {
+                        s += 1;
+                    }
+                    while e > s && buf[e - 1].is_ascii_whitespace() {
+                        e -= 1;
+                    }
+                    if s < e {
+                        out.push(buf.slice(s..e));
+                        if out.len() >= max {
+                            break;
+                        }
+                    }
+                    line_start = i.saturating_add(1);
+                }
+            }
+            if out.is_empty() {
+                // Fallback to treating as a single JSON blob (e.g. pretty-printed json)
+                let body = slice_trim_ascii(&buf);
+                if body.is_empty() {
+                    out.push(Bytes::from_static(b"{}"));
+                } else {
+                    out.push(body);
+                }
+            }
+        }
+        XgbBodyFormat::Dir => {
+            let mut entries: Vec<_> = std::fs::read_dir(&path)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .map(|e| e.path())
+                .collect();
+            entries.sort();
+            for p in entries {
+                let buf = Bytes::from(std::fs::read(&p)?);
+                let body = slice_trim_ascii(&buf);
+                if !body.is_empty() {
+                    out.push(body);
+                    if out.len() >= max {
+                        break;
+                    }
+                }
+            }
+            if out.is_empty() {
+                out.push(Bytes::from_static(b"{}"));
+            }
+        }
+        XgbBodyFormat::Auto => unreachable!("auto resolved above"),
+    }
+
+    Ok(Arc::new(out))
 }
 
 fn parse_targets(args: &Args) -> anyhow::Result<Vec<Target>> {
