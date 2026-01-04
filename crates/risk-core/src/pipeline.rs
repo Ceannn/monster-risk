@@ -9,6 +9,7 @@ use crate::{
 };
 
 use anyhow::Context;
+use bytes::Bytes;
 use serde_json::{Map, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -254,6 +255,13 @@ impl AppCore {
                 .unwrap_or(default)
         }
 
+        fn parse_u64_env(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+
         fn parse_pin_env(key: &str) -> Option<Vec<usize>> {
             std::env::var(key).ok().and_then(|s| {
                 let v: Vec<usize> = s
@@ -319,7 +327,7 @@ impl AppCore {
         let xgb_pool1 = {
             let feature_names = Arc::new(xgb1.feature_names.clone());
             let model_path = xgb1.model_path.clone();
-            let pool = XgbPool::new_with_pinning(
+            let mut pool = XgbPool::new_with_pinning(
                 model_path,
                 feature_names,
                 l1_threads,
@@ -327,6 +335,25 @@ impl AppCore {
                 l1_warm,
                 l1_pin,
             )?;
+
+            // Admission-control backpressure (fail fast with 429) to keep client-visible tail stable.
+            // Default: half of SLO budget (microseconds). Override with env:
+            //   - XGB_L1_POOL_EARLY_REJECT_US
+            //   - (fallback) XGB_POOL_EARLY_REJECT_US
+            let default_early_us = (cfg.slo_p99_ms as u64)
+                .saturating_mul(1000)
+                .saturating_div(2)
+                .max(0);
+            let l1_early_us = std::env::var("XGB_L1_POOL_EARLY_REJECT_US")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| {
+                    std::env::var("XGB_POOL_EARLY_REJECT_US")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                })
+                .unwrap_or(default_early_us);
+            pool.set_early_reject_pred_wait_us(l1_early_us);
             Some(Arc::new(pool))
         };
 
@@ -352,7 +379,7 @@ impl AppCore {
 
             let feature_names = Arc::new(x.feature_names.clone());
             let model_path = x.model_path.clone();
-            let pool = XgbPool::new_with_pinning(
+            let mut pool = XgbPool::new_with_pinning(
                 model_path,
                 feature_names,
                 l2_threads,
@@ -360,6 +387,14 @@ impl AppCore {
                 l2_warm,
                 l2_pin,
             )?;
+
+            // L2 is slower; default to a smaller budget (quarter of SLO) unless overridden.
+            let default_l2_early_us = (cfg.slo_p99_ms as u64)
+                .saturating_mul(1000)
+                .saturating_div(4)
+                .max(0);
+            let l2_early_us = parse_u64_env("XGB_L2_POOL_EARLY_REJECT_US", default_l2_early_us);
+            pool.set_early_reject_pred_wait_us(l2_early_us);
             xgb2 = Some(x);
             xgb_pool2 = Some(Arc::new(pool));
         }
@@ -806,6 +841,99 @@ impl AppCore {
             score: score_final as f64,
             decision,
             reason: reasons,
+            timings_us: timings,
+        };
+
+        let t_ser = Instant::now();
+        let _ = serde_json::to_vec(&resp);
+        resp.timings_us.serialize = now_us(t_ser);
+        metrics::histogram!("stage_serialize_us").record(resp.timings_us.serialize as f64);
+
+        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
+
+        Ok(resp)
+    }
+
+    /// Like `score_xgb_pool_dense_async`, but accepts a **little-endian raw f32 byte buffer**.
+    ///
+    /// This is designed for extreme throughput:
+    /// - avoids JSON parse
+    /// - avoids allocating / building `Vec<f32>` on the Tokio side
+    /// - still keeps the XgbPool isolation + bounded-queue semantics
+    pub async fn score_xgb_pool_dense_bytes_async(
+        &self,
+        parse_us: u64,
+        row_bytes_le: Bytes,
+    ) -> anyhow::Result<ScoreResponse> {
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_millis(self.cfg.slo_p99_ms as u64);
+
+        let mut timings = TimingsUs::default();
+        timings.parse = parse_us;
+        timings.feature = 0;
+        metrics::histogram!("stage_feature_us").record(0.0);
+
+        let xgb1 = self
+            .xgb
+            .as_ref()
+            .context("xgb not enabled: start server with --model-dir")?;
+        let pool1 = self.xgb_pool.as_ref().context("xgb_pool not enabled")?;
+
+        // 维度校验：避免客户端/模型不匹配时 silent corruption
+        let feature_dim = xgb1.feature_names.len();
+        let expected_len = feature_dim.saturating_mul(4);
+        anyhow::ensure!(
+            row_bytes_le.len() == expected_len,
+            "dense bytes length mismatch: got={}, expected={} (dim={})",
+            row_bytes_le.len(),
+            expected_len,
+            feature_dim
+        );
+
+        // L1：score（pool）
+        let t_l1_total = Instant::now();
+        let rx = pool1
+            .try_submit_dense_bytes_le(row_bytes_le, feature_dim, 0)
+            .map_err(|e| anyhow::Error::new(e))?;
+
+        let tokio_deadline =
+            tokio::time::Instant::now() + Duration::from_millis(self.cfg.slo_p99_ms);
+        let out1 = match tokio::time::timeout_at(tokio_deadline, rx).await {
+            Ok(Ok(v)) => v?,
+            Ok(Err(_)) => anyhow::bail!(XgbPoolError::Canceled),
+            Err(_) => anyhow::bail!(XgbPoolError::DeadlineExceeded),
+        };
+
+        timings.xgb = now_us(t_l1_total);
+        metrics::histogram!("stage_xgb_us").record(timings.xgb as f64);
+
+        let score1 = out1.score;
+        let decision: Decision = decision_from_str(xgb1.decide(score1));
+
+        // router：dense-bytes 版本默认不跑 L2（原因同 dense Vec 版本）
+        let t_router = Instant::now();
+        if matches!(decision, Decision::ManualReview) && self.xgb_l2.is_some() {
+            metrics::counter!("router_l2_skipped_budget_total").increment(1);
+            metrics::counter!("router_l2_skipped_dense_unsupported_total").increment(1);
+
+            let now = Instant::now();
+            let remaining_us = deadline
+                .checked_duration_since(now)
+                .unwrap_or_else(|| Duration::from_micros(0))
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64;
+            if remaining_us < self.l2_ctrl.min_remaining_us {
+                metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+            }
+        }
+        timings.router = now_us(t_router);
+        metrics::histogram!("stage_router_us").record(timings.router as f64);
+
+        let mut resp = ScoreResponse {
+            trace_id: Uuid::new_v4(),
+            score: score1 as f64,
+            decision,
+            reason: vec![],
             timings_us: timings,
         };
 

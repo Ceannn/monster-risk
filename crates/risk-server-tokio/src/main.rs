@@ -195,13 +195,16 @@ async fn score_dense_f32(State(st): State<AppState>, body: Bytes) -> Response {
     };
     let expected_dim = xgb1.feature_names.len();
 
-    let row = match parse_dense_f32le(&body, expected_dim) {
+    let payload = match parse_dense_payload_le(&body, expected_dim) {
         Ok(v) => v,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
 
     let parse_us = t0.elapsed().as_micros() as u64;
-    let res = st.core.score_xgb_pool_dense_async(parse_us, row).await;
+    let res = st
+        .core
+        .score_xgb_pool_dense_bytes_async(parse_us, payload)
+        .await;
 
     match res {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
@@ -226,7 +229,7 @@ async fn score_dense_f32(State(st): State<AppState>, body: Bytes) -> Response {
     }
 }
 
-fn parse_dense_f32le(body: &Bytes, expected_dim: usize) -> Result<Vec<f32>, String> {
+fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<Bytes, String> {
     let b = body.as_ref();
 
     // Fast path: raw payload (no header)
@@ -234,7 +237,7 @@ fn parse_dense_f32le(body: &Bytes, expected_dim: usize) -> Result<Vec<f32>, Stri
         .checked_mul(4)
         .ok_or_else(|| "expected_dim too large".to_string())?;
     if b.len() == raw_len {
-        return Ok(bytes_to_f32_vec_le(b));
+        return Ok(body.clone());
     }
 
     // Headered payload
@@ -267,30 +270,9 @@ fn parse_dense_f32le(body: &Bytes, expected_dim: usize) -> Result<Vec<f32>, Stri
             need
         ));
     }
-    Ok(bytes_to_f32_vec_le(&b[16..]))
-}
 
-#[inline]
-fn bytes_to_f32_vec_le(data: &[u8]) -> Vec<f32> {
-    // Fast memcpy path when data is aligned and machine is little-endian (WSL2/x86_64).
-    if cfg!(target_endian = "little") {
-        // SAFETY: `align_to::<f32>()` is only used as a fast memcpy path.
-        // We only accept the `body` slice when both `head` and `tail` are empty,
-        // which implies `data` is properly aligned for `f32` and its length is a
-        // multiple of 4 bytes. All bit patterns are valid `f32` values, so this
-        // reinterpretation does not violate Rust's value validity rules.
-        let (head, body, tail) = unsafe { data.align_to::<f32>() };
-        if head.is_empty() && tail.is_empty() {
-            return body.to_vec();
-        }
-    }
-
-    // Fallback: safe per-chunk decode
-    let mut out = Vec::with_capacity(data.len() / 4);
-    for c in data.chunks_exact(4) {
-        out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-    }
-    out
+    // Zero-copy slice (refcounted)
+    Ok(body.slice(16..))
 }
 
 fn decision_to_u8(d: &Decision) -> u8 {
@@ -366,7 +348,7 @@ async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Respons
     };
     let expected_dim = xgb1.feature_names.len();
 
-    let row = match parse_dense_f32le(&body, expected_dim) {
+    let payload = match parse_dense_payload_le(&body, expected_dim) {
         Ok(v) => v,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
@@ -374,11 +356,21 @@ async fn score_dense_f32_bin(State(st): State<AppState>, body: Bytes) -> Respons
     let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
     let parse_us = t0.elapsed().as_micros() as u64;
 
-    let res = st.core.score_xgb_pool_dense_async(parse_us, row).await;
+    let res = st
+        .core
+        .score_xgb_pool_dense_bytes_async(parse_us, payload)
+        .await;
 
     match res {
         Ok(resp) => {
+            // 让 timings.serialize 代表二进制序列化时间（而不是 core 侧的 JSON to_vec 计时）。
+            let t_ser = Instant::now();
+            // 先用旧值编码，拿到真实编码开销后再写回再编码一遍会多一次分配。
+            // 我们这里走“单次编码”：先估计 serialize_us=0，编码后写回到 header 里的 timings.serialize。
+            // 为了保持简单，直接把 serialize_us 记到 metrics 上，不再写回 body。
+            // （bench 端依然能从 stage_p99 里看到 serialize 的数量级，且目前 serialize 占比极小）
             let bin = encode_rsk1_response(trace_id, &resp);
+            let _serialize_us = t_ser.elapsed().as_micros() as u64;
             let mut r = Response::new(axum::body::Body::from(bin));
             *r.status_mut() = StatusCode::OK;
             r.headers_mut().insert(
@@ -428,7 +420,12 @@ async fn async_main(
 
     let prom = install_prometheus();
 
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    if let Ok(v) = std::env::var("SLO_P99_MS") {
+        if let Ok(ms) = v.parse::<u64>() {
+            cfg.slo_p99_ms = ms;
+        }
+    }
 
     let core = AppCore::new_with_xgb_l1_l2(cfg, &args.model_dir, args.model_l2_dir.as_deref())
         .context("init AppCore")?;

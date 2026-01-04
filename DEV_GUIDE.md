@@ -1,555 +1,243 @@
-1. 项目目标（论文核心目标）
+# DEV_GUIDE
 
-本项目实现一个面向高频信用卡交易欺诈检测的在线推理服务，强调 吞吐极限 + 可控 P99：
+> 这份文档是“能一键跑起来 + 能稳定压测 + 能解释结果”的最小闭环指南。  
+> 目标是：**用同一套命令**把 `risk-server-tokio` 跑稳、把 `risk-bench2` 打爆，并且能快速判断：到底是 **server-limited** 还是 **bench-limited**。
 
-吞吐目标：单机尽可能推高 RPS（最终目标可达 10k~20k+，视硬件）
+---
 
-尾延迟目标：P99 在 SLO 范围内稳定（核心研究对象：排队/调度造成的尾爆）
+## 1. 项目目标（我们到底在追什么）
 
-方法论：
+1) **把线上“高频打分服务”拆成可控的实验台：**
+- Tokio HTTP server：`crates/risk-server-tokio`
+- 推理核心：`crates/risk-core`（L1/L2、XGBoost pool、背压/降级）
+- 压测器：`crates/risk-bench2`（benchV3 方向：每核一线程 + 多连接 keepalive + 精准 pacer）
 
-CPU-bound 推理必须隔离（线程/模型）
+2) **强约束：不允许“测不准”。**  
+bench 不能成为瓶颈，否则你看到的 P99 就像“拿温度计测电压”——数字很漂亮，但结论不可信。
 
-必须显式背压（bounded queue / 429/降级）
+3) **接口方向：从 JSON → 二进制（更接近真实线上）。**
+- 请求：dense f32 little-endian bytes（`application/octet-stream`）
+- 响应：`RSK1` 二进制封包（包含 score + stage timings）
 
-尾延迟必须可观测分解（queue_wait vs compute）
+---
 
-压测必须用 open-loop/Poisson 才能测 knee（closed-loop 会掩盖拥塞）
+## 2. 本地开发环境（建议配置）
 
-引入级联（L1/L2）后，研究触发率预算导致的“相变曲线”
+- Rust stable（建议 `rustup default stable`）
+- Linux（本地 loopback 压测 OK；想测网络栈/网卡请用两机）
+- 建议编译参数：
+  ```bash
+  export RUSTFLAGS="-C target-cpu=native"
+  ```
 
-2. Repo 结构与职责（crates）
-2.1 crates/risk-server-tokio
+> 小比喻：`-C target-cpu=native` 就像“让编译器知道你这台 CPU 真的有 AVX2/Zen4/…”，否则它会按保守档跑。
 
-HTTP 服务（axum/hyper）
+---
 
-暴露 endpoints：
+## 3. 数据与模型准备
 
-POST /score_xgb_pool：主压测口（走 XgbPool / 或 L1+L2 级联）
+### 3.1 常用数据文件（你现在已经有了）
+你当前目录里看到的这些就够了：
 
-GET /metrics：Prometheus 指标
+- `data/bench/ieee_20k.f32`：**dense f32le 二进制**（推荐用于压测）
+- `data/bench/ieee_20k.jsonl` / `ieee_20k_posmix.jsonl`：历史 JSONL（更多用于功能对齐/调试）
 
-负责：
+维度：
+- `models/ieee_l1/feature_names.json` 长度应为 **432**（你测的就是 432）
 
-JSON parse（支持 body 或 body.features）
+### 3.2 dense f32le 文件格式（重要！）
+`ieee_20k.f32` 的布局：
 
-调用 risk-core 的 AppCore pipeline
+- 每行 = `dense_dim * 4` 字节（f32 little-endian）
+- 文件总大小 = `rows * dense_dim * 4`
 
-将错误映射为 HTTP（200/429/503）
+比如 `rows=20000`，`dense_dim=432`：
+- 单行字节数 = 432 * 4 = **1728 bytes**
+- 文件大小约 = 20000 * 1728 ≈ **33MB**（与你 ls 看到的吻合）
 
-tower trace / metrics 暴露
+---
 
-2.2 crates/risk-core
+## 4. 启动 risk-server-tokio（Tokio server）
 
-核心 pipeline + 模型运行时封装：
+### 4.1 Server CLI（以当前接口为准）
+`risk-server-tokio` 目前核心参数是：
 
-schema.rs：协议唯一真理
+- `--listen <IP:PORT>`：监听地址（**没有 `--host`**，所以你之前会报错）
+- `--model-dir <DIR>`：L1 模型目录
+- `--model-l2-dir <DIR>`：L2 模型目录
+- `--max-in-flight <N>`：HTTP 层最大并发（超出会 429，保护服务）
 
-ScoreRequest/ScoreResponse/Decision/ReasonItem/TimingsUs
+此外，Tokio runtime 线程数从环境变量读：
+- `TOKIO_WORKER_THREADS`（默认 4）
+- `TOKIO_MAX_BLOCKING_THREADS`（默认 4）
 
-pipeline.rs：AppCore
+### 4.2 推荐启动命令（经典“绑核 + 限制线程 + 背压”）
+下面给你一套“最经典的那种”，你直接复制就能跑：
 
-将输入 object（Map）跑完：parse → feature → router → xgb(L1) → (可选 L2) → serialize
+```bash
+# 1) 编译（可选，但推荐先 build）
+export RUSTFLAGS="-C target-cpu=native"
+cargo build -p risk-server-tokio --release
 
-注意：很多函数是 sync（不要 .await），以免误以为 async
+# 2) 绑核启动（示例：给 server 8 个逻辑核；按你机器改）
+OMP_NUM_THREADS=1 MALLOC_ARENA_MAX=2 TOKIO_WORKER_THREADS=4 TOKIO_MAX_BLOCKING_THREADS=4 XGB_L1_POOL_THREADS=8 XGB_L1_POOL_QUEUE_CAP=512 XGB_L1_POOL_WARMUP_ITERS=1000 XGB_L1_POOL_PIN_CPUS=0,1,2,3,4,5,6,7 XGB_L1_POOL_EARLY_REJECT_US=50 XGB_L2_POOL_THREADS=4 XGB_L2_POOL_QUEUE_CAP=256 XGB_L2_POOL_WARMUP_ITERS=200 XGB_L2_POOL_PIN_CPUS=8,9,10,11 XGB_L2_POOL_EARLY_REJECT_US=50 taskset -c 0-11 cargo run -p risk-server-tokio --release --   --listen 127.0.0.1:8080   --model-dir models/ieee_l1   --model-l2-dir models/ieee_l2   --max-in-flight 4096
+```
 
-xgb_pool.rs：推理隔离池
+说明（你会用得上）：
+- `OMP_NUM_THREADS=1`：强制 XGBoost 单线程（否则会在 pool 里“线程套线程”爆炸）
+- `*_POOL_THREADS / *_POOL_QUEUE_CAP`：XGB worker 数与队列上限（核心背压开关）
+- `*_POOL_PIN_CPUS`：把 worker 固定到核上（避免跑来跑去抖动 P99）
+- `*_POOL_EARLY_REJECT_US`：当预测排队等待超过阈值，提前拒绝（可选，但对尾延迟有帮助）
 
-N OS threads，每线程持有一份 Booster
+---
 
-bounded queue（cap）
+## 5. 接口（对齐当前进度）
 
-warmup
+### 5.1 推荐压测接口：`POST /score_dense_f32_bin`
+- Request:
+  - `Content-Type: application/octet-stream`
+  - Body：**exactly `dense_dim` 个 f32le**（即 `dense_dim * 4` bytes）
+- Response:
+  - `Content-Type: application/octet-stream`
+  - Body：48 bytes 的 `RSK1` 二进制封包（小、稳定、便于解析）
 
-metrics：queue_wait_us、xgb_compute_us、deadline_miss_total、QueueFull 等
+#### 5.1.1 `RSK1` 响应格式（48 bytes）
+| offset | size | type | 含义 |
+|---:|---:|---|---|
+| 0 | 4 | bytes | magic = `RSK1` |
+| 4 | 2 | u16le | version（当前 1） |
+| 6 | 2 | u16le | flags（当前 0） |
+| 8 | 8 | u64le | trace_id（服务端自增） |
+| 16 | 4 | f32le | score |
+| 20 | 24 | 6×u32le | stage_us：parse, feature, router, xgb, l2, serialize |
+| 44 | 4 | u32le | reserved（0） |
 
-xgb_runtime.rs：单 Booster 封装
+> 类比：这就像给每个请求都发了一个“迷你 flight recorder”，你不用解析 JSON，也能知道每段耗时。
 
-predict_proba_* 等；（性能优化点：dense buffer 复用、scalar 快路径、topk partial select）
+### 5.2 兼容接口（调试用，非压测首选）
+- `/score_xgb_pool_async` / `/score_dense_f32` 等（JSON 体/JSON 回包）
+- 这些保留用于对齐逻辑、debug 与回归；压测建议统一走 bin 版本，噪声更小。
 
-2.3 crates/xgb-ffi
+---
 
-XGBoost C API 的薄封装
+## 6. 启动 risk-bench2（benchV3 方向）
 
-只做 handle 管理、predict、错误处理
+### 6.1 bench2 CLI（你现在的 usage）
+你目前看到的参数已经是“修到能用”的版本（重点变化）：
 
-不掺业务字段/不掺 pipeline
+- `--duration` / `--warmup`：**单位是秒（整数）**，不能写 `10s`
+- 并发用 `--concurrency`（替代你之前记忆里的 `--inflight-total`）
+- payload 文件用 `--xgb-dense-file`（替代 `--payload-f32-file`）
+- pacer：
+  - `--pacer poisson|fixed`
+  - `--pacer-spin-threshold-us N`：最后 N 微秒 busy-spin（用来榨干 tick 抖动）
 
-2.4 crates/risk-bench
+### 6.2 经典压测命令（固定 pacer，逐步拉 RPS）
+> 下面这套就是你一直在跑的“黄金模板”，我把坑都填平了。
 
-压测工具（极关键）：
+```bash
+export RUSTFLAGS="-C target-cpu=native"
+cargo build -p risk-bench2 --release
 
-open-loop/Poisson pacer
+# 给 bench 4~6 个核（示例：12-15）；确保不和 server 绑到同一批核
+taskset -c 12-15 cargo run -p risk-bench2 --release --   --url http://127.0.0.1:8080/score_dense_f32_bin   --xgb-dense-file data/bench/ieee_20k.f32   --xgb-dense-dim 432   --content-type application/octet-stream   --rps 20000   --warmup 10   --duration 30   --threads 6   --concurrency 2048   --conns-per-thread 8   --timeout-ms 50   --pacer fixed   --pacer-jitter-us 0   --pacer-spin-threshold-us 0   --window-ms 200   --window-csv bench_ts_fixed_rps20000_t{t}.csv   --progress
+```
 
-JSONL body 池（避免重复同 body 导致分布失真）
+#### 6.2.1 推荐的 ramp 计划（找拐点）
+固定其他参数不动，只改 `--rps`：
+- 20k → 21k → 22k → 23k → 24k → 25k …
 
-并发控制（concurrency 为上限，避免无界 in-flight）
+你现在的数据很清楚：
+- 20k、21k、22k：基本 **PASS**
+- 23k 开始：出现 `timeout`，说明已触碰服务端尾延迟/容量极限
+- 25k+：`drop_conn_queue_full` + 大量 timeout，说明 client 连接队列也开始爆
 
-输出 stdout + CSV：
+---
 
-ok/err/dropped、p50/p95/p99、attempted_rps/ok_rps/drop_pct
+## 7. 输出怎么读（判断是不是“螺丝壳里做道场”）
 
-HTTP 状态分类：http_2xx/http_429/http_5xx/timeout
+bench2 输出里你最该盯的 5 个东西：
 
-stage_p99：parse/feature/router/xgb/l2/serialize
+1) **ok_rps vs attempted_rps**  
+- ok_rps 跟不上 attempted_rps：要么 server 顶不住，要么 client 自己卡住
 
-xgb_pool：deadline_miss_total、queue_wait_p99、compute_p99
+2) **429 / timeout / dropped 的结构**
+- `429`：服务端背压（通常是队列满/并发上限）
+- `timeout`：尾部严重拖长（也可能是 client 排队过久）
+- `drop_conn_queue_full`：client 的连接发送队列顶满（bench 自身开始爆）
 
-bench 生成器：bench_lag_p99 / missed_ticks_total
+3) **stage_p99(us)**
+- 你现在经常看到 xgb p99 在 800~2300us 的区间波动  
+  ——这基本就是“模型推理 + 池化调度”的真实成本
 
-3. 协议与接口（HTTP/JSON）
-请求体
+4) **pacer_lag_p99**
+- 你之前看到 ~1900us 的 lag，一般是“tick 调度与 runtime 抖动”
+- 开 `--pacer-spin-threshold-us` 的意义：把最后几十微秒变成自旋，减少 oversleep
 
-必须是 JSON object
+5) **quality_gate**
+- `PASS`：bench 自己没有明显掉链子（结果更可信）
+- `FAIL (bench-limited)`：先别优化 server，先把 bench 拉直
 
-若外层存在 "features": {...} 则取内部 object
+> 你现在已经把 `missed_ticks_total` 压到 0，说明 bench 的“发车节奏”稳定很多；  
+> 这就是从 benchV2 → benchV3 的质变点。
 
-否则整个 object 作为 features
+---
 
-响应体（ScoreResponse）
+## 8. 常见坑（你踩过的我都写死在这里）
 
-典型字段：
+- `error: unexpected argument '--host' found`  
+  ✅ server 用 `--listen 127.0.0.1:8080`
 
-{
-  "trace_id": "...",
-  "score": 0.0,
-  "decision": "allow|deny|manual_review|degrade_allow",
-  "reason": [],
-  "timings_us": {
-    "parse":0, "feature":0, "router":0, "xgb":0, "l2":0, "serialize":0
-  }
-}
+- `error: invalid value '10s' for '--warmup'`  
+  ✅ `--warmup 10`（单位秒，整数）
 
-4. 运行方式（服务端）
-4.1 基本准则（必须遵守）
+- `error: unexpected argument '--inflight-total' found`  
+  ✅ 用 `--concurrency 2048`
 
-CPU-bound 推理不允许无界 async 化
+- `error: unexpected argument '--payload-f32-file' found`  
+  ✅ 用 `--xgb-dense-file data/bench/ieee_20k.f32`
 
-必须：bounded queue + 429（或降级）
+---
 
-XGB worker 核 / Tokio runtime 核 / bench 核 必须分区不重叠
+## 9. 这次我们到底做了什么（进度对齐用）
 
-XGBoost 内部线程数固定：OMP_NUM_THREADS=1
+这一轮 chat 的核心成果可以总结成 5 条：
 
-WSL2 下 RSS 控制：MALLOC_ARENA_MAX=2
+1) **risk-server-tokio：支持 dense f32 二进制请求**（减少 JSON 噪声）
+2) **risk-server-tokio：增加 `RSK1` 二进制响应**（小回包 + 带 stage timing）
+3) **推理链路：做了零拷贝/少拷贝路径**（`align_to::<f32>()` + fallback decode）
+4) **背压体系更完整**：HTTP 层 `--max-in-flight` + pool queue cap + early reject → 429
+5) **risk-bench2（benchV3 方向）**：CLI 变好用、pacer 更稳、quality gate 更可信、窗口 CSV 可观测
 
-4.2 推荐启动命令（Tokio glue + L1/L2 pool）
-OMP_NUM_THREADS=1 \
-MALLOC_ARENA_MAX=2 \
-TOKIO_WORKER_THREADS=4 \
-TOKIO_MAX_BLOCKING_THREADS=4 \
-XGB_L1_POOL_THREADS=8 \
-XGB_L1_POOL_QUEUE_CAP=512 \
-XGB_L1_POOL_PIN_CPUS="2,4,6,8,10,12,14,16" \
-XGB_L2_POOL_THREADS=4 \
-XGB_L2_POOL_QUEUE_CAP=256 \
-XGB_L2_POOL_PIN_CPUS="19,21,23,25" \
-taskset -c 2-25 \
-cargo run -p risk-server-tokio --release -- \
-  --model-dir models/ieee_l1 \
-  --model-l2-dir models/ieee_l2
+---
 
+## 10. 下一步建议（别只在 4 核 bench 里“内卷”）
 
-注意：CLI 选项以 risk-server-tokio --help 为准（历史上出现过 --listen 不被识别的变更）。
+你说得非常对：如果 bench 只有 4 核，很多优化会进入“螺丝壳里做道场”。
 
-5. 压测方式（bench）
-5.1 基本压测（bench 绑核 26-31）
-taskset -c 26-31 \
-target/release/risk-bench \
-  --url http://127.0.0.1:8080/score_xgb_pool \
-  --metrics-url http://127.0.0.1:8080/metrics \
-  --rps 14000 --duration 20 \
-  --concurrency 256 \
-  --pacer-shards 512 --pacer-jitter-us 0 \
-  --xgb-body-file data/bench/ieee_20k.jsonl
+下一步更值钱的方向（按优先级）：
 
-5.2 knee sweep（手动扫 RPS）
+1) **两机压测**（bench 一台、server 一台）  
+   - 这样你测到的才是“网络栈 + 中断 + NIC + 调度”的真实形态  
+   - loopback 更像“在同一个屋里扔球”，两机才是“隔着马路扔球”
 
-例如从 14k 到 20k，每档 20s，记录 CSV
+2) **明确容量目标：以 timeout=0 的 ok_rps 找拐点**  
+   - 把 22k~24k 区间的曲线拉细：22.5k/23k/23.5k/…  
+   - 你现在已经看到了 23k 的边界迹象，这很宝贵
 
-关注：
+3) **做一套“固定配置的回归基线”**  
+   - 固定：模型、dim、concurrency、conns、timeout、pacer  
+   - 每次改动只比：p50/p99、xgb_p99、429、timeout
 
-ok_rps 与 attempted_rps 的差距（drop_pct）
+---
 
-http_429/5xx 是否出现
+## 11. 代码结构速览（便于快速定位）
 
-stage_p99 是否由 xgb_pool.queue_wait 主导
+- `crates/risk-server-tokio`：HTTP server（路由、并发限制、请求解析、回包）
+- `crates/risk-core`：pipeline（L1/L2 路由、XgbPool、背压/early reject、metrics）
+- `crates/risk-bench2`：压测器（pacer、连接池、并发、统计、CSV、quality gate）
 
-bench_lag 与 missed_ticks 是否失真（bench 自己跟不上会污染结论）
+---
 
-5.3 并发选择规则（避免 bench 误伤）
-
-concurrency 要足够大，粗略估计：
-required_concurrency ≈ rps * p95_latency
-
-如果 p95=60ms、rps=14k，则并发约需要 840；否则会出现大量 dropped（bench 的锅，不是 server）。
-
-6. Prometheus 指标（读指标定位瓶颈）
-server / pool 侧关键指标
-
-xgb_pool_queue_wait_us（summary）
-
-0.99/0.999 上升 ⇒ 排队尾爆
-
-xgb_pool_xgb_compute_us（summary）
-
-compute 稳定但整体 p99 爆 ⇒ 不是模型慢，是排队/调度/生成器抖动
-
-xgb_pool_deadline_miss_total（counter）
-
-deadline 策略触发次数
-
-级联相关：
-
-router_l2_trigger_total
-
-router_l2_skipped_budget_total
-
-stage_l2_us（summary）
-
-7. IEEE-CIS 训练（L1/L2）
-数据位置
-
-data/raw/ieee-cis/ 下包含 train_transaction/train_identity 等
-
-训练脚本（Polars Streaming）
-
-使用 Polars Lazy/Streaming 避免一次性爆内存
-
-输出：
-
-models/ieee_l1/（含 model + policy.json）
-
-models/ieee_l2/（含 model + 可选 policy）
-
-训练结果示例（全量）
-
-L1：valid AUC≈0.9089，AUPRC≈0.554；生成 review/deny 阈值
-
-L2：valid AUC≈0.9227，AUPRC≈0.596；提升不大但更强
-
-8. 已踩过的坑（防止新 Chat 重蹈覆辙）
-
-CPU-bound 被 async 化 → OOM/尾爆
-解决：XgbPool + bounded queue + 拒绝策略
-
-只 pin XGB 不够
-Tokio runtime 线程不 pin 会和 XGB 抢核导致随机尾爆
-解决：核分区（XGB/Tokio/bench）
-
-bench 用同一个 body 重复压测 → 级联测不出
-解决：JSONL body 池，随机轮转
-
-级联 L2 触发率过高会把系统拖死
-需要 L2 budget/deadline 控制，否则 stage_l2_us 会出现 10~50ms p99，吞吐断崖
-
-CLI 参数变更（--listen 不存在）
-任何运行命令先 --help 校验
-
-9. 当前项目状态（截止本次 commit/tag）
-
-单 L1（或 L1-only xgb_pool）已达到高吞吐低 p99 的稳定区间（knee 右移明显）
-
-bench 已支持 Poisson/open-loop、JSONL、HTTP 状态分类输出
-
-L1/L2 模型已训练完成并产出 policy 阈值
-
-L1/L2 级联已初步接入，但仍需：
-
-L2 触发预算
-
-bench 端可控触发率实验
-
-明确 5xx/429/降级策略（论文要写清楚“早拒绝 vs 晚成功”）
-
-10. 下一步计划（论文产出最大）
-必做（论文核心图）
-
-固定 RPS（如 14k），扫 L2 触发率（0%、1%、5%、10%、20%）
-
-输出曲线：ok_rps、p99、http_429/5xx、stage_l2_p99、queue_wait_p99
-
-写结论：级联触发率预算导致吞吐/尾延迟“相变”（断崖）
-
-可选（runtime 对比）
-
-等级联预算稳定后，再做 Tokio vs Glommio 对比（控制变量更干净）
-
-目标：证明 runtime 是否成为结构性瓶颈，以及 glommio shard 是否右移 knee / 降抖动1. 项目目标（论文核心目标）
-
-本项目实现一个面向高频信用卡交易欺诈检测的在线推理服务，强调 吞吐极限 + 可控 P99：
-
-吞吐目标：单机尽可能推高 RPS（最终目标可达 10k~20k+，视硬件）
-
-尾延迟目标：P99 在 SLO 范围内稳定（核心研究对象：排队/调度造成的尾爆）
-
-方法论：
-
-CPU-bound 推理必须隔离（线程/模型）
-
-必须显式背压（bounded queue / 429/降级）
-
-尾延迟必须可观测分解（queue_wait vs compute）
-
-压测必须用 open-loop/Poisson 才能测 knee（closed-loop 会掩盖拥塞）
-
-引入级联（L1/L2）后，研究触发率预算导致的“相变曲线”
-
-2. Repo 结构与职责（crates）
-2.1 crates/risk-server-tokio
-
-HTTP 服务（axum/hyper）
-
-暴露 endpoints：
-
-POST /score_xgb_pool：主压测口（走 XgbPool / 或 L1+L2 级联）
-
-GET /metrics：Prometheus 指标
-
-负责：
-
-JSON parse（支持 body 或 body.features）
-
-调用 risk-core 的 AppCore pipeline
-
-将错误映射为 HTTP（200/429/503）
-
-tower trace / metrics 暴露
-
-2.2 crates/risk-core
-
-核心 pipeline + 模型运行时封装：
-
-schema.rs：协议唯一真理
-
-ScoreRequest/ScoreResponse/Decision/ReasonItem/TimingsUs
-
-pipeline.rs：AppCore
-
-将输入 object（Map）跑完：parse → feature → router → xgb(L1) → (可选 L2) → serialize
-
-注意：很多函数是 sync（不要 .await），以免误以为 async
-
-xgb_pool.rs：推理隔离池
-
-N OS threads，每线程持有一份 Booster
-
-bounded queue（cap）
-
-warmup
-
-metrics：queue_wait_us、xgb_compute_us、deadline_miss_total、QueueFull 等
-
-xgb_runtime.rs：单 Booster 封装
-
-predict_proba_* 等；（性能优化点：dense buffer 复用、scalar 快路径、topk partial select）
-
-2.3 crates/xgb-ffi
-
-XGBoost C API 的薄封装
-
-只做 handle 管理、predict、错误处理
-
-不掺业务字段/不掺 pipeline
-
-2.4 crates/risk-bench
-
-压测工具（极关键）：
-
-open-loop/Poisson pacer
-
-JSONL body 池（避免重复同 body 导致分布失真）
-
-并发控制（concurrency 为上限，避免无界 in-flight）
-
-输出 stdout + CSV：
-
-ok/err/dropped、p50/p95/p99、attempted_rps/ok_rps/drop_pct
-
-HTTP 状态分类：http_2xx/http_429/http_5xx/timeout
-
-stage_p99：parse/feature/router/xgb/l2/serialize
-
-xgb_pool：deadline_miss_total、queue_wait_p99、compute_p99
-
-bench 生成器：bench_lag_p99 / missed_ticks_total
-
-3. 协议与接口（HTTP/JSON）
-请求体
-
-必须是 JSON object
-
-若外层存在 "features": {...} 则取内部 object
-
-否则整个 object 作为 features
-
-响应体（ScoreResponse）
-
-典型字段：
-
-{
-  "trace_id": "...",
-  "score": 0.0,
-  "decision": "allow|deny|manual_review|degrade_allow",
-  "reason": [],
-  "timings_us": {
-    "parse":0, "feature":0, "router":0, "xgb":0, "l2":0, "serialize":0
-  }
-}
-
-4. 运行方式（服务端）
-4.1 基本准则（必须遵守）
-
-CPU-bound 推理不允许无界 async 化
-
-必须：bounded queue + 429（或降级）
-
-XGB worker 核 / Tokio runtime 核 / bench 核 必须分区不重叠
-
-XGBoost 内部线程数固定：OMP_NUM_THREADS=1
-
-WSL2 下 RSS 控制：MALLOC_ARENA_MAX=2
-
-4.2 推荐启动命令（Tokio glue + L1/L2 pool）
-OMP_NUM_THREADS=1 \
-MALLOC_ARENA_MAX=2 \
-TOKIO_WORKER_THREADS=4 \
-TOKIO_MAX_BLOCKING_THREADS=4 \
-XGB_L1_POOL_THREADS=8 \
-XGB_L1_POOL_QUEUE_CAP=512 \
-XGB_L1_POOL_PIN_CPUS="2,4,6,8,10,12,14,16" \
-XGB_L2_POOL_THREADS=4 \
-XGB_L2_POOL_QUEUE_CAP=256 \
-XGB_L2_POOL_PIN_CPUS="19,21,23,25" \
-taskset -c 2-25 \
-cargo run -p risk-server-tokio --release -- \
-  --model-dir models/ieee_l1 \
-  --model-l2-dir models/ieee_l2
-
-
-注意：CLI 选项以 risk-server-tokio --help 为准（历史上出现过 --listen 不被识别的变更）。
-
-5. 压测方式（bench）
-5.1 基本压测（bench 绑核 26-31）
-taskset -c 26-31 \
-target/release/risk-bench \
-  --url http://127.0.0.1:8080/score_xgb_pool \
-  --metrics-url http://127.0.0.1:8080/metrics \
-  --rps 14000 --duration 20 \
-  --concurrency 256 \
-  --pacer-shards 512 --pacer-jitter-us 0 \
-  --xgb-body-file data/bench/ieee_20k.jsonl
-
-5.2 knee sweep（手动扫 RPS）
-
-例如从 14k 到 20k，每档 20s，记录 CSV
-
-关注：
-
-ok_rps 与 attempted_rps 的差距（drop_pct）
-
-http_429/5xx 是否出现
-
-stage_p99 是否由 xgb_pool.queue_wait 主导
-
-bench_lag 与 missed_ticks 是否失真（bench 自己跟不上会污染结论）
-
-5.3 并发选择规则（避免 bench 误伤）
-
-concurrency 要足够大，粗略估计：
-required_concurrency ≈ rps * p95_latency
-
-如果 p95=60ms、rps=14k，则并发约需要 840；否则会出现大量 dropped（bench 的锅，不是 server）。
-
-6. Prometheus 指标（读指标定位瓶颈）
-server / pool 侧关键指标
-
-xgb_pool_queue_wait_us（summary）
-
-0.99/0.999 上升 ⇒ 排队尾爆
-
-xgb_pool_xgb_compute_us（summary）
-
-compute 稳定但整体 p99 爆 ⇒ 不是模型慢，是排队/调度/生成器抖动
-
-xgb_pool_deadline_miss_total（counter）
-
-deadline 策略触发次数
-
-级联相关：
-
-router_l2_trigger_total
-
-router_l2_skipped_budget_total
-
-stage_l2_us（summary）
-
-7. IEEE-CIS 训练（L1/L2）
-数据位置
-
-data/raw/ieee-cis/ 下包含 train_transaction/train_identity 等
-
-训练脚本（Polars Streaming）
-
-使用 Polars Lazy/Streaming 避免一次性爆内存
-
-输出：
-
-models/ieee_l1/（含 model + policy.json）
-
-models/ieee_l2/（含 model + 可选 policy）
-
-训练结果示例（全量）
-
-L1：valid AUC≈0.9089，AUPRC≈0.554；生成 review/deny 阈值
-
-L2：valid AUC≈0.9227，AUPRC≈0.596；提升不大但更强
-
-8. 已踩过的坑（防止新 Chat 重蹈覆辙）
-
-CPU-bound 被 async 化 → OOM/尾爆
-解决：XgbPool + bounded queue + 拒绝策略
-
-只 pin XGB 不够
-Tokio runtime 线程不 pin 会和 XGB 抢核导致随机尾爆
-解决：核分区（XGB/Tokio/bench）
-
-bench 用同一个 body 重复压测 → 级联测不出
-解决：JSONL body 池，随机轮转
-
-级联 L2 触发率过高会把系统拖死
-需要 L2 budget/deadline 控制，否则 stage_l2_us 会出现 10~50ms p99，吞吐断崖
-
-CLI 参数变更（--listen 不存在）
-任何运行命令先 --help 校验
-
-9. 当前项目状态（截止本次 commit/tag）
-
-单 L1（或 L1-only xgb_pool）已达到高吞吐低 p99 的稳定区间（knee 右移明显）
-
-bench 已支持 Poisson/open-loop、JSONL、HTTP 状态分类输出
-
-L1/L2 模型已训练完成并产出 policy 阈值
-
-L1/L2 级联已初步接入，但仍需：
-
-L2 触发预算
-
-bench 端可控触发率实验
-
-明确 5xx/429/降级策略（论文要写清楚“早拒绝 vs 晚成功”）
-
-10. 下一步计划（论文产出最大）
-必做（论文核心图）
-
-固定 RPS（如 14k），扫 L2 触发率（0%、1%、5%、10%、20%）
-
-输出曲线：ok_rps、p99、http_429/5xx、stage_l2_p99、queue_wait_p99
-
-写结论：级联触发率预算导致吞吐/尾延迟“相变”（断崖）
-
-可选（runtime 对比）
-
-等级联预算稳定后，再做 Tokio vs Glommio 对比（控制变量更干净）
-
-目标：证明 runtime 是否成为结构性瓶颈，以及 glommio shard 是否右移 knee / 降抖动
+如果你要“最简单一口气跑起来”的版本：  
+先跑第 4 章 server 命令，再跑第 6 章 bench 命令，然后从 `--rps 20000` 开始往上加。

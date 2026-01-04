@@ -1,0 +1,17 @@
+[package]
+name = "risk-bench2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+bytes = "1"
+http = "1"
+hyper = { version = "1", features = ["http1", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+hdrhistogram = "7"
+futures-util = "0.3"
+rand = { version = "0.8", features = ["small_rng"] }
+tokio = { version = "1", features = ["rt", "time", "net", "sync", "macros"] }

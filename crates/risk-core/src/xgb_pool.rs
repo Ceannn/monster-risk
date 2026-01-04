@@ -9,9 +9,11 @@
 //! This file intentionally keeps the public API tiny and stable.
 
 use anyhow::Context;
+use bytes::Bytes;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -47,10 +49,20 @@ pub struct XgbOut {
     pub contrib_topk: Vec<(String, f32)>,
 }
 
+/// Input row representation.
+///
+/// - `OwnedDense`: legacy path (already materialized Vec<f32>)
+/// - `DenseBytesLe`: raw f32 little-endian bytes (len = ncols * 4)
+///   This avoids building a `Vec<f32>` on the server thread.
+enum XgbRow {
+    OwnedDense(Vec<f32>),
+    DenseBytesLe { bytes: Bytes, ncols: usize },
+}
+
 struct XgbJob {
     enq_at: Instant,
     deadline_at: Option<Instant>,
-    row: Vec<f32>,
+    row: XgbRow,
     contrib_topk: usize,
     resp_tx: oneshot::Sender<anyhow::Result<XgbOut>>,
 }
@@ -102,6 +114,13 @@ pub struct XgbPool {
     cap_total: usize,
     queued: Arc<AtomicUsize>,
     running: Arc<AtomicUsize>,
+
+    /// If non-zero: reject at admission when predicted queue wait exceeds this budget.
+    ///
+    /// This is the "real" backpressure knob that keeps client-visible P99 stable.
+    early_reject_pred_wait_us: u64,
+    /// EWMA of compute time (best-effort, microseconds).
+    compute_ema_us: Arc<AtomicU64>,
 }
 
 impl XgbPool {
@@ -157,6 +176,10 @@ impl XgbPool {
         let mut workers = Vec::with_capacity(n_workers);
         let pin_cpus = pin_cpus.unwrap_or_default();
 
+        // Initialize EMA with a conservative default to make admission control work immediately.
+        // (Typical dense 1-row compute is sub-millisecond.)
+        let compute_ema_us = Arc::new(AtomicU64::new(500));
+
         for wid in 0..n_workers {
             let (tx, mut rx) = mpsc::channel::<XgbJob>(per_worker_cap);
             let model_path = Arc::clone(&model_path);
@@ -165,6 +188,7 @@ impl XgbPool {
             let warmup_iters = warmup_iters;
             let queued = Arc::clone(&queued);
             let running = Arc::clone(&running);
+            let compute_ema_us = Arc::clone(&compute_ema_us);
 
             thread::Builder::new()
                 .name(format!("xgb-worker-{wid}"))
@@ -201,6 +225,7 @@ impl XgbPool {
                     }
 
                     // Main loop
+                    let mut scratch_f32: Vec<f32> = Vec::new();
                     while let Some(job) = rx.blocking_recv() {
                         // Best-effort counters (admission control / debug).
                         queued.fetch_sub(1, Ordering::Relaxed);
@@ -226,35 +251,87 @@ impl XgbPool {
                         }
 
                         let t0 = Instant::now();
-                        let score = match bst.predict_proba_dense_1row(&job.row) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
-                                continue;
+
+                        // Run inference with either owned row or raw bytes.
+                        let (score, contrib_topk) = match job.row {
+                            XgbRow::OwnedDense(row) => {
+                                let s = match bst.predict_proba_dense_1row(&row) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
+                                        continue;
+                                    }
+                                };
+
+                                let mut topk = Vec::new();
+                                if job.contrib_topk > 0 {
+                                    match bst.predict_contribs_dense_1row(&row) {
+                                        Ok(out) => {
+                                            let n = feature_names.len().min(out.values.len());
+                                            topk = topk_abs_named(
+                                                &out.values[..n],
+                                                &feature_names,
+                                                job.contrib_topk,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                (s, topk)
+                            }
+                            XgbRow::DenseBytesLe { bytes, ncols } => {
+                                let row = match bytes_as_f32le(&bytes, ncols, &mut scratch_f32) {
+                                    Ok(s) => s,
+                                    Err(msg) => {
+                                        let _ = job.resp_tx.send(Err(anyhow::anyhow!(msg)));
+                                        continue;
+                                    }
+                                };
+
+                                let s = match bst.predict_proba_dense_1row(row) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
+                                        continue;
+                                    }
+                                };
+
+                                let mut topk = Vec::new();
+                                if job.contrib_topk > 0 {
+                                    match bst.predict_contribs_dense_1row(row) {
+                                        Ok(out) => {
+                                            let n = feature_names.len().min(out.values.len());
+                                            topk = topk_abs_named(
+                                                &out.values[..n],
+                                                &feature_names,
+                                                job.contrib_topk,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                (s, topk)
                             }
                         };
 
-                        let mut contrib_topk = Vec::new();
-                        if job.contrib_topk > 0 {
-                            match bst.predict_contribs_dense_1row(&job.row) {
-                                Ok(out) => {
-                                    // Usually len = ncols + 1 (bias). We ignore bias for topk.
-                                    let n = feature_names.len().min(out.values.len());
-                                    contrib_topk = topk_abs_named(
-                                        &out.values[..n],
-                                        &feature_names,
-                                        job.contrib_topk,
-                                    );
-                                }
-                                Err(e) => {
-                                    let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
-                                    continue;
-                                }
-                            }
-                        }
-
                         let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                         metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
+
+                        // Best-effort compute EWMA update.
+                        // new = old*7/8 + xgb*1/8  (stable + cheap integer math)
+                        let old = compute_ema_us.load(Ordering::Relaxed);
+                        let new = if old == 0 {
+                            xgb_us.max(1)
+                        } else {
+                            (old.saturating_mul(7) + xgb_us) / 8
+                        };
+                        compute_ema_us.store(new.max(1), Ordering::Relaxed);
 
                         let _ = job.resp_tx.send(Ok(XgbOut {
                             score,
@@ -275,7 +352,18 @@ impl XgbPool {
             cap_total,
             queued,
             running,
+
+            early_reject_pred_wait_us: 0,
+            compute_ema_us,
         })
+    }
+
+    /// Enable admission-control style backpressure.
+    ///
+    /// When enabled, `try_submit*` will **fail fast** with `QueueFull` if the
+    /// predicted queue wait exceeds `pred_wait_budget_us`.
+    pub fn set_early_reject_pred_wait_us(&mut self, pred_wait_budget_us: u64) {
+        self.early_reject_pred_wait_us = pred_wait_budget_us;
     }
 
     /// Convenience: build a pool directly from a model directory (same format as `XgbRuntime::load_from_dir`).
@@ -320,11 +408,24 @@ impl XgbPool {
             return Err(XgbPoolError::WorkerDown);
         }
 
+        // Admission control: reject early to keep client-visible P99 stable.
+        if self.early_reject_pred_wait_us > 0 {
+            let inflight =
+                (self.queued.load(Ordering::Relaxed) + self.running.load(Ordering::Relaxed)) as u64;
+            let ema = self.compute_ema_us.load(Ordering::Relaxed).max(1);
+            let pred_wait_us = inflight.saturating_mul(ema) / (n as u64).max(1);
+            metrics::histogram!("xgb_pool_pred_wait_us").record(pred_wait_us as f64);
+            if pred_wait_us >= self.early_reject_pred_wait_us {
+                metrics::counter!("xgb_pool_admission_reject_total").increment(1);
+                return Err(XgbPoolError::QueueFull);
+            }
+        }
+
         let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
         let mut job = XgbJob {
             enq_at: Instant::now(),
             deadline_at: None,
-            row,
+            row: XgbRow::OwnedDense(row),
             contrib_topk,
             resp_tx,
         };
@@ -379,6 +480,19 @@ impl XgbPool {
             return Err(XgbPoolError::WorkerDown);
         }
 
+        // Admission control: reject early to keep client-visible P99 stable.
+        if self.early_reject_pred_wait_us > 0 {
+            let inflight =
+                (self.queued.load(Ordering::Relaxed) + self.running.load(Ordering::Relaxed)) as u64;
+            let ema = self.compute_ema_us.load(Ordering::Relaxed).max(1);
+            let pred_wait_us = inflight.saturating_mul(ema) / (n as u64).max(1);
+            metrics::histogram!("xgb_pool_pred_wait_us").record(pred_wait_us as f64);
+            if pred_wait_us >= self.early_reject_pred_wait_us {
+                metrics::counter!("xgb_pool_admission_reject_total").increment(1);
+                return Err(XgbPoolError::QueueFull);
+            }
+        }
+
         let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
 
         let enq_at = Instant::now();
@@ -387,7 +501,7 @@ impl XgbPool {
         let mut job = XgbJob {
             enq_at,
             deadline_at: Some(deadline_at),
-            row,
+            row: XgbRow::OwnedDense(row),
             contrib_topk,
             resp_tx,
         };
@@ -448,6 +562,128 @@ impl XgbPool {
             Err(_) => Err(XgbPoolError::Canceled),
         }
     }
+
+    /// Non-blocking submission for dense bytes payload (f32 little-endian).
+    pub fn try_submit_dense_bytes_le(
+        &self,
+        bytes: Bytes,
+        ncols: usize,
+        contrib_topk: usize,
+    ) -> Result<oneshot::Receiver<anyhow::Result<XgbOut>>, XgbPoolError> {
+        // Validate shape early to avoid silent corruption.
+        let need = ncols.checked_mul(4).ok_or(XgbPoolError::QueueFull)?;
+        if bytes.len() != need {
+            // Treat as bad request upstream; here we surface it as worker error.
+            // (Server/pipeline should have validated already.)
+            return Err(XgbPoolError::QueueFull);
+        }
+
+        let n = self.workers.len();
+        if n == 0 {
+            return Err(XgbPoolError::WorkerDown);
+        }
+
+        // Admission control: reject early to keep client-visible P99 stable.
+        if self.early_reject_pred_wait_us > 0 {
+            let inflight =
+                (self.queued.load(Ordering::Relaxed) + self.running.load(Ordering::Relaxed)) as u64;
+            let ema = self.compute_ema_us.load(Ordering::Relaxed).max(1);
+            let pred_wait_us = inflight.saturating_mul(ema) / (n as u64).max(1);
+            metrics::histogram!("xgb_pool_pred_wait_us").record(pred_wait_us as f64);
+            if pred_wait_us >= self.early_reject_pred_wait_us {
+                metrics::counter!("xgb_pool_admission_reject_total").increment(1);
+                return Err(XgbPoolError::QueueFull);
+            }
+        }
+
+        let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
+        let mut job = XgbJob {
+            enq_at: Instant::now(),
+            deadline_at: None,
+            row: XgbRow::DenseBytesLe { bytes, ncols },
+            contrib_topk,
+            resp_tx,
+        };
+
+        let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        let mut down = 0usize;
+
+        for i in 0..n {
+            let idx = (start + i) % n;
+            self.queued.fetch_add(1, Ordering::Relaxed);
+            match self.workers[idx].tx.try_send(job) {
+                Ok(()) => return Ok(resp_rx),
+                Err(mpsc::error::TrySendError::Full(j)) => {
+                    self.queued.fetch_sub(1, Ordering::Relaxed);
+                    job = j;
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(j)) => {
+                    self.queued.fetch_sub(1, Ordering::Relaxed);
+                    job = j;
+                    down += 1;
+                    continue;
+                }
+            }
+        }
+
+        if down == n {
+            Err(XgbPoolError::WorkerDown)
+        } else {
+            Err(XgbPoolError::QueueFull)
+        }
+    }
+
+    /// Convenience async wrapper.
+    pub async fn submit_dense_bytes_le(
+        &self,
+        bytes: Bytes,
+        ncols: usize,
+        contrib_topk: usize,
+    ) -> Result<anyhow::Result<XgbOut>, XgbPoolError> {
+        let rx = self.try_submit_dense_bytes_le(bytes, ncols, contrib_topk)?;
+        match rx.await {
+            Ok(v) => Ok(v),
+            Err(_) => Err(XgbPoolError::Canceled),
+        }
+    }
+}
+
+/// Convert raw f32 little-endian bytes into a `&[f32]` view when possible.
+/// Falls back to decoding into `scratch` when the byte slice is unaligned.
+fn bytes_as_f32le<'a>(
+    bytes: &'a Bytes,
+    ncols: usize,
+    scratch: &'a mut Vec<f32>,
+) -> Result<&'a [f32], String> {
+    let b = bytes.as_ref();
+    let need = ncols
+        .checked_mul(4)
+        .ok_or_else(|| "ncols too large".to_string())?;
+    if b.len() != need {
+        return Err(format!(
+            "dense bytes size mismatch: got {}, need {}",
+            b.len(),
+            need
+        ));
+    }
+
+    // Fast path: reinterpret when aligned (little-endian only).
+    if cfg!(target_endian = "little") {
+        // SAFETY: We only accept the aligned case (head/tail empty). All bit patterns are valid f32.
+        let (head, body, tail) = unsafe { b.align_to::<f32>() };
+        if head.is_empty() && tail.is_empty() && body.len() == ncols {
+            return Ok(body);
+        }
+    }
+
+    // Fallback: decode safely into scratch.
+    scratch.clear();
+    scratch.reserve(ncols);
+    for c in b.chunks_exact(4) {
+        scratch.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    Ok(scratch.as_slice())
 }
 
 #[derive(Copy, Clone, Debug)]

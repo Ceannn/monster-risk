@@ -4,6 +4,7 @@ members = [
   "crates/risk-core",
   "crates/risk-server-tokio",
   "crates/risk-bench",
+  "crates/risk-bench2",
   "crates/risk-server-glommio"
 
 ]

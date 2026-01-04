@@ -22,4 +22,5 @@ core_affinity = "0.8"
 # it builds cleanly even when the top-level binary is not Tokio-based (e.g. glommio).
 tokio = { version = "1", features = ["sync"] }
 libc = "0.2"
+bytes = "1"
 #xgb-ffi = { path = "../xgb-ffi" }
