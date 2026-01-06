@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-risk-core = { path = "../risk-core" }
+risk-core = { path = "../risk-core", default-features = false }
+
+bytes = "1"
 
 glommio = "0.9"
 futures-lite = "2"
@@ -20,3 +22,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 anyhow = "1"
+
+# Used to read the current process CPU affinity mask (Linux).
+libc = "0.2"
+
+[features]
+default = []
+
+# Convenience pass-through features so you can run:
+#   cargo build -p risk-server-glommio --no-default-features --features native_l1_tl2cgen,native_l2_tl2cgen
+xgb_ffi = ["risk-core/xgb_ffi"]
+native_l1_tl2cgen = ["risk-core/native_l1_tl2cgen"]
+native_l2_tl2cgen = ["risk-core/native_l2_tl2cgen"]

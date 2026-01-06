@@ -54,3 +54,20 @@ If you prefer手动起服务 + 手动改 env，这个脚本会按顺序跑 bench
 ```
 
 The sweep is designed around the idea: keep RPS fixed, change L2 trigger budget, and observe the phase transition (ok_rps/p99/429 + queue_wait).
+
+
+This patch implements XgbPool option (B): per-core sharded queues + lock-free work-stealing.
+
+Files:
+- crates/risk-core/src/xgb_pool.rs  (replaces the old tokio::mpsc-based implementation)
+- crates/risk-core/Cargo.toml      (adds crossbeam-deque + crossbeam-utils deps)
+
+How to apply:
+1) Copy the two files into your repo at the same paths (overwrite).
+2) `cargo build -p risk-server-glommio --release ...` as usual.
+
+Notes:
+- Public API of XgbPool stays the same.
+- Admission control still uses:
+  - XGB_L1_POOL_QUEUE_CAP  -> total queue capacity (rounded up by per-worker split)
+  - XGB_L1_POOL_EARLY_REJECT_US -> optional predicted-queue-wait budget

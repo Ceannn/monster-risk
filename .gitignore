@@ -35,3 +35,5 @@ results/
 target/
 *.patch
 *.patch*
+crates/risk-core/native/
+.cache/*

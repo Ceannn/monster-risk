@@ -1,17 +1,19 @@
-use anyhow::Context;
-use flate2::read::GzDecoder;
-use serde::Deserialize;
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
-use xgb_ffi::Booster;
-use xgb_ffi::PredictOutput;
-#[derive(Debug, Clone, Deserialize)]
+#[cfg(feature = "xgb_ffi")]
+use xgb_ffi::{Booster, DMatrix};
+
+#[cfg(feature = "native_l1_tl2cgen")]
+use crate::native_l1_tl2cgen;
+#[cfg(feature = "native_l2_tl2cgen")]
+use crate::native_l2_tl2cgen;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Policy {
     pub review_threshold: f32,
     pub deny_threshold: f32,
@@ -21,197 +23,168 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             review_threshold: 0.5,
-            deny_threshold: 0.9,
+            deny_threshold: 0.95,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+fn looks_like_l2_path(p: &Path) -> bool {
+    let s = p.to_string_lossy().to_ascii_lowercase();
+    // 兼容: .../ieee_l2... 或 .../l2_judge...
+    s.contains("l2")
+}
+
+fn select_model_file(dir: &Path) -> Option<PathBuf> {
+    let p0 = dir.join("xgb_model.json");
+    if p0.exists() {
+        return Some(p0);
+    }
+
+    // 兼容: xgb_model_iter1800.json / xgb_model_iter1801.json ...
+    let mut cands: Vec<(u32, PathBuf)> = vec![];
+    if let Ok(rd) = fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if let Some(rest) = name.strip_prefix("xgb_model_iter") {
+                if let Some(rest) = rest.strip_suffix(".json") {
+                    if let Ok(it) = rest.parse::<u32>() {
+                        cands.push((it, path));
+                    }
+                }
+            }
+        }
+    }
+    cands.sort_by_key(|(it, _)| *it);
+    cands.first().map(|(_, p)| p.clone())
+}
+
+fn load_feature_names(dir: &Path) -> Result<Vec<String>> {
+    let json_path = dir.join("feature_names.json");
+    if json_path.exists() {
+        let s = fs::read_to_string(&json_path)
+            .with_context(|| format!("read feature_names.json: {}", json_path.display()))?;
+        let names: Vec<String> = serde_json::from_str(&s)
+            .with_context(|| format!("parse feature_names.json: {}", json_path.display()))?;
+        return Ok(names);
+    }
+
+    let txt_path = dir.join("features.txt");
+    if txt_path.exists() {
+        let s = fs::read_to_string(&txt_path)
+            .with_context(|| format!("read features.txt: {}", txt_path.display()))?;
+        let mut out: Vec<String> = vec![];
+        for line in s.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            out.push(t.to_string());
+        }
+        return Ok(out);
+    }
+
+    Err(anyhow!(
+        "missing feature schema in model_dir={}, expected feature_names.json or features.txt",
+        dir.display()
+    ))
+}
+
+fn load_cat_maps(dir: &Path) -> Result<HashMap<String, HashMap<String, u32>>> {
+    // 兼容: cat_maps.json.gz (我们训练脚本会写)
+    let gz = dir.join("cat_maps.json.gz");
+    if gz.exists() {
+        let f = fs::File::open(&gz)
+            .with_context(|| format!("open cat_maps.json.gz: {}", gz.display()))?;
+        let dec = flate2::read::GzDecoder::new(f);
+        let maps: HashMap<String, HashMap<String, u32>> = serde_json::from_reader(dec)
+            .with_context(|| format!("parse cat_maps.json.gz: {}", gz.display()))?;
+        return Ok(maps);
+    }
+
+    // 允许没有 cat_maps（纯数值 / 已经提前做 one-hot / hash 等）
+    Ok(HashMap::new())
+}
+
+fn load_policy(dir: &Path) -> Result<Policy> {
+    let p = dir.join("policy.json");
+    if !p.exists() {
+        return Ok(Policy::default());
+    }
+    let s = fs::read_to_string(&p).with_context(|| format!("read policy.json: {}", p.display()))?;
+    let v: Policy =
+        serde_json::from_str(&s).with_context(|| format!("parse policy.json: {}", p.display()))?;
+    Ok(v)
+}
+
+#[derive(Debug)]
 pub struct XgbRuntime {
+    pub model_dir: PathBuf,
     pub model_path: PathBuf,
     pub feature_names: Vec<String>,
-    pub cat_maps: HashMap<String, HashMap<String, f32>>,
+    pub cat_maps: HashMap<String, HashMap<String, u32>>,
     pub policy: Policy,
+    is_l2: bool,
+
+    #[cfg(feature = "xgb_ffi")]
+    booster: Booster,
 }
 
 impl XgbRuntime {
-    pub fn load_from_dir(dir: &Path) -> anyhow::Result<Self> {
-        // 约定：
-        // - feature_names.json: ["f1","f2",...]
-        // - cat_maps.json.gz:  {"col":{"A":1.0,"B":2.0}, ...}
-        // - policy.json (可选): {"review_threshold":0.5,"deny_threshold":0.9}
-        // - model: ieee_xgb.ubj / xgb_model.json / ieee_xgb.bin
-        let feature_names_path = dir.join("feature_names.json");
-        let cat_maps_gz_path = dir.join("cat_maps.json.gz");
-        let policy_path = dir.join("policy.json");
+    pub fn load_from_dir(dir: &Path) -> Result<Self> {
+        let model_dir = dir.to_path_buf();
+        let is_l2 = looks_like_l2_path(dir);
 
-        let model_path_candidates = [
-            // ✅ 最高优先：UBJSON（跨版本更稳）
-            dir.join("ieee_xgb.ubj"),
-            // 次优先：JSON
-            dir.join("xgb_model.json"),
-            // 兜底：老二进制
-            dir.join("ieee_xgb.bin"),
-        ];
+        let feature_names = load_feature_names(dir)?;
+        let cat_maps = load_cat_maps(dir)?;
+        let policy = load_policy(dir)?;
 
-        let feature_names = {
-            let s = fs::read_to_string(&feature_names_path)
-                .with_context(|| format!("read {}", feature_names_path.display()))?;
-            serde_json::from_str::<Vec<String>>(&s)
-                .with_context(|| format!("parse {}", feature_names_path.display()))?
-        };
+        // xgb_model.json 在 TL2CGEN 静态推理模式下不一定“必须”，但保留路径用于日志/兼容。
+        let model_path = select_model_file(dir).unwrap_or_else(|| dir.join("xgb_model.json"));
 
-        let cat_maps = if cat_maps_gz_path.exists() {
-            read_gz_json_map(&cat_maps_gz_path)
-                .with_context(|| format!("read {}", cat_maps_gz_path.display()))?
-        } else {
-            HashMap::new()
-        };
-
-        let policy = if policy_path.exists() {
-            let s = fs::read_to_string(&policy_path)
-                .with_context(|| format!("read {}", policy_path.display()))?;
-            serde_json::from_str::<Policy>(&s)
-                .with_context(|| format!("parse {}", policy_path.display()))?
-        } else {
-            Policy::default()
-        };
-
-        let model_path = model_path_candidates
-            .into_iter()
-            .find(|p| p.exists())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "cannot find model file: expected ieee_xgb.ubj / xgb_model.json / ieee_xgb.bin under {}",
-                    dir.display()
-                )
-            })?;
-
-        Ok(Self {
-            model_path,
-            feature_names,
-            cat_maps,
-            policy,
-        })
-    }
-
-    /// 把输入 JSON object（列名->值）按 feature_names 顺序拼成 dense row（缺失=NaN，字符串=cat_maps 编码）
-    pub fn build_row(&self, obj: &Map<String, Value>) -> Vec<f32> {
-        let mut row = Vec::with_capacity(self.feature_names.len());
-
-        for name in &self.feature_names {
-            let v = obj.get(name);
-            let x = match v {
-                None | Some(Value::Null) => f32::NAN,
-                Some(Value::Bool(b)) => {
-                    if *b {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
-                Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN) as f32,
-                Some(Value::String(s)) => {
-                    // 未知类别 → 0（也可以改成 NaN；0 更稳，线上不容易炸）
-                    self.cat_maps
-                        .get(name)
-                        .and_then(|m| m.get(s))
-                        .copied()
-                        .unwrap_or(0.0)
-                }
-                _ => f32::NAN,
-            };
-            row.push(x);
-        }
-
-        row
-    }
-
-    /// Thread-local Booster：避免 Booster !Send/!Sync + 避免锁
-    fn with_booster<F, R>(&self, f: F) -> anyhow::Result<R>
-    where
-        F: FnOnce(&Booster) -> anyhow::Result<R>,
-    {
-        thread_local! {
-            static TL: std::cell::RefCell<Option<(PathBuf, Booster)>> = std::cell::RefCell::new(None);
-        }
-
-        TL.with(|cell| -> anyhow::Result<R> {
-            let mut guard = cell.borrow_mut();
-
-            let need_reload = match guard.as_ref() {
-                None => true,
-                Some((path, _)) => path != &self.model_path,
-            };
-
-            if need_reload {
-                let booster = Booster::load_model(&self.model_path)
-                    .map_err(|e: String| anyhow::anyhow!(e))
-                    .with_context(|| format!("load_model {}", self.model_path.display()))?;
-                *guard = Some((self.model_path.clone(), booster));
+        #[cfg(feature = "xgb_ffi")]
+        {
+            if !model_path.exists() {
+                return Err(anyhow!(
+                    "xgb_ffi enabled but model file missing: {}",
+                    model_path.display()
+                ));
             }
-
-            let (_, booster) = guard.as_ref().unwrap();
-            f(booster)
-        })
-    }
-
-    /// 预测概率（1 行）
-    pub fn predict_proba(&self, row: &[f32]) -> anyhow::Result<f32> {
-        self.with_booster(|bst| {
-            let p = bst
-                .predict_proba_dense_1row(row)
-                .map_err(|e: String| anyhow::anyhow!(e))
-                .context("predict_proba_dense_1row")?;
-            Ok(p)
-        })
-    }
-
-    /// contrib（返回：features contrib + bias）
-    /// - 一般 contrib 长度 = n_features + 1（最后一项 bias）
-    pub fn contrib_row_with_bias(&self, row: &[f32]) -> anyhow::Result<Vec<f32>> {
-        self.with_booster(|bst| {
-            let out = bst
-                .predict_contribs_dense_1row(row)
-                .map_err(|e: String| anyhow::anyhow!(e))
-                .context("predict_contribs_dense_1row")?;
-
-            let contrib_row: Vec<f32> = match out.shape.as_slice() {
-                [1, _groups, m] => slice_contrib(&out, *m)?,
-                [1, m] => slice_contrib(&out, *m)?,
-                _ => anyhow::bail!("unexpected contrib shape: {:?}", out.shape),
-            };
-
-            Ok(contrib_row)
-        })
-    }
-
-    /// 解释：取 TopK 贡献（绝对值排序），返回 (feature_name, contribution)
-    /// 注意：默认忽略最后的 bias（如果你想要 bias，我也可以给你单独返回）
-    pub fn topk_contrib(&self, row: &[f32], k: usize) -> anyhow::Result<Vec<(String, f32)>> {
-        let n = self.feature_names.len();
-        if row.len() != n {
-            anyhow::bail!("feature size mismatch: got {}, expected {}", row.len(), n);
+            let booster = Booster::from_file(&model_path)
+                .with_context(|| format!("load xgboost model: {}", model_path.display()))?;
+            Ok(Self {
+                model_dir,
+                model_path,
+                feature_names,
+                cat_maps,
+                policy,
+                is_l2,
+                booster,
+            })
         }
 
-        let contrib = self.contrib_row_with_bias(row)?;
-        if contrib.len() < n {
-            anyhow::bail!(
-                "contrib too short: got {}, expected >= {}",
-                contrib.len(),
-                n
-            );
+        #[cfg(not(feature = "xgb_ffi"))]
+        {
+            Ok(Self {
+                model_dir,
+                model_path,
+                feature_names,
+                cat_maps,
+                policy,
+                is_l2,
+            })
         }
-
-        //  topk 选择：O(n log k)，避免全量 sort
-        let idx_vals = topk_abs_idx_vals(&contrib[..n], k);
-
-        Ok(idx_vals
-            .into_iter()
-            .map(|(i, c)| (self.feature_names[i].clone(), c))
-            .collect())
     }
 
+    #[inline]
+    pub fn is_l2(&self) -> bool {
+        self.is_l2
+    }
+
+    #[inline]
     pub fn decide(&self, score: f32) -> &'static str {
         if score >= self.policy.deny_threshold {
             "deny"
@@ -221,92 +194,169 @@ impl XgbRuntime {
             "allow"
         }
     }
-}
-#[inline]
-fn slice_contrib(out: &PredictOutput, m: u64) -> anyhow::Result<Vec<f32>> {
-    let m_usize: usize = m
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("contrib shape dim overflow: {}", m))?;
 
-    if m_usize > out.values.len() {
-        anyhow::bail!(
-            "contrib shape {:?} implies m={}, but values.len()={}",
-            out.shape,
-            m_usize,
-            out.values.len()
-        );
+    /// 从 JSON object（宽表字段）构造模型输入 row（dense f32）
+    ///
+    /// - 数值：直接转 f32
+    /// - 字符串：查 cat_maps 映射到整数 id，再 cast 为 f32（与训练一致）
+    /// - 缺失：NaN（TL2CGEN / XGBoost 都用 NaN 表示 missing）
+    pub fn build_row(&self, obj: &Map<String, Value>) -> Vec<f32> {
+        self.feature_names
+            .iter()
+            .map(|k| match obj.get(k) {
+                None => f32::NAN,
+                Some(Value::Null) => f32::NAN,
+                Some(Value::Bool(b)) => {
+                    if *b {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN) as f32,
+                Some(Value::String(s)) => {
+                    // 注意：未知类别 -> 0（训练时也会把未知映射到 0 或者 special bucket）
+                    let map = self.cat_maps.get(k);
+                    let id = map.and_then(|m| m.get(s).copied()).unwrap_or(0);
+                    id as f32
+                }
+                Some(v) => {
+                    // 兜底：数组/对象等不支持
+                    let _ = v;
+                    f32::NAN
+                }
+            })
+            .collect()
     }
 
-    Ok(out.values[..m_usize].to_vec())
-}
-
-#[derive(Copy, Clone, Debug)]
-struct TopkItem {
-    abs: f32,
-    idx: usize,
-    val: f32,
-}
-impl PartialEq for TopkItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.abs.to_bits() == other.abs.to_bits() && self.idx == other.idx
-    }
-}
-impl Eq for TopkItem {}
-impl PartialOrd for TopkItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for TopkItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.abs
-            .total_cmp(&other.abs)
-            .then_with(|| self.idx.cmp(&other.idx))
-    }
-}
-
-/// Return top-k indices/values by absolute value, in descending abs order.
-fn topk_abs_idx_vals(values: &[f32], k: usize) -> Vec<(usize, f32)> {
-    if k == 0 || values.is_empty() {
-        return Vec::new();
-    }
-
-    let k = k.min(values.len());
-    let mut heap: BinaryHeap<Reverse<TopkItem>> = BinaryHeap::with_capacity(k + 1);
-
-    for (idx, &val) in values.iter().enumerate() {
-        let item = TopkItem {
-            abs: val.abs(),
-            idx,
-            val,
-        };
-
-        if heap.len() < k {
-            heap.push(Reverse(item));
-            continue;
-        }
-
-        if let Some(Reverse(min_item)) = heap.peek() {
-            if item.abs > min_item.abs {
-                let _ = heap.pop();
-                heap.push(Reverse(item));
+    /// 预测概率（单行 dense）
+    pub fn predict_proba(&self, row: &[f32]) -> Result<f32> {
+        // TL2CGEN 静态推理优先（如果编译了）
+        #[cfg(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))]
+        {
+            if self.is_l2 {
+                #[cfg(feature = "native_l2_tl2cgen")]
+                {
+                    return native_l2_tl2cgen::predict_proba_dense_1row(row);
+                }
+                #[cfg(not(feature = "native_l2_tl2cgen"))]
+                {
+                    return Err(anyhow!(
+                        "L2 model_dir={} but feature native_l2_tl2cgen is not enabled",
+                        self.model_dir.display()
+                    ));
+                }
+            } else {
+                #[cfg(feature = "native_l1_tl2cgen")]
+                {
+                    return native_l1_tl2cgen::predict_proba_dense_1row(row);
+                }
+                #[cfg(not(feature = "native_l1_tl2cgen"))]
+                {
+                    // no L1 native
+                }
             }
         }
+
+        #[cfg(feature = "xgb_ffi")]
+        {
+            let dm = DMatrix::from_dense(row, 1, row.len(), f32::NAN)?;
+            let pred = self.booster.predict(&dm, false)?;
+            pred.get(0)
+                .copied()
+                .ok_or_else(|| anyhow!("xgb_ffi predict returned empty"))
+        }
+
+        #[cfg(not(feature = "xgb_ffi"))]
+        {
+            Err(anyhow!(
+                "no predictor backend enabled: build with native_*_tl2cgen and/or xgb_ffi"
+            ))
+        }
     }
 
-    let mut out: Vec<(usize, f32)> = heap
-        .into_iter()
-        .map(|Reverse(it)| (it.idx, it.val))
-        .collect();
-    out.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
-    out
-}
+    /// 预测概率：输入为小端 f32 的 bytes（常见于 /score_dense_f32_bin 这种二进制接口）
+    pub fn predict_proba_dense_bytes_le(&self, bytes: &[u8], ncols: usize) -> Result<f32> {
+        #[cfg(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))]
+        {
+            if self.is_l2 {
+                #[cfg(feature = "native_l2_tl2cgen")]
+                {
+                    return native_l2_tl2cgen::predict_proba_dense_bytes_le(bytes, ncols);
+                }
+                #[cfg(not(feature = "native_l2_tl2cgen"))]
+                {
+                    return Err(anyhow!(
+                        "L2 model_dir={} but feature native_l2_tl2cgen is not enabled",
+                        self.model_dir.display()
+                    ));
+                }
+            } else {
+                #[cfg(feature = "native_l1_tl2cgen")]
+                {
+                    return native_l1_tl2cgen::predict_proba_dense_bytes_le(bytes, ncols);
+                }
+                #[cfg(not(feature = "native_l1_tl2cgen"))]
+                {
+                    // no L1 native
+                }
+            }
+        }
 
-fn read_gz_json_map(path: &Path) -> anyhow::Result<HashMap<String, HashMap<String, f32>>> {
-    let mut f = fs::File::open(path)?;
-    let mut gz = GzDecoder::new(&mut f);
-    let mut buf = Vec::new();
-    gz.read_to_end(&mut buf)?;
-    let m = serde_json::from_slice::<HashMap<String, HashMap<String, f32>>>(&buf)?;
-    Ok(m)
+        // fallback：解码 bytes -> row -> predict
+        if bytes.len() != ncols * 4 {
+            return Err(anyhow!(
+                "dense bytes len mismatch: got={} expect={}",
+                bytes.len(),
+                ncols * 4
+            ));
+        }
+        let mut row = vec![0f32; ncols];
+        for i in 0..ncols {
+            let b = &bytes[i * 4..i * 4 + 4];
+            row[i] = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        }
+        self.predict_proba(&row)
+    }
+
+    /// top-k feature contribution（仅 xgb_ffi 支持；TL2CGEN 纯推理不提供解释接口）
+    pub fn topk_contrib(&self, row: &[f32], topk: usize) -> Result<Vec<(String, f32)>> {
+        #[cfg(feature = "xgb_ffi")]
+        {
+            let mut row2 = Vec::with_capacity(row.len() + 1);
+            row2.extend_from_slice(row);
+            row2.push(1.0); // bias
+
+            let dm = DMatrix::from_dense(&row2, 1, row2.len(), f32::NAN)?;
+            let contrib = self.booster.predict_contrib(&dm, false)?;
+
+            // contrib 形状: [n_features + 1]，最后是 bias
+            let mut pairs: Vec<(usize, f32)> = contrib
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| (i, c))
+                .collect();
+            pairs.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+
+            let names = self.contrib_names();
+            let mut out = Vec::with_capacity(topk.min(pairs.len()));
+            for (i, c) in pairs.into_iter().take(topk) {
+                let name = names.get(i).cloned().unwrap_or_else(|| format!("f{i}"));
+                out.push((name, c));
+            }
+            Ok(out)
+        }
+
+        #[cfg(not(feature = "xgb_ffi"))]
+        {
+            let _ = (row, topk);
+            Ok(vec![])
+        }
+    }
+
+    pub fn contrib_names(&self) -> Vec<String> {
+        let mut names = self.feature_names.clone();
+        names.push("bias".to_string());
+        names
+    }
 }

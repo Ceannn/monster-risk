@@ -3,13 +3,20 @@
 //! Why this exists:
 //! - XGBoost C-API is blocking and can be CPU heavy; running it on Tokio workers
 //!   causes head-of-line blocking and latency spikes.
-//! - We instead create N dedicated OS threads, each owning its own Booster.
-//! - Submission is non-blocking (`try_submit`); when all queues are full we fail fast.
+//! - We instead create N dedicated OS threads, each owning its own Booster (or native predictor).
+//! - Submission is non-blocking (`try_submit*`); when the pool is saturated we fail fast.
 //!
 //! This file intentionally keeps the public API tiny and stable.
+//!
+//! Monster optimization (Work-stealing + per-core sharding):
+//! - Instead of N bounded MPSC queues (Tokio mpsc), we shard submissions by *current CPU*
+//!   into multiple lock-free injectors (crossbeam_deque::Injector).
+//! - Each worker has a local deque (Worker) and pulls work by stealing batches from injectors,
+//!   which reduces cross-core contention in the hot path.
 
 use anyhow::Context;
 use bytes::Bytes;
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::path::Path;
@@ -18,8 +25,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+
+use crossbeam_deque::{Injector, Steal, Worker as DequeWorker};
+use crossbeam_utils::Backoff;
+
+#[cfg(all(not(feature = "xgb_ffi"), not(feature = "native_l1_tl2cgen")))]
+compile_error!("risk-core: enable feature `xgb_ffi` or `native_l1_tl2cgen` to build xgb_pool");
+
+use tokio::sync::oneshot;
+
+#[cfg(feature = "xgb_ffi")]
 use xgb_ffi::Booster;
+#[cfg(feature = "native_l1_tl2cgen")]
+use crate::native_l1_tl2cgen;
 
 #[derive(Debug)]
 pub enum XgbPoolError {
@@ -67,16 +85,12 @@ struct XgbJob {
     resp_tx: oneshot::Sender<anyhow::Result<XgbOut>>,
 }
 
-struct WorkerHandle {
-    tx: mpsc::Sender<XgbJob>,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct XgbPoolStats {
     pub n_workers: usize,
     /// Total queue capacity across all workers (rounded up by per-worker split).
     pub cap_total: usize,
-    /// Jobs currently waiting in worker queues (does not include running jobs).
+    /// Jobs currently waiting in pool queues (best-effort; does not include running jobs).
     pub queued: usize,
     /// Jobs currently executing inside workers.
     pub running: usize,
@@ -100,20 +114,35 @@ impl XgbPoolStats {
 
 /// Decrements `running` when dropped.
 struct RunningGuard(Arc<AtomicUsize>);
-
 impl Drop for RunningGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
+thread_local! {
+    // Per-thread RR to spread bursts across shards without a global atomic.
+    static TLS_RR: Cell<usize> = const { Cell::new(0) };
+    // Cache current CPU id for threads that are pinned (Glommio executors, pinned workers).
+    // Avoids a `sched_getcpu()` syscall on every submission.
+    static TLS_CPU_ID: Cell<i32> = const { Cell::new(-1) };
+}
+
+/// Work-stealing XGB pool.
 pub struct XgbPool {
-    workers: Vec<WorkerHandle>,
-    rr: AtomicUsize,
+    n_workers: usize,
+
+    // Sharded injectors keyed by current CPU (best-effort).
+    shards: Arc<Vec<Arc<Injector<XgbJob>>>>,
+    // cpu_id -> shard_id mapping for fast lookup (i16: -1 means unknown)
+    io_cpu_to_shard: Arc<Vec<i16>>,
 
     cap_total: usize,
     queued: Arc<AtomicUsize>,
     running: Arc<AtomicUsize>,
+
+    // Best-effort liveness tracking: if all workers died, fail fast.
+    live_workers: Arc<AtomicUsize>,
 
     /// If non-zero: reject at admission when predicted queue wait exceeds this budget.
     ///
@@ -129,8 +158,9 @@ impl XgbPool {
     /// - `model_path`: path to the model file (e.g. ieee_xgb.ubj / xgb_model.json / ieee_xgb.bin)
     /// - `feature_names`: feature order used by the model (for contrib top-k naming)
     /// - `n_workers`: number of dedicated XGB threads
-    /// - `queue_cap_total`: total queue capacity across all workers (will be evenly split)
+    /// - `queue_cap_total`: total queue capacity across all workers (will be evenly split for legacy semantics)
     /// - `warmup_iters`: per-worker warmup iterations to eliminate cold-start spikes
+    #[cfg(feature = "xgb_ffi")]
     pub fn new(
         model_path: impl AsRef<Path>,
         feature_names: Arc<Vec<String>>,
@@ -151,6 +181,7 @@ impl XgbPool {
     /// Same as [`XgbPool::new`], but pins each worker thread to a specific CPU id (linux only).
     ///
     /// `pin_cpus`: optional CPU ids to pin each worker to (extra ids ignored).
+    #[cfg(any(feature = "xgb_ffi", feature = "native_l1_tl2cgen"))]
     pub fn new_with_pinning(
         model_path: impl AsRef<Path>,
         feature_names: Arc<Vec<String>>,
@@ -162,26 +193,34 @@ impl XgbPool {
         anyhow::ensure!(n_workers > 0, "xgb pool n_workers must be > 0");
         anyhow::ensure!(queue_cap_total > 0, "xgb pool queue_cap_total must be > 0");
 
-        // Split total cap across workers to keep admission-control semantics intuitive.
-        // Example: n_workers=8, queue_cap_total=512 => per_worker_cap=64.
+        // Keep legacy semantics: queue_cap_total is "total capacity", but the old implementation
+        // rounded it up by per-worker split. Preserve that so tests/knobs stay intuitive.
         let per_worker_cap = (queue_cap_total + n_workers - 1) / n_workers;
         let cap_total = per_worker_cap * n_workers;
 
         let model_path = Arc::new(model_path.as_ref().to_path_buf());
 
-        // Track queue/running counts for admission control & debugging (best-effort).
+        // Counters for admission control (best-effort).
         let queued = Arc::new(AtomicUsize::new(0));
         let running = Arc::new(AtomicUsize::new(0));
 
-        let mut workers = Vec::with_capacity(n_workers);
-        let pin_cpus = pin_cpus.unwrap_or_default();
-
-        // Initialize EMA with a conservative default to make admission control work immediately.
-        // (Typical dense 1-row compute is sub-millisecond.)
+        // Initialize EMA with a conservative default (microseconds).
         let compute_ema_us = Arc::new(AtomicU64::new(500));
 
+        let pin_cpus = pin_cpus.unwrap_or_default();
+
+        // Determine I/O CPUs (where requests are produced) vs worker CPUs.
+        // If we can infer an affinity mask, shard by the CPUs that are NOT used by XGB workers.
+        // If we can't, fall back to 1 shard.
+        let io_cpus = infer_io_cpus(&pin_cpus);
+        let (shards, io_cpu_to_shard) = build_shards(&io_cpus);
+
+        let shards = Arc::new(shards);
+        let io_cpu_to_shard = Arc::new(io_cpu_to_shard);
+
+        let live_workers = Arc::new(AtomicUsize::new(n_workers));
+
         for wid in 0..n_workers {
-            let (tx, mut rx) = mpsc::channel::<XgbJob>(per_worker_cap);
             let model_path = Arc::clone(&model_path);
             let feature_names = Arc::clone(&feature_names);
             let cpu = pin_cpus.get(wid).copied();
@@ -189,10 +228,22 @@ impl XgbPool {
             let queued = Arc::clone(&queued);
             let running = Arc::clone(&running);
             let compute_ema_us = Arc::clone(&compute_ema_us);
+            let shards = Arc::clone(&shards);
+            let io_cpu_to_shard = Arc::clone(&io_cpu_to_shard);
+            let live_workers2 = Arc::clone(&live_workers);
 
             thread::Builder::new()
                 .name(format!("xgb-worker-{wid}"))
                 .spawn(move || {
+                    // Ensure live counter is decremented even on panic / early return.
+                    struct LiveGuard(Arc<AtomicUsize>);
+                    impl Drop for LiveGuard {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                    let _lg = LiveGuard(live_workers2);
+
                     if let Some(cpu) = cpu {
                         #[cfg(target_os = "linux")]
                         {
@@ -204,155 +255,290 @@ impl XgbPool {
                         }
                     }
 
-                    let bst = match Booster::load_model(model_path.as_ref()) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            eprintln!("xgb-worker-{wid}: failed to load model: {e}");
-                            return;
+                    let n_shards = shards.len().max(1);
+                    let home_shard = {
+                        // Best-effort: if we know the current CPU, map to a nearby IO shard
+                        // so the worker tends to pull from the shard "closest" to its CPU.
+                        // Otherwise just distribute by wid.
+                        let cur = current_cpu_id();
+                        if let Some(cur) = cur {
+                            // Pick nearest IO CPU, then map to shard.
+                            // If mapping fails, fall back to wid-based.
+                            nearest_shard(cur, &io_cpu_to_shard, n_shards).unwrap_or(wid % n_shards)
+                        } else {
+                            wid % n_shards
                         }
                     };
 
-                    // Warmup: initialize thread-local buffers & JIT-ish internals.
-                    if warmup_iters > 0 {
-                        let ncols = feature_names.len();
-                        let row = vec![f32::NAN; ncols];
-                        for _ in 0..warmup_iters {
-                            let _ = bst.predict_proba_dense_1row(&row);
+                    // Local deque as a cache to reduce contention (batch steal from injectors).
+                    let local = DequeWorker::new_fifo();
+                    let mut rr = wid;
+
+                    #[cfg(feature = "native_l1_tl2cgen")]
+                    {
+                        let ncols = native_l1_tl2cgen::num_feature();
+                        if feature_names.len() != ncols {
+                            eprintln!(
+                                "xgb-worker-{wid}: tl2cgen num_feature mismatch: feature_names.len()={} num_feature={}",
+                                feature_names.len(),
+                                ncols
+                            );
                         }
-                        // Best-effort warmup for contrib path (usually colder).
-                        let _ = bst.predict_contribs_dense_1row(&row);
-                        eprintln!("xgb-worker-{wid}: warmup done iters={warmup_iters}");
+
+                        if warmup_iters > 0 {
+                            let row = vec![f32::NAN; ncols];
+                            for _ in 0..warmup_iters {
+                                let _ = native_l1_tl2cgen::predict_proba_dense_1row(&row);
+                            }
+                            eprintln!("xgb-worker-{wid}: warmup done iters={warmup_iters} (tl2cgen)");
+                        }
+
+                        let backoff = Backoff::new();
+
+                        loop {
+                            let job = match pop_job(&local, &shards, home_shard, &mut rr) {
+                                Some(j) => {
+                                    backoff.reset();
+                                    j
+                                }
+                                None => {
+                                    backoff.snooze();
+                                    continue;
+                                }
+                            };
+
+                            running.fetch_add(1, Ordering::Relaxed);
+                            let _running_guard = RunningGuard(Arc::clone(&running));
+
+                            let now = Instant::now();
+                            let queue_wait_us =
+                                now.duration_since(job.enq_at)
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX)) as u64;
+                            metrics::histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
+
+                            // We've started processing this job => decrement queued.
+                            queued.fetch_sub(1, Ordering::Relaxed);
+
+                            if let Some(deadline_at) = job.deadline_at {
+                                if now >= deadline_at {
+                                    metrics::counter!("xgb_pool_deadline_miss_total").increment(1);
+                                    let _ = job
+                                        .resp_tx
+                                        .send(Err(anyhow::Error::new(XgbPoolError::DeadlineExceeded)));
+                                    continue;
+                                }
+                            }
+
+                            let t0 = Instant::now();
+
+                            let (score, contrib_topk) = match job.row {
+                                XgbRow::OwnedDense(row) => {
+                                    let s = match native_l1_tl2cgen::predict_proba_dense_1row(&row) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            let _ = job.resp_tx.send(Err(e));
+                                            continue;
+                                        }
+                                    };
+                                    (s, Vec::new())
+                                }
+                                XgbRow::DenseBytesLe { bytes, ncols } => {
+                                    let s = match native_l1_tl2cgen::predict_proba_dense_bytes_le(&bytes, ncols) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            let _ = job.resp_tx.send(Err(e));
+                                            continue;
+                                        }
+                                    };
+                                    (s, Vec::new())
+                                }
+                            };
+
+                            let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                            metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
+
+                            // Best-effort compute EWMA update.
+                            let old = compute_ema_us.load(Ordering::Relaxed);
+                            let new = if old == 0 {
+                                xgb_us.max(1)
+                            } else {
+                                (old.saturating_mul(7) + xgb_us) / 8
+                            };
+                            compute_ema_us.store(new.max(1), Ordering::Relaxed);
+
+                            let _ = job.resp_tx.send(Ok(XgbOut {
+                                score,
+                                queue_wait_us,
+                                xgb_us,
+                                contrib_topk,
+                            }));
+                        }
                     }
 
-                    // Main loop
-                    let mut scratch_f32: Vec<f32> = Vec::new();
-                    while let Some(job) = rx.blocking_recv() {
-                        // Best-effort counters (admission control / debug).
-                        queued.fetch_sub(1, Ordering::Relaxed);
-                        running.fetch_add(1, Ordering::Relaxed);
-                        let _running_guard = RunningGuard(Arc::clone(&running));
-
-                        let now = Instant::now();
-                        let queue_wait_us =
-                            now.duration_since(job.enq_at)
-                                .as_micros()
-                                .min(u128::from(u64::MAX)) as u64;
-
-                        metrics::histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
-
-                        if let Some(deadline_at) = job.deadline_at {
-                            if now >= deadline_at {
-                                metrics::counter!("xgb_pool_deadline_miss_total").increment(1);
-                                let _ = job
-                                    .resp_tx
-                                    .send(Err(anyhow::Error::new(XgbPoolError::DeadlineExceeded)));
-                                continue;
+                    #[cfg(all(feature = "xgb_ffi", not(feature = "native_l1_tl2cgen")))]
+                    {
+                        let bst = match Booster::load_model(model_path.as_ref()) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("xgb-worker-{wid}: failed to load model: {e}");
+                                return;
                             }
+                        };
+
+                        // Warmup: initialize thread-local buffers & internals.
+                        if warmup_iters > 0 {
+                            let ncols = feature_names.len();
+                            let row = vec![f32::NAN; ncols];
+                            for _ in 0..warmup_iters {
+                                let _ = bst.predict_proba_dense_1row(&row);
+                            }
+                            let _ = bst.predict_contribs_dense_1row(&row);
+                            eprintln!("xgb-worker-{wid}: warmup done iters={warmup_iters}");
                         }
 
-                        let t0 = Instant::now();
+                        // Main loop
+                        let mut scratch_f32: Vec<f32> = Vec::new();
+                        let backoff = Backoff::new();
 
-                        // Run inference with either owned row or raw bytes.
-                        let (score, contrib_topk) = match job.row {
-                            XgbRow::OwnedDense(row) => {
-                                let s = match bst.predict_proba_dense_1row(&row) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
-                                        continue;
-                                    }
-                                };
+                        loop {
+                            let job = match pop_job(&local, &shards, home_shard, &mut rr) {
+                                Some(j) => {
+                                    backoff.reset();
+                                    j
+                                }
+                                None => {
+                                    backoff.snooze();
+                                    continue;
+                                }
+                            };
 
-                                let mut topk = Vec::new();
-                                if job.contrib_topk > 0 {
-                                    match bst.predict_contribs_dense_1row(&row) {
-                                        Ok(out) => {
-                                            let n = feature_names.len().min(out.values.len());
-                                            topk = topk_abs_named(
-                                                &out.values[..n],
-                                                &feature_names,
-                                                job.contrib_topk,
-                                            );
-                                        }
+                            running.fetch_add(1, Ordering::Relaxed);
+                            let _running_guard = RunningGuard(Arc::clone(&running));
+
+                            let now = Instant::now();
+                            let queue_wait_us =
+                                now.duration_since(job.enq_at)
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX)) as u64;
+
+                            metrics::histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
+
+                            // Started => dequeue.
+                            queued.fetch_sub(1, Ordering::Relaxed);
+
+                            if let Some(deadline_at) = job.deadline_at {
+                                if now >= deadline_at {
+                                    metrics::counter!("xgb_pool_deadline_miss_total").increment(1);
+                                    let _ = job
+                                        .resp_tx
+                                        .send(Err(anyhow::Error::new(XgbPoolError::DeadlineExceeded)));
+                                    continue;
+                                }
+                            }
+
+                            let t0 = Instant::now();
+
+                            // Run inference with either owned row or raw bytes.
+                            let (score, contrib_topk) = match job.row {
+                                XgbRow::OwnedDense(row) => {
+                                    let s = match bst.predict_proba_dense_1row(&row) {
+                                        Ok(s) => s,
                                         Err(e) => {
                                             let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
                                             continue;
                                         }
-                                    }
-                                }
-                                (s, topk)
-                            }
-                            XgbRow::DenseBytesLe { bytes, ncols } => {
-                                let row = match bytes_as_f32le(&bytes, ncols, &mut scratch_f32) {
-                                    Ok(s) => s,
-                                    Err(msg) => {
-                                        let _ = job.resp_tx.send(Err(anyhow::anyhow!(msg)));
-                                        continue;
-                                    }
-                                };
+                                    };
 
-                                let s = match bst.predict_proba_dense_1row(row) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
-                                        continue;
-                                    }
-                                };
-
-                                let mut topk = Vec::new();
-                                if job.contrib_topk > 0 {
-                                    match bst.predict_contribs_dense_1row(row) {
-                                        Ok(out) => {
-                                            let n = feature_names.len().min(out.values.len());
-                                            topk = topk_abs_named(
-                                                &out.values[..n],
-                                                &feature_names,
-                                                job.contrib_topk,
-                                            );
+                                    let mut topk = Vec::new();
+                                    if job.contrib_topk > 0 {
+                                        match bst.predict_contribs_dense_1row(&row) {
+                                            Ok(out) => {
+                                                let n = feature_names.len().min(out.values.len());
+                                                topk = topk_abs_named(
+                                                    &out.values[..n],
+                                                    &feature_names,
+                                                    job.contrib_topk,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
+                                                continue;
+                                            }
                                         }
+                                    }
+                                    (s, topk)
+                                }
+                                XgbRow::DenseBytesLe { bytes, ncols } => {
+                                    let row = match bytes_as_f32le(&bytes, ncols, &mut scratch_f32) {
+                                        Ok(s) => s,
+                                        Err(msg) => {
+                                            let _ = job.resp_tx.send(Err(anyhow::anyhow!(msg)));
+                                            continue;
+                                        }
+                                    };
+
+                                    let s = match bst.predict_proba_dense_1row(row) {
+                                        Ok(s) => s,
                                         Err(e) => {
                                             let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
                                             continue;
                                         }
+                                    };
+
+                                    let mut topk = Vec::new();
+                                    if job.contrib_topk > 0 {
+                                        match bst.predict_contribs_dense_1row(row) {
+                                            Ok(out) => {
+                                                let n = feature_names.len().min(out.values.len());
+                                                topk = topk_abs_named(
+                                                    &out.values[..n],
+                                                    &feature_names,
+                                                    job.contrib_topk,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                let _ = job.resp_tx.send(Err(anyhow::anyhow!(e)));
+                                                continue;
+                                            }
+                                        }
                                     }
+                                    (s, topk)
                                 }
-                                (s, topk)
-                            }
-                        };
+                            };
 
-                        let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                        metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
+                            let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                            metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
 
-                        // Best-effort compute EWMA update.
-                        // new = old*7/8 + xgb*1/8  (stable + cheap integer math)
-                        let old = compute_ema_us.load(Ordering::Relaxed);
-                        let new = if old == 0 {
-                            xgb_us.max(1)
-                        } else {
-                            (old.saturating_mul(7) + xgb_us) / 8
-                        };
-                        compute_ema_us.store(new.max(1), Ordering::Relaxed);
+                            // EWMA update: new = old*7/8 + xgb*1/8
+                            let old = compute_ema_us.load(Ordering::Relaxed);
+                            let new = if old == 0 {
+                                xgb_us.max(1)
+                            } else {
+                                (old.saturating_mul(7) + xgb_us) / 8
+                            };
+                            compute_ema_us.store(new.max(1), Ordering::Relaxed);
 
-                        let _ = job.resp_tx.send(Ok(XgbOut {
-                            score,
-                            queue_wait_us,
-                            xgb_us,
-                            contrib_topk,
-                        }));
+                            let _ = job.resp_tx.send(Ok(XgbOut {
+                                score,
+                                queue_wait_us,
+                                xgb_us,
+                                contrib_topk,
+                            }));
+                        }
                     }
                 })
                 .context("spawn xgb worker")?;
-
-            workers.push(WorkerHandle { tx });
         }
 
         Ok(Self {
-            workers,
-            rr: AtomicUsize::new(0),
+            n_workers,
+            shards,
+            io_cpu_to_shard,
             cap_total,
             queued,
             running,
-
+            live_workers,
             early_reject_pred_wait_us: 0,
             compute_ema_us,
         })
@@ -367,6 +553,7 @@ impl XgbPool {
     }
 
     /// Convenience: build a pool directly from a model directory (same format as `XgbRuntime::load_from_dir`).
+    #[cfg(any(feature = "xgb_ffi", feature = "native_l1_tl2cgen"))]
     pub fn new_from_dir(
         model_dir: impl AsRef<Path>,
         n_workers: usize,
@@ -390,11 +577,45 @@ impl XgbPool {
     #[inline]
     pub fn stats(&self) -> XgbPoolStats {
         XgbPoolStats {
-            n_workers: self.workers.len(),
+            n_workers: self.n_workers,
             cap_total: self.cap_total,
             queued: self.queued.load(Ordering::Relaxed),
             running: self.running.load(Ordering::Relaxed),
         }
+    }
+
+    #[inline]
+    fn ensure_alive(&self) -> Result<(), XgbPoolError> {
+        if self.live_workers.load(Ordering::Relaxed) == 0 {
+            Err(XgbPoolError::WorkerDown)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    fn admission_control(&self) -> Result<(), XgbPoolError> {
+        self.ensure_alive()?;
+
+        if self.early_reject_pred_wait_us > 0 {
+            let inflight = (self.queued.load(Ordering::Relaxed) + self.running.load(Ordering::Relaxed)) as u64;
+            let ema = self.compute_ema_us.load(Ordering::Relaxed).max(1);
+            let pred_wait_us = inflight.saturating_mul(ema) / (self.n_workers as u64).max(1);
+            metrics::histogram!("xgb_pool_pred_wait_us").record(pred_wait_us as f64);
+            if pred_wait_us >= self.early_reject_pred_wait_us {
+                metrics::counter!("xgb_pool_admission_reject_total").increment(1);
+                return Err(XgbPoolError::QueueFull);
+            }
+        }
+
+        // Hard cap: global queued count.
+        let prev = self.queued.fetch_add(1, Ordering::Relaxed);
+        if prev >= self.cap_total {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+            return Err(XgbPoolError::QueueFull);
+        }
+
+        Ok(())
     }
 
     /// Non-blocking submission. Returns a oneshot receiver to await the result.
@@ -403,61 +624,27 @@ impl XgbPool {
         row: Vec<f32>,
         contrib_topk: usize,
     ) -> Result<oneshot::Receiver<anyhow::Result<XgbOut>>, XgbPoolError> {
-        let n = self.workers.len();
-        if n == 0 {
-            return Err(XgbPoolError::WorkerDown);
-        }
-
-        // Admission control: reject early to keep client-visible P99 stable.
-        if self.early_reject_pred_wait_us > 0 {
-            let inflight =
-                (self.queued.load(Ordering::Relaxed) + self.running.load(Ordering::Relaxed)) as u64;
-            let ema = self.compute_ema_us.load(Ordering::Relaxed).max(1);
-            let pred_wait_us = inflight.saturating_mul(ema) / (n as u64).max(1);
-            metrics::histogram!("xgb_pool_pred_wait_us").record(pred_wait_us as f64);
-            if pred_wait_us >= self.early_reject_pred_wait_us {
-                metrics::counter!("xgb_pool_admission_reject_total").increment(1);
-                return Err(XgbPoolError::QueueFull);
-            }
-        }
+        self.admission_control()?;
 
         let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
-        let mut job = XgbJob {
-            enq_at: Instant::now(),
-            deadline_at: None,
+        let enq_at = Instant::now();
+        let deadline_at = if self.early_reject_pred_wait_us > 0 {
+            Some(enq_at + Duration::from_micros(self.early_reject_pred_wait_us))
+        } else {
+            None
+        };
+        let job = XgbJob {
+            enq_at,
+            deadline_at,
             row: XgbRow::OwnedDense(row),
             contrib_topk,
             resp_tx,
         };
 
-        let start = self.rr.fetch_add(1, Ordering::Relaxed);
-        let mut down = 0usize;
+        let sid = pick_shard(&self.io_cpu_to_shard, self.shards.len());
+        self.shards[sid].push(job);
 
-        for i in 0..n {
-            let idx = (start + i) % n;
-            // NOTE: increment before enqueue to avoid underflow race with worker-side fetch_sub.
-            self.queued.fetch_add(1, Ordering::Relaxed);
-            match self.workers[idx].tx.try_send(job) {
-                Ok(()) => return Ok(resp_rx),
-                Err(mpsc::error::TrySendError::Full(j)) => {
-                    self.queued.fetch_sub(1, Ordering::Relaxed);
-                    job = j;
-                    continue;
-                }
-                Err(mpsc::error::TrySendError::Closed(j)) => {
-                    self.queued.fetch_sub(1, Ordering::Relaxed);
-                    job = j;
-                    down += 1;
-                    continue;
-                }
-            }
-        }
-
-        if down == n {
-            Err(XgbPoolError::WorkerDown)
-        } else {
-            Err(XgbPoolError::QueueFull)
-        }
+        Ok(resp_rx)
     }
 
     /// Non-blocking submission with a queue-wait budget (microseconds).
@@ -475,30 +662,14 @@ impl XgbPool {
             return self.try_submit(row, contrib_topk);
         }
 
-        let n = self.workers.len();
-        if n == 0 {
-            return Err(XgbPoolError::WorkerDown);
-        }
-
-        // Admission control: reject early to keep client-visible P99 stable.
-        if self.early_reject_pred_wait_us > 0 {
-            let inflight =
-                (self.queued.load(Ordering::Relaxed) + self.running.load(Ordering::Relaxed)) as u64;
-            let ema = self.compute_ema_us.load(Ordering::Relaxed).max(1);
-            let pred_wait_us = inflight.saturating_mul(ema) / (n as u64).max(1);
-            metrics::histogram!("xgb_pool_pred_wait_us").record(pred_wait_us as f64);
-            if pred_wait_us >= self.early_reject_pred_wait_us {
-                metrics::counter!("xgb_pool_admission_reject_total").increment(1);
-                return Err(XgbPoolError::QueueFull);
-            }
-        }
+        self.admission_control()?;
 
         let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
 
         let enq_at = Instant::now();
         let deadline_at = enq_at + Duration::from_micros(budget_us);
 
-        let mut job = XgbJob {
+        let job = XgbJob {
             enq_at,
             deadline_at: Some(deadline_at),
             row: XgbRow::OwnedDense(row),
@@ -506,34 +677,10 @@ impl XgbPool {
             resp_tx,
         };
 
-        let start = self.rr.fetch_add(1, Ordering::Relaxed);
-        let mut down = 0usize;
+        let sid = pick_shard(&self.io_cpu_to_shard, self.shards.len());
+        self.shards[sid].push(job);
 
-        for i in 0..n {
-            let idx = (start + i) % n;
-            // NOTE: increment before enqueue to avoid underflow race with worker-side fetch_sub.
-            self.queued.fetch_add(1, Ordering::Relaxed);
-            match self.workers[idx].tx.try_send(job) {
-                Ok(()) => return Ok(resp_rx),
-                Err(mpsc::error::TrySendError::Full(j)) => {
-                    self.queued.fetch_sub(1, Ordering::Relaxed);
-                    job = j;
-                    continue;
-                }
-                Err(mpsc::error::TrySendError::Closed(j)) => {
-                    self.queued.fetch_sub(1, Ordering::Relaxed);
-                    job = j;
-                    down += 1;
-                    continue;
-                }
-            }
-        }
-
-        if down == n {
-            Err(XgbPoolError::WorkerDown)
-        } else {
-            Err(XgbPoolError::QueueFull)
-        }
+        Ok(resp_rx)
     }
 
     /// Convenience async wrapper with budget.
@@ -573,65 +720,31 @@ impl XgbPool {
         // Validate shape early to avoid silent corruption.
         let need = ncols.checked_mul(4).ok_or(XgbPoolError::QueueFull)?;
         if bytes.len() != need {
-            // Treat as bad request upstream; here we surface it as worker error.
-            // (Server/pipeline should have validated already.)
+            // Treat as bad request upstream; here we surface it as QueueFull to keep API stable.
             return Err(XgbPoolError::QueueFull);
         }
 
-        let n = self.workers.len();
-        if n == 0 {
-            return Err(XgbPoolError::WorkerDown);
-        }
-
-        // Admission control: reject early to keep client-visible P99 stable.
-        if self.early_reject_pred_wait_us > 0 {
-            let inflight =
-                (self.queued.load(Ordering::Relaxed) + self.running.load(Ordering::Relaxed)) as u64;
-            let ema = self.compute_ema_us.load(Ordering::Relaxed).max(1);
-            let pred_wait_us = inflight.saturating_mul(ema) / (n as u64).max(1);
-            metrics::histogram!("xgb_pool_pred_wait_us").record(pred_wait_us as f64);
-            if pred_wait_us >= self.early_reject_pred_wait_us {
-                metrics::counter!("xgb_pool_admission_reject_total").increment(1);
-                return Err(XgbPoolError::QueueFull);
-            }
-        }
+        self.admission_control()?;
 
         let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
-        let mut job = XgbJob {
-            enq_at: Instant::now(),
-            deadline_at: None,
+        let enq_at = Instant::now();
+        let deadline_at = if self.early_reject_pred_wait_us > 0 {
+            Some(enq_at + Duration::from_micros(self.early_reject_pred_wait_us))
+        } else {
+            None
+        };
+        let job = XgbJob {
+            enq_at,
+            deadline_at,
             row: XgbRow::DenseBytesLe { bytes, ncols },
             contrib_topk,
             resp_tx,
         };
 
-        let start = self.rr.fetch_add(1, Ordering::Relaxed);
-        let mut down = 0usize;
+        let sid = pick_shard(&self.io_cpu_to_shard, self.shards.len());
+        self.shards[sid].push(job);
 
-        for i in 0..n {
-            let idx = (start + i) % n;
-            self.queued.fetch_add(1, Ordering::Relaxed);
-            match self.workers[idx].tx.try_send(job) {
-                Ok(()) => return Ok(resp_rx),
-                Err(mpsc::error::TrySendError::Full(j)) => {
-                    self.queued.fetch_sub(1, Ordering::Relaxed);
-                    job = j;
-                    continue;
-                }
-                Err(mpsc::error::TrySendError::Closed(j)) => {
-                    self.queued.fetch_sub(1, Ordering::Relaxed);
-                    job = j;
-                    down += 1;
-                    continue;
-                }
-            }
-        }
-
-        if down == n {
-            Err(XgbPoolError::WorkerDown)
-        } else {
-            Err(XgbPoolError::QueueFull)
-        }
+        Ok(resp_rx)
     }
 
     /// Convenience async wrapper.
@@ -647,6 +760,148 @@ impl XgbPool {
             Err(_) => Err(XgbPoolError::Canceled),
         }
     }
+}
+
+#[inline]
+fn pop_job(
+    local: &DequeWorker<XgbJob>,
+    shards: &Vec<Arc<Injector<XgbJob>>>,
+    home_shard: usize,
+    rr: &mut usize,
+) -> Option<XgbJob> {
+    if let Some(j) = local.pop() {
+        return Some(j);
+    }
+
+    let n = shards.len().max(1);
+
+    // 1) Try home shard first (hot path locality).
+    match steal_one(&shards[home_shard % n], local) {
+        Some(j) => return Some(j),
+        None => {}
+    }
+
+    // 2) Try a small number of other shards (work stealing).
+    // Rotate which shards we try first to avoid hammering shard 0.
+    let tries = n.min(4);
+    let start = *rr % n;
+    *rr = rr.wrapping_add(1);
+
+    for k in 0..tries {
+        let sid = (start + k) % n;
+        if sid == home_shard {
+            continue;
+        }
+        if let Some(j) = steal_one(&shards[sid], local) {
+            return Some(j);
+        }
+    }
+
+    None
+}
+
+#[inline]
+fn steal_one(inj: &Injector<XgbJob>, local: &DequeWorker<XgbJob>) -> Option<XgbJob> {
+    loop {
+        match inj.steal_batch_and_pop(local) {
+            Steal::Success(j) => return Some(j),
+            Steal::Empty => return None,
+            Steal::Retry => continue,
+        }
+    }
+}
+
+#[inline]
+fn pick_shard(io_cpu_to_shard: &[i16], n_shards: usize) -> usize {
+    let n = n_shards.max(1);
+    let cpu = current_cpu_id_fast();
+    let base = io_cpu_to_shard.get(cpu).copied().unwrap_or(-1);
+
+    // If we can map CPU -> shard, use it; else hash by cpu.
+    let mut sid = if base >= 0 { base as usize } else { cpu % n };
+
+    // Add per-thread RR to reduce collisions when multiple tasks run on the same CPU.
+    TLS_RR.with(|c| {
+        let cur = c.get();
+        c.set(cur.wrapping_add(1));
+        sid = sid.wrapping_add(cur) % n;
+    });
+
+    sid
+}
+
+#[inline]
+fn nearest_shard(worker_cpu: usize, io_cpu_to_shard: &[i16], n_shards: usize) -> Option<usize> {
+    if n_shards == 0 {
+        return None;
+    }
+    // Prefer exact mapping if exists.
+    if let Some(s) = io_cpu_to_shard.get(worker_cpu).copied() {
+        if s >= 0 {
+            return Some(s as usize);
+        }
+    }
+    // Otherwise search outward a bit for the nearest known IO cpu (cheap, bounded).
+    // (This matters only when workers are pinned but IO CPUs are disjoint.)
+    for d in 1..=8usize {
+        if worker_cpu >= d {
+            if let Some(s) = io_cpu_to_shard.get(worker_cpu - d).copied() {
+                if s >= 0 {
+                    return Some(s as usize);
+                }
+            }
+        }
+        if let Some(s) = io_cpu_to_shard.get(worker_cpu + d).copied() {
+            if s >= 0 {
+                return Some(s as usize);
+            }
+        }
+    }
+    None
+}
+
+fn build_shards(io_cpus: &[usize]) -> (Vec<Arc<Injector<XgbJob>>>, Vec<i16>) {
+    // If we know IO CPUs, one shard per IO CPU. Otherwise 1 shard.
+    let n_shards = io_cpus.len().max(1).min(64);
+    let mut shards = Vec::with_capacity(n_shards);
+    for _ in 0..n_shards {
+        shards.push(Arc::new(Injector::new()));
+    }
+
+    // Build cpu_id -> shard_id table.
+    let max_cpu = max_cpu_id().unwrap_or(0);
+    let mut map = vec![-1i16; max_cpu + 1];
+    if !io_cpus.is_empty() {
+        for (sid, &cpu) in io_cpus.iter().take(n_shards).enumerate() {
+            if cpu < map.len() {
+                map[cpu] = sid as i16;
+            }
+        }
+    }
+
+    (shards, map)
+}
+
+/// Infer the CPU list used by "I/O producers" (HTTP runtime threads),
+/// by taking the current process affinity mask and removing worker-pinned CPUs.
+///
+/// If we fail to read affinity mask, returns empty => caller falls back to 1 shard.
+fn infer_io_cpus(pin_cpus: &[usize]) -> Vec<usize> {
+    let allowed = get_self_affinity_cpus().unwrap_or_default();
+    if allowed.is_empty() {
+        return Vec::new();
+    }
+    if pin_cpus.is_empty() {
+        return allowed;
+    }
+
+    let mut mark = vec![false; max_cpu_id().unwrap_or(0) + 1];
+    for &c in pin_cpus {
+        if c < mark.len() {
+            mark[c] = true;
+        }
+    }
+    allowed.into_iter().filter(|&c| c < mark.len() && !mark[c]).collect()
 }
 
 /// Convert raw f32 little-endian bytes into a `&[f32]` view when possible.
@@ -684,6 +939,29 @@ fn bytes_as_f32le<'a>(
         scratch.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
     }
     Ok(scratch.as_slice())
+}
+
+fn bytes_as_f64le(bytes: &[u8], ncols: usize, scratch: &mut Vec<f64>) -> anyhow::Result<()> {
+    let need = ncols * 4;
+    anyhow::ensure!(
+        bytes.len() == need,
+        "DenseBytesLe: expected {} bytes (ncols={} * 4), got {}",
+        need,
+        ncols,
+        bytes.len()
+    );
+
+    if scratch.len() != ncols {
+        scratch.resize(ncols, 0.0);
+    }
+
+    for i in 0..ncols {
+        let off = i * 4;
+        let c = [bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]];
+        scratch[i] = f32::from_le_bytes(c) as f64;
+    }
+
+    Ok(())
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -774,4 +1052,77 @@ fn pin_current_thread(cpu: usize) -> std::io::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn pin_current_thread(_cpu: usize) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn current_cpu_id() -> Option<usize> {
+    // SAFETY: sched_getcpu has no side effects.
+    let cpu = unsafe { libc::sched_getcpu() };
+    if cpu >= 0 {
+        Some(cpu as usize)
+    } else {
+        None
+    }
+}
+
+
+#[inline]
+fn current_cpu_id_fast() -> usize {
+    TLS_CPU_ID.with(|c| {
+        let v = c.get();
+        if v >= 0 {
+            v as usize
+        } else {
+            let cpu = current_cpu_id().unwrap_or(0) as i32;
+            c.set(cpu);
+            cpu as usize
+        }
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn current_cpu_id() -> Option<usize> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn max_cpu_id() -> Option<usize> {
+    // This is the smallest safe bound we can get without external deps.
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+    if n > 0 {
+        Some((n as usize).saturating_sub(1))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn max_cpu_id() -> Option<usize> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn get_self_affinity_cpus() -> std::io::Result<Vec<usize>> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        let tid = libc::pthread_self();
+        let rc = libc::pthread_getaffinity_np(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc));
+        }
+        let mut out = Vec::new();
+        // cpu_set_t size is platform-specific; CPU_ISSET is safe to query up to CONF cpus.
+        let max = max_cpu_id().unwrap_or(0);
+        for cpu in 0..=max {
+            if libc::CPU_ISSET(cpu, &set) {
+                out.push(cpu);
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_self_affinity_cpus() -> std::io::Result<Vec<usize>> {
+    Ok(Vec::new())
 }

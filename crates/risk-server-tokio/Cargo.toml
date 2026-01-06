@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-risk-core = { path = "../risk-core" }
+risk-core = { path = "../risk-core", default-features = false }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,3 +19,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+
+[features]
+default = ["xgb_ffi"]
+xgb_ffi = ["risk-core/xgb_ffi"]
+native_l1_tl2cgen = ["risk-core/native_l1_tl2cgen"]
+native_l1_m2cgen = ["risk-core/native_l1_m2cgen"]

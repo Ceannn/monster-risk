@@ -1,243 +1,214 @@
-# DEV_GUIDE
+# Dev Guide
 
-> 这份文档是“能一键跑起来 + 能稳定压测 + 能解释结果”的最小闭环指南。  
-> 目标是：**用同一套命令**把 `risk-server-tokio` 跑稳、把 `risk-bench2` 打爆，并且能快速判断：到底是 **server-limited** 还是 **bench-limited**。
-
----
-
-## 1. 项目目标（我们到底在追什么）
-
-1) **把线上“高频打分服务”拆成可控的实验台：**
-- Tokio HTTP server：`crates/risk-server-tokio`
-- 推理核心：`crates/risk-core`（L1/L2、XGBoost pool、背压/降级）
-- 压测器：`crates/risk-bench2`（benchV3 方向：每核一线程 + 多连接 keepalive + 精准 pacer）
-
-2) **强约束：不允许“测不准”。**  
-bench 不能成为瓶颈，否则你看到的 P99 就像“拿温度计测电压”——数字很漂亮，但结论不可信。
-
-3) **接口方向：从 JSON → 二进制（更接近真实线上）。**
-- 请求：dense f32 little-endian bytes（`application/octet-stream`）
-- 响应：`RSK1` 二进制封包（包含 score + stage timings）
+> 最后更新：2026-01-06  
+> 目标：让你在 **WSL2 / Linux** 上把 `risk-server-glommio` 跑起来、确认 **L1/L2 TL2CGEN 静态推理已启用**、然后用 `risk-bench2` 压到 knee。
 
 ---
 
-## 2. 本地开发环境（建议配置）
+## 0. TL;DR（最短路径）
 
-- Rust stable（建议 `rustup default stable`）
-- Linux（本地 loopback 压测 OK；想测网络栈/网卡请用两机）
-- 建议编译参数：
-  ```bash
-  export RUSTFLAGS="-C target-cpu=native"
-  ```
-
-> 小比喻：`-C target-cpu=native` 就像“让编译器知道你这台 CPU 真的有 AVX2/Zen4/…”，否则它会按保守档跑。
-
----
-
-## 3. 数据与模型准备
-
-### 3.1 常用数据文件（你现在已经有了）
-你当前目录里看到的这些就够了：
-
-- `data/bench/ieee_20k.f32`：**dense f32le 二进制**（推荐用于压测）
-- `data/bench/ieee_20k.jsonl` / `ieee_20k_posmix.jsonl`：历史 JSONL（更多用于功能对齐/调试）
-
-维度：
-- `models/ieee_l1/feature_names.json` 长度应为 **432**（你测的就是 432）
-
-### 3.2 dense f32le 文件格式（重要！）
-`ieee_20k.f32` 的布局：
-
-- 每行 = `dense_dim * 4` 字节（f32 little-endian）
-- 文件总大小 = `rows * dense_dim * 4`
-
-比如 `rows=20000`，`dense_dim=432`：
-- 单行字节数 = 432 * 4 = **1728 bytes**
-- 文件大小约 = 20000 * 1728 ≈ **33MB**（与你 ls 看到的吻合）
-
----
-
-## 4. 启动 risk-server-tokio（Tokio server）
-
-### 4.1 Server CLI（以当前接口为准）
-`risk-server-tokio` 目前核心参数是：
-
-- `--listen <IP:PORT>`：监听地址（**没有 `--host`**，所以你之前会报错）
-- `--model-dir <DIR>`：L1 模型目录
-- `--model-l2-dir <DIR>`：L2 模型目录
-- `--max-in-flight <N>`：HTTP 层最大并发（超出会 429，保护服务）
-
-此外，Tokio runtime 线程数从环境变量读：
-- `TOKIO_WORKER_THREADS`（默认 4）
-- `TOKIO_MAX_BLOCKING_THREADS`（默认 4）
-
-### 4.2 推荐启动命令（经典“绑核 + 限制线程 + 背压”）
-下面给你一套“最经典的那种”，你直接复制就能跑：
-
+### 0.1 编译（L1+L2 都走 TL2CGEN 静态推理）
 ```bash
-# 1) 编译（可选，但推荐先 build）
-export RUSTFLAGS="-C target-cpu=native"
-cargo build -p risk-server-tokio --release
-
-# 2) 绑核启动（示例：给 server 8 个逻辑核；按你机器改）
-OMP_NUM_THREADS=1 MALLOC_ARENA_MAX=2 TOKIO_WORKER_THREADS=4 TOKIO_MAX_BLOCKING_THREADS=4 XGB_L1_POOL_THREADS=8 XGB_L1_POOL_QUEUE_CAP=512 XGB_L1_POOL_WARMUP_ITERS=1000 XGB_L1_POOL_PIN_CPUS=0,1,2,3,4,5,6,7 XGB_L1_POOL_EARLY_REJECT_US=50 XGB_L2_POOL_THREADS=4 XGB_L2_POOL_QUEUE_CAP=256 XGB_L2_POOL_WARMUP_ITERS=200 XGB_L2_POOL_PIN_CPUS=8,9,10,11 XGB_L2_POOL_EARLY_REJECT_US=50 taskset -c 0-11 cargo run -p risk-server-tokio --release --   --listen 127.0.0.1:8080   --model-dir models/ieee_l1   --model-l2-dir models/ieee_l2   --max-in-flight 4096
+TL2CGEN_MARCH_NATIVE=1 \
+cargo build -p risk-server-glommio --release \
+  --no-default-features \
+  --features native_l1_tl2cgen,native_l2_tl2cgen
 ```
 
-说明（你会用得上）：
-- `OMP_NUM_THREADS=1`：强制 XGBoost 单线程（否则会在 pool 里“线程套线程”爆炸）
-- `*_POOL_THREADS / *_POOL_QUEUE_CAP`：XGB worker 数与队列上限（核心背压开关）
-- `*_POOL_PIN_CPUS`：把 worker 固定到核上（避免跑来跑去抖动 P99）
-- `*_POOL_EARLY_REJECT_US`：当预测排队等待超过阈值，提前拒绝（可选，但对尾延迟有帮助）
-
----
-
-## 5. 接口（对齐当前进度）
-
-### 5.1 推荐压测接口：`POST /score_dense_f32_bin`
-- Request:
-  - `Content-Type: application/octet-stream`
-  - Body：**exactly `dense_dim` 个 f32le**（即 `dense_dim * 4` bytes）
-- Response:
-  - `Content-Type: application/octet-stream`
-  - Body：48 bytes 的 `RSK1` 二进制封包（小、稳定、便于解析）
-
-#### 5.1.1 `RSK1` 响应格式（48 bytes）
-| offset | size | type | 含义 |
-|---:|---:|---|---|
-| 0 | 4 | bytes | magic = `RSK1` |
-| 4 | 2 | u16le | version（当前 1） |
-| 6 | 2 | u16le | flags（当前 0） |
-| 8 | 8 | u64le | trace_id（服务端自增） |
-| 16 | 4 | f32le | score |
-| 20 | 24 | 6×u32le | stage_us：parse, feature, router, xgb, l2, serialize |
-| 44 | 4 | u32le | reserved（0） |
-
-> 类比：这就像给每个请求都发了一个“迷你 flight recorder”，你不用解析 JSON，也能知道每段耗时。
-
-### 5.2 兼容接口（调试用，非压测首选）
-- `/score_xgb_pool_async` / `/score_dense_f32` 等（JSON 体/JSON 回包）
-- 这些保留用于对齐逻辑、debug 与回归；压测建议统一走 bin 版本，噪声更小。
-
----
-
-## 6. 启动 risk-bench2（benchV3 方向）
-
-### 6.1 bench2 CLI（你现在的 usage）
-你目前看到的参数已经是“修到能用”的版本（重点变化）：
-
-- `--duration` / `--warmup`：**单位是秒（整数）**，不能写 `10s`
-- 并发用 `--concurrency`（替代你之前记忆里的 `--inflight-total`）
-- payload 文件用 `--xgb-dense-file`（替代 `--payload-f32-file`）
-- pacer：
-  - `--pacer poisson|fixed`
-  - `--pacer-spin-threshold-us N`：最后 N 微秒 busy-spin（用来榨干 tick 抖动）
-
-### 6.2 经典压测命令（固定 pacer，逐步拉 RPS）
-> 下面这套就是你一直在跑的“黄金模板”，我把坑都填平了。
+### 0.2 运行（建议绑核 + memlock）
+> **TL2CGEN 模式不需要** `LD_LIBRARY_PATH` / `OMP_NUM_THREADS`（那是给 `xgb_ffi` 动态库 + OpenMP 用的）。
 
 ```bash
-export RUSTFLAGS="-C target-cpu=native"
-cargo build -p risk-bench2 --release
-
-# 给 bench 4~6 个核（示例：12-15）；确保不和 server 绑到同一批核
-taskset -c 12-15 cargo run -p risk-bench2 --release --   --url http://127.0.0.1:8080/score_dense_f32_bin   --xgb-dense-file data/bench/ieee_20k.f32   --xgb-dense-dim 432   --content-type application/octet-stream   --rps 20000   --warmup 10   --duration 30   --threads 6   --concurrency 2048   --conns-per-thread 8   --timeout-ms 50   --pacer fixed   --pacer-jitter-us 0   --pacer-spin-threshold-us 0   --window-ms 200   --window-csv bench_ts_fixed_rps20000_t{t}.csv   --progress
+sudo env \
+  MALLOC_ARENA_MAX=2 \
+  XGB_L1_POOL_THREADS=6 \
+  XGB_L1_POOL_QUEUE_CAP=512 \
+  XGB_L1_POOL_EARLY_REJECT_US=2000 \
+  XGB_L1_POOL_PIN_CPUS="2,4,6,8,10,12" \
+  XGB_L2_POOL_THREADS=2 \
+  XGB_L2_POOL_QUEUE_CAP=256 \
+  XGB_L2_POOL_EARLY_REJECT_US=4000 \
+  XGB_L2_POOL_PIN_CPUS="14,16" \
+  prlimit --memlock=unlimited -- \
+  taskset -c 2,4,6,8,10,12,14,16,18,20,22,24 \
+  target/release/risk-server-glommio \
+    --listen 127.0.0.1:8080 \
+    --model-dir models/ieee_l1l2_full/ieee_l1 \
+    --model-l2-dir models/ieee_l2_iter1800 \
+    --max-in-flight 4096 \
+    --warmup-iters 0
 ```
 
-#### 6.2.1 推荐的 ramp 计划（找拐点）
-固定其他参数不动，只改 `--rps`：
-- 20k → 21k → 22k → 23k → 24k → 25k …
+### 0.3 压测（knee：38k/40k）
+> 你现在的 `risk-bench2` CLI **已经收敛成精简版**：它不再接受 `--inflight-total / --conns-per-thread` 这些参数（你已经踩过坑了）。  
+> 以 `--help` 输出为准。
 
-你现在的数据很清楚：
-- 20k、21k、22k：基本 **PASS**
-- 23k 开始：出现 `timeout`，说明已触碰服务端尾延迟/容量极限
-- 25k+：`drop_conn_queue_full` + 大量 timeout，说明 client 连接队列也开始爆
-
----
-
-## 7. 输出怎么读（判断是不是“螺丝壳里做道场”）
-
-bench2 输出里你最该盯的 5 个东西：
-
-1) **ok_rps vs attempted_rps**  
-- ok_rps 跟不上 attempted_rps：要么 server 顶不住，要么 client 自己卡住
-
-2) **429 / timeout / dropped 的结构**
-- `429`：服务端背压（通常是队列满/并发上限）
-- `timeout`：尾部严重拖长（也可能是 client 排队过久）
-- `drop_conn_queue_full`：client 的连接发送队列顶满（bench 自身开始爆）
-
-3) **stage_p99(us)**
-- 你现在经常看到 xgb p99 在 800~2300us 的区间波动  
-  ——这基本就是“模型推理 + 池化调度”的真实成本
-
-4) **pacer_lag_p99**
-- 你之前看到 ~1900us 的 lag，一般是“tick 调度与 runtime 抖动”
-- 开 `--pacer-spin-threshold-us` 的意义：把最后几十微秒变成自旋，减少 oversleep
-
-5) **quality_gate**
-- `PASS`：bench 自己没有明显掉链子（结果更可信）
-- `FAIL (bench-limited)`：先别优化 server，先把 bench 拉直
-
-> 你现在已经把 `missed_ticks_total` 压到 0，说明 bench 的“发车节奏”稳定很多；  
-> 这就是从 benchV2 → benchV3 的质变点。
+```bash
+# 先准备一个 dense 特征二进制样本文件（bench 需要它）
+# --xgb-dense-file：f32 little-endian，按 row-major 平铺
+taskset -c 1,3,5,7,9,11 \
+target/release/risk-bench2 \
+  --url http://127.0.0.1:8080/score_dense_f32_bin \
+  --xgb-dense-file data/bench/xgb_dense_f32le.bin \
+  --xgb-dense-dim 432 \
+  --rps 40000 \
+  --warmup 10 \
+  --duration 30 \
+  --threads 6
+```
 
 ---
 
-## 8. 常见坑（你踩过的我都写死在这里）
+## 1. 架构总览（你现在的“怪兽形态”）
 
-- `error: unexpected argument '--host' found`  
-  ✅ server 用 `--listen 127.0.0.1:8080`
+### 1.1 请求链路（从 socket 到分数）
+1. **Glommio** 线程（thread-per-core executor）
+   - `accept()` 新连接（多 executor + `SO_REUSEPORT` 分流）
+   - 读 HTTP 请求头 + body
+   - body 是 **dense f32 little-endian**（维度 432）
+2. 解析/校验
+   - 校验 body 长度是否为 `dim * 4`
+   - （可选）fast-path：`align_to::<f32>()` 零拷贝；否则拷贝到对齐 scratch
+3. 推理调度
+   - 把推理任务扔给 **XgbPool**（L1 pool / L2 pool）
+   - pool 线程做 CPU 密集型推理，避免把 Glommio I/O 核拖死
+4. 推理后处理
+   - L1：给出 `score1`，按 policy 得出初步决策（PASS / REVIEW / DENY）
+   - L2：只在需要时触发（通常是 L1 的 REVIEW 区间）
+5. 写回 HTTP 响应
+   - JSON / 二进制输出（取决于 endpoint）
 
-- `error: invalid value '10s' for '--warmup'`  
-  ✅ `--warmup 10`（单位秒，整数）
+> 直觉类比：Glommio 是“高速收费站闸机”，负责把车流分流并快速验票；XgbPool 是“背后的一排检票员”，专做重 CPU 的查验。你要的是 **闸机永远不堵**。
 
-- `error: unexpected argument '--inflight-total' found`  
-  ✅ 用 `--concurrency 2048`
-
-- `error: unexpected argument '--payload-f32-file' found`  
-  ✅ 用 `--xgb-dense-file data/bench/ieee_20k.f32`
-
----
-
-## 9. 这次我们到底做了什么（进度对齐用）
-
-这一轮 chat 的核心成果可以总结成 5 条：
-
-1) **risk-server-tokio：支持 dense f32 二进制请求**（减少 JSON 噪声）
-2) **risk-server-tokio：增加 `RSK1` 二进制响应**（小回包 + 带 stage timing）
-3) **推理链路：做了零拷贝/少拷贝路径**（`align_to::<f32>()` + fallback decode）
-4) **背压体系更完整**：HTTP 层 `--max-in-flight` + pool queue cap + early reject → 429
-5) **risk-bench2（benchV3 方向）**：CLI 变好用、pacer 更稳、quality gate 更可信、窗口 CSV 可观测
-
----
-
-## 10. 下一步建议（别只在 4 核 bench 里“内卷”）
-
-你说得非常对：如果 bench 只有 4 核，很多优化会进入“螺丝壳里做道场”。
-
-下一步更值钱的方向（按优先级）：
-
-1) **两机压测**（bench 一台、server 一台）  
-   - 这样你测到的才是“网络栈 + 中断 + NIC + 调度”的真实形态  
-   - loopback 更像“在同一个屋里扔球”，两机才是“隔着马路扔球”
-
-2) **明确容量目标：以 timeout=0 的 ok_rps 找拐点**  
-   - 把 22k~24k 区间的曲线拉细：22.5k/23k/23.5k/…  
-   - 你现在已经看到了 23k 的边界迹象，这很宝贵
-
-3) **做一套“固定配置的回归基线”**  
-   - 固定：模型、dim、concurrency、conns、timeout、pacer  
-   - 每次改动只比：p50/p99、xgb_p99、429、timeout
+### 1.2 推理后端（TL2CGEN vs xgb_ffi）
+| 后端 | 依赖 | 线程模型 | 适用 |
+|---|---|---|---|
+| `native_*_tl2cgen` | **静态链接**（C 代码编进二进制） | 建议走 XgbPool（隔离 CPU） | 线上/压测默认 |
+| `xgb_ffi` | `libxgboost.so` 动态库 + 可能的 OpenMP | 必须谨慎限制线程数 | 兼容/对照实验 |
 
 ---
 
-## 11. 代码结构速览（便于快速定位）
+## 2. 模型目录规范（必须对齐，否则 silent failure）
 
-- `crates/risk-server-tokio`：HTTP server（路由、并发限制、请求解析、回包）
-- `crates/risk-core`：pipeline（L1/L2 路由、XgbPool、背压/early reject、metrics）
-- `crates/risk-bench2`：压测器（pacer、连接池、并发、统计、CSV、quality gate）
+### 2.1 必备文件
+每个 `model_dir` 必须包含：
+- `xgb_model*.json`（或你约定的模型文件名）
+- `feature_names.json`（或者 `features.txt`）：**特征顺序**是生命线  
+- `cat_maps.json.gz`：类别映射（注意：我们修过 `u32` 类型坑）
+- （推荐）`policy.json`：阈值（L1 的 review/deny；L2 的 deny 等）
+
+你遇到过的典型报错：
+- `missing feature schema ... expected feature_names.json or features.txt`
+- `parse cat_maps.json.gz ... invalid type: floating point 1.0, expected u32`
+
+### 2.2 L1/L2 schema 对齐检查
+你已经验证过：
+```bash
+wc -l models/ieee_l1l2_full/ieee_l1/feature_names.json
+wc -l models/ieee_l2_iter1800/feature_names.json
+# 两边都应一致（例如 433 行 ≈ 432 维 + JSON 结构）
+```
 
 ---
 
-如果你要“最简单一口气跑起来”的版本：  
-先跑第 4 章 server 命令，再跑第 6 章 bench 命令，然后从 `--rps 20000` 开始往上加。
+## 3. TL2CGEN：静态编译到底发生了什么？
+
+### 3.1 你现在是不是“int8 量化”？
+严格说：**不是 XGBoost 的 int8 权重量化**，但 TL2CGEN 生成的 C 代码里确实有 `quantize.c` / `qvalue` 路径：
+
+- 输入还是 `float`
+- 会把 `float` 映射到某个整数 bin（quantized feature value）
+- 树的分裂比较更多走整数/表驱动路径（对分支预测更友好）
+
+你 grep 到的这些就是证据：
+- `crates/risk-core/native/tl2cgen/ieee_l*/quantize.c`
+- `main.c` 里 “Quantize data … data[i].qvalue = quantize(…)”
+
+### 3.2 为什么 TL2CGEN 下不需要 `OMP_NUM_THREADS`？
+因为 **没有 OpenMP 的并行 region**：TL2CGEN 的推理就是纯函数 + CPU 分支/数组访问。  
+`OMP_NUM_THREADS=1` 只对 `xgb_ffi`（动态 `libxgboost.so`）那条链路有意义。
+
+---
+
+## 4. 资源与绑核（WSL2 尤其关键）
+
+### 4.1 `memlock` 与 Glommio io_uring “Cannot allocate memory”
+你看到过类似警告：
+- `registering buffers … Skipping … code: 12 OutOfMemory`
+
+这通常意味着：Glommio 想预注册固定 buffer，但 **RLIMIT_MEMLOCK 不够**（在 WSL2 非常常见）。  
+你现在的最佳实践就是：
+- `prlimit --memlock=unlimited -- <cmd>`
+- 或者减少 executor 数 / 降低并发（当你只想先跑通）
+
+> 注意：这类 warning 很多时候不会让服务挂掉，只是少了“固定 buffer 的加速档”。
+
+### 4.2 绑核建议
+- **server** 和 **bench** 尽量分开物理核（不要共用同一对 SMT 兄弟线程）
+- 如果你不确定拓扑：用 `lscpu -e` 看 `CORE,CPU,SOCKET`
+
+---
+
+## 5. `risk-bench2`：当前 CLI 变化
+
+你遇到过：
+- `error: unexpected argument '--inflight-total' found`
+
+说明当前 `risk-bench2` 已改成精简版（只保留必要参数）。  
+文档里不要再“死记”参数：直接用：
+
+```bash
+target/release/risk-bench2 --help
+```
+
+并以 help 输出为准更新脚本。
+
+---
+
+## 6. 常见坑位速查（你已经踩过的都在这）
+
+### 6.1 sudo 下找不到 cargo / rustup default
+- 不要用 `sudo cargo …`（PATH 和 rustup toolchain 会炸）
+- 推荐：
+  - 先 `cargo build --release`
+  - 然后 `sudo prlimit … taskset … target/release/<bin>`
+
+### 6.2 `libxgboost.so: cannot open shared object file`
+只在 `xgb_ffi` 动态库模式会出现。  
+TL2CGEN 模式下：
+```bash
+ldd target/release/risk-server-glommio | rg -i "xgboost|gomp"
+# 应该是空（你已经验证过）
+```
+
+---
+
+## 7. 如何确认 L2 “真的在跑”？
+
+仅仅看 bench 输出里的 `l2=1us` **不一定说明 L2 跑了**——更可能是“L2 stage 没触发，计时几乎为 0”。
+
+你可以用三种方式确认（按成本从低到高）：
+1. **启动日志**：启动时应该能看到 L2 模型加载（如果代码里有 INFO/WARN）
+2. **构造高风险样本**：让 L1 score 落入 REVIEW 区间，触发 L2
+3. **临时把 L1 policy 调成“全进 L2”**（如果你把阈值文件做成可配）
+
+---
+
+## 8. 附：训练脚本（Polars + Hard Negative Mining，6G 内存友好）
+
+示例（注意参数名已经是 `--hnm-neg-th`，不是 `--l2-keep-neg-th`）：
+```bash
+MALLOC_ARENA_MAX=2 OMP_NUM_THREADS=1 \
+python3 scripts/train_ieee_l1_l2_polars_hardneg.py \
+  --data-dir data/raw/ieee-cis \
+  --out-root models \
+  --valid-frac 0.20 \
+  --sample 0.10 \
+  --nthread 4 \
+  --topk 256 \
+  --max-cat-unique 50000 \
+  --l1-rounds 200 --l1-max-depth 3 --l1-scale-pos-weight 50 \
+  --hnm-neg-th 0.01 \
+  --l2-rounds 3000 --l2-max-depth 7 --l2-scale-pos-weight 5 \
+  --max-bin 256
+```

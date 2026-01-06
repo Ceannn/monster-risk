@@ -2,6 +2,7 @@
 name = "risk-core"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -14,7 +15,9 @@ thiserror = "1"
 anyhow = "1"
 flate2 = "1"
 #xgboost = { package = "xgboostrs", version = "0.2.0" }
-xgb_ffi = { path = "../xgb-ffi" }
+# NOTE: the crate directory is `crates/xgb-ffi`, but its package name is `xgb_ffi`
+# Use `package = "xgb_ffi"` to avoid Cargo package-name mismatch.
+xgb_ffi = { path = "../xgb-ffi", package = "xgb_ffi", optional = true }
 crossbeam-channel = "0.5"
 futures-channel = "0.3"
 core_affinity = "0.8"
@@ -24,3 +27,16 @@ tokio = { version = "1", features = ["sync"] }
 libc = "0.2"
 bytes = "1"
 #xgb-ffi = { path = "../xgb-ffi" }
+
+crossbeam-deque = "0.8"
+crossbeam-utils = "0.8"
+[features]
+default = ["xgb_ffi"]
+xgb_ffi = ["dep:xgb_ffi"]
+native_l1_m2cgen = []
+native_l1_tl2cgen = []
+native_l2_tl2cgen = []
+
+
+[build-dependencies]
+cc = "1"
