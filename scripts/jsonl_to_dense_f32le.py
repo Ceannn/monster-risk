@@ -84,6 +84,14 @@ def main():
         "--jsonl", required=True, help="one-json-object per line; can be plain json too"
     )
     ap.add_argument("--out", required=True)
+    ap.add_argument(
+        "--labels-out",
+        default="",
+        help=(
+            "Optional: write aligned labels as raw u8 (0/1), one byte per row. "
+            "If present in JSONL, uses top-level key 'label' (preferred) or 'isFraud'."
+        ),
+    )
     ap.add_argument("--max", type=int, default=20000)
     args = ap.parse_args()
 
@@ -96,6 +104,11 @@ def main():
     )
 
     n = 0
+    f_lab = None
+    if args.labels_out:
+        os.makedirs(os.path.dirname(args.labels_out) or ".", exist_ok=True)
+        f_lab = open(args.labels_out, "wb")
+
     with open(args.jsonl, "r", encoding="utf-8") as fin, open(args.out, "wb") as fout:
         for line in fin:
             line = line.strip()
@@ -125,11 +138,25 @@ def main():
                 continue
             row = build_row(obj, feature_names, cat_maps)
             fout.write(struct.pack("<" + "f" * dim, *row))
+
+            if f_lab is not None:
+                y = v.get("label", v.get("isFraud", 0))
+                try:
+                    yy = int(y) & 0xFF
+                except Exception:
+                    yy = 0
+                f_lab.write(bytes([yy]))
+
             n += 1
             if n >= args.max:
                 break
 
+    if f_lab is not None:
+        f_lab.close()
+
     print(f"wrote {n} records => {args.out}", file=sys.stderr)
+    if args.labels_out:
+        print(f"wrote {n} labels  => {args.labels_out}", file=sys.stderr)
 
 
 if __name__ == "__main__":

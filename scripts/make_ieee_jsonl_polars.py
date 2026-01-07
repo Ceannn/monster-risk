@@ -49,6 +49,15 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Only for split=train. E.g. 0.2 means 20%% fraud rows in corpus (for L2 trigger debugging).",
     )
+    p.add_argument(
+        "--labels-out",
+        type=str,
+        default="",
+        help=(
+            "Optional: write aligned labels as raw u8 (0/1), one byte per row. "
+            "Only valid for split=train (test split has no isFraud label)."
+        ),
+    )
     p.add_argument("--out", required=True, type=str)
     return p.parse_args()
 
@@ -170,11 +179,56 @@ def main() -> None:
 
     # wrap into {"features": {...}}
     features_struct = pl.struct([pl.col(c) for c in use_cols]).alias("features")
-    lf_jsonl = lf_out.select(features_struct)
+
+    # IMPORTANT: for label-aware calibration we must guarantee that the label file
+    # is aligned with the JSONL row order.
+    #
+    # Polars LazyFrame is optimized independently per execution (sink vs collect),
+    # so "collect labels" and "sink jsonl" can end up with different physical
+    # plans/order. To make alignment deterministic, when --labels-out is enabled
+    # we emit `TransactionID` and `label` into the JSONL itself, then derive the
+    # raw u8 label stream by reading that JSONL file line-by-line.
+    if args.labels_out:
+        if args.split != "train":
+            raise SystemExit(
+                "[FATAL] --labels-out is only supported for --split train (test split has no isFraud label)."
+            )
+        lf_jsonl = lf_out.select(
+            pl.col("TransactionID").cast(pl.UInt32).alias("transaction_id"),
+            pl.col("isFraud").cast(pl.UInt8).alias("label"),
+            features_struct,
+        )
+    else:
+        lf_jsonl = lf_out.select(features_struct)
 
     print(f"[WRITE] {out_path} (ndjson) ...")
     # Polars streaming sink (low memory). If your polars is old, see fallback notes below.
     lf_jsonl.sink_ndjson(out_path)  # streaming by design in modern polars
+
+    # Optional labels output for calibration (train split only)
+    if args.labels_out:
+        labels_path = Path(args.labels_out)
+        labels_path.parent.mkdir(parents=True, exist_ok=True)
+
+        n_lab = 0
+        n_pos = 0
+        with (
+            open(out_path, "r", encoding="utf-8") as fin,
+            open(labels_path, "wb") as fout,
+        ):
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                y = int(obj.get("label", 0)) & 0xFF
+                fout.write(bytes([y]))
+                n_lab += 1
+                n_pos += 1 if y == 1 else 0
+
+        print(
+            f"[LABEL] wrote {n_lab} labels => {labels_path} (pos={n_pos} frac={n_pos / max(1, n_lab):.6f})"
+        )
 
     print("[DONE]")
     print(f"  file={out_path}")

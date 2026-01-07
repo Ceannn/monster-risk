@@ -1,3 +1,4 @@
+use crate::stateful_l2::{DenseStatefulCtx, StatefulL2Augmenter};
 use crate::xgb_pool::{XgbPool, XgbPoolError};
 use crate::xgb_runtime::XgbRuntime;
 use crate::{
@@ -129,6 +130,33 @@ impl L2Control {
 }
 
 #[derive(Clone)]
+pub struct L2ControlView {
+    inner: Arc<L2Control>,
+}
+
+impl L2ControlView {
+    #[inline]
+    pub fn allow_by_rate(&self) -> bool {
+        self.inner.allow_by_rate()
+    }
+
+    #[inline]
+    pub fn max_queue_waterline(&self) -> f64 {
+        self.inner.max_queue_waterline
+    }
+
+    #[inline]
+    pub fn min_remaining_us(&self) -> u64 {
+        self.inner.min_remaining_us
+    }
+
+    #[inline]
+    pub fn queue_wait_budget_us(&self) -> u64 {
+        self.inner.queue_wait_budget_us
+    }
+}
+
+#[derive(Clone)]
 pub struct AppCore {
     pub cfg: Config,
     pub store: Arc<FeatureStore>,
@@ -143,6 +171,11 @@ pub struct AppCore {
 
     /// ✅ L2 专用推理池（隔离更重模型，可选）
     pub xgb_pool_l2: Option<Arc<XgbPool>>,
+
+    /// ✅ L2 stateful 增强器：当 L2 特征维度 > L1（L2 是 L1 前缀 + 额外特征）时启用。
+    ///
+    /// 典型用途：在 L2 阶段加入本地“有状态”特征（velocity / aggregation / graph），让 L2 和 L1 成为两种物种。
+    pub stateful_l2: Option<Arc<StatefulL2Augmenter>>,
 
     // Router-side overload control for L2 triggering (budget / waterline / etc).
     l2_ctrl: Arc<L2Control>,
@@ -160,6 +193,7 @@ impl AppCore {
             xgb_l2: None,
             xgb_pool: None,
             xgb_pool_l2: None,
+            stateful_l2: None,
             l2_ctrl,
         }
     }
@@ -230,6 +264,7 @@ impl AppCore {
             xgb_l2: None,
             xgb_pool,
             xgb_pool_l2: None,
+            stateful_l2: None,
             l2_ctrl,
         })
     }
@@ -399,6 +434,13 @@ impl AppCore {
             xgb_pool2 = Some(Arc::new(pool));
         }
 
+        let stateful_l2 = if let Some(ref x2) = xgb2 {
+            StatefulL2Augmenter::try_new(&cfg, &xgb1.feature_names, &x2.feature_names)?
+                .map(Arc::new)
+        } else {
+            None
+        };
+
         Ok(Self {
             cfg,
             store,
@@ -407,11 +449,19 @@ impl AppCore {
             xgb_l2: xgb2,
             xgb_pool: xgb_pool1,
             xgb_pool_l2: xgb_pool2,
+            stateful_l2,
             l2_ctrl,
         })
     }
 
     /// 启动预热：消掉第一次请求的冷启动尖刺（TLS booster 路径的 warmup）
+
+    pub fn l2_ctrl(&self) -> L2ControlView {
+        L2ControlView {
+            inner: std::sync::Arc::clone(&self.l2_ctrl),
+        }
+    }
+
     pub fn warmup_xgb(&self, iters: usize) -> anyhow::Result<()> {
         let xgb = self.xgb.as_ref().context("xgb not enabled")?;
         let n = xgb.feature_names.len();
@@ -870,8 +920,6 @@ impl AppCore {
 
         let mut timings = TimingsUs::default();
         timings.parse = parse_us;
-        timings.feature = 0;
-        metrics::histogram!("stage_feature_us").record(0.0);
 
         let xgb1 = self
             .xgb
@@ -880,25 +928,37 @@ impl AppCore {
         let pool1 = self.xgb_pool.as_ref().context("xgb_pool not enabled")?;
 
         // 维度校验：避免客户端/模型不匹配时 silent corruption
-        let feature_dim = xgb1.feature_names.len();
-        let expected_len = feature_dim.saturating_mul(4);
+        let l1_dim = xgb1.feature_names.len();
+        let expected_len = l1_dim.saturating_mul(4);
         anyhow::ensure!(
             row_bytes_le.len() == expected_len,
             "dense bytes length mismatch: got={}, expected={} (dim={})",
             row_bytes_le.len(),
             expected_len,
-            feature_dim
+            l1_dim
         );
+
+        // (可选) stateful pre-L1：更新本地 history store，为 L2 构造额外特征做准备
+        let mut stateful_ctx: Option<DenseStatefulCtx> = None;
+        let mut feature_us: u64 = 0;
+        if let Some(aug) = self.stateful_l2.as_ref() {
+            let (ctx, t) = aug.pre_l1(&row_bytes_le);
+            stateful_ctx = Some(ctx);
+            feature_us = feature_us.saturating_add(t.pre_l1_us);
+        }
+
+        // L2 可能需要 payload 的 clone（Bytes clone 是 O(1)）
+        let payload_for_l2 = row_bytes_le.clone();
 
         // L1：score（pool）
         let t_l1_total = Instant::now();
         let rx = pool1
-            .try_submit_dense_bytes_le(row_bytes_le, feature_dim, 0)
+            .try_submit_dense_bytes_le(row_bytes_le, l1_dim, 0)
             .map_err(|e| anyhow::Error::new(e))?;
 
-        let tokio_deadline =
-            tokio::time::Instant::now() + Duration::from_millis(self.cfg.slo_p99_ms);
-        let out1 = match tokio::time::timeout_at(tokio_deadline, rx).await {
+        let out1 = match tokio::time::timeout(Duration::from_millis(self.cfg.slo_p99_ms as u64), rx)
+            .await
+        {
             Ok(Ok(v)) => v?,
             Ok(Err(_)) => anyhow::bail!(XgbPoolError::Canceled),
             Err(_) => anyhow::bail!(XgbPoolError::DeadlineExceeded),
@@ -908,13 +968,17 @@ impl AppCore {
         metrics::histogram!("stage_xgb_us").record(timings.xgb as f64);
 
         let score1 = out1.score;
-        let decision: Decision = decision_from_str(xgb1.decide(score1));
+        let mut score_final = score1;
+        let mut decision: Decision = decision_from_str(xgb1.decide(score1));
 
-        // router：dense-bytes 版本默认不跑 L2（原因同 dense Vec 版本）
+        // router + (optional) L2
         let t_router = Instant::now();
-        if matches!(decision, Decision::ManualReview) && self.xgb_l2.is_some() {
-            metrics::counter!("router_l2_skipped_budget_total").increment(1);
-            metrics::counter!("router_l2_skipped_dense_unsupported_total").increment(1);
+
+        let l2_enabled = self.xgb_l2.is_some() && self.xgb_pool_l2.is_some();
+
+        if matches!(decision, Decision::ManualReview) && l2_enabled {
+            let xgb2 = self.xgb_l2.as_ref().unwrap();
+            let pool2 = self.xgb_pool_l2.as_ref().unwrap();
 
             let now = Instant::now();
             let remaining_us = deadline
@@ -922,16 +986,117 @@ impl AppCore {
                 .unwrap_or_else(|| Duration::from_micros(0))
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
+
+            // 1) deadline / remaining budget
             if remaining_us < self.l2_ctrl.min_remaining_us {
-                metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                if now >= deadline {
+                    metrics::counter!("router_timeout_before_l2_total").increment(1);
+                } else {
+                    metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                }
+            }
+            // 2) per-second budget (rate limiter)
+            else if !self.l2_ctrl.allow_by_rate() {
+                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                metrics::counter!("router_l2_skipped_rate_total").increment(1);
+            }
+            // 3) queue waterline gate
+            else if self.l2_ctrl.max_queue_waterline < 1.0
+                && pool2.stats().queue_waterline() >= self.l2_ctrl.max_queue_waterline
+            {
+                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                metrics::counter!("router_l2_skipped_waterline_total").increment(1);
+            } else {
+                // Build L2 payload only when we really plan to run L2.
+                let mut l2_dim = xgb2.feature_names.len();
+                let payload2: Bytes = if let Some(aug) = self.stateful_l2.as_ref() {
+                    // If stateful augmenter is enabled, L2 must use (L1 + EXTRA) schema.
+                    let ctx = stateful_ctx.as_ref().expect("stateful ctx missing");
+                    let (p2, t2) = aug.build_l2_payload(&payload_for_l2, ctx);
+                    feature_us = feature_us.saturating_add(t2.build_l2_payload_us);
+                    l2_dim = aug.l2_dim();
+                    p2
+                } else {
+                    payload_for_l2.clone()
+                };
+
+                let t_l2_total = Instant::now();
+
+                // Optional queue-wait budget for L2 pool.
+                let mut q_budget_us = self.l2_ctrl.queue_wait_budget_us;
+                if q_budget_us > 0 {
+                    q_budget_us = q_budget_us.min(remaining_us);
+                }
+
+                let rx2 = (if q_budget_us > 0 {
+                    pool2.try_submit_dense_bytes_le_with_budget(payload2, l2_dim, 0, q_budget_us)
+                } else {
+                    pool2.try_submit_dense_bytes_le(payload2, l2_dim, 0)
+                })
+                .map_err(|e| anyhow::Error::new(e));
+
+                match rx2 {
+                    Ok(rx2) => {
+                        // Count as triggered only after we successfully enqueued.
+                        metrics::counter!("router_l2_trigger_total").increment(1);
+
+                        let rem = deadline.saturating_duration_since(Instant::now());
+                        match tokio::time::timeout(rem, rx2).await {
+                            Ok(Ok(inner)) => match inner {
+                                Ok(out2) => {
+                                    timings.l2 = now_us(t_l2_total);
+                                    metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+
+                                    score_final = out2.score;
+                                    decision = decision_from_str(xgb2.decide(out2.score));
+                                }
+                                Err(e) => {
+                                    // If L2 missed its queue-wait budget, degrade to L1 result rather than fail the request.
+                                    if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
+                                        if matches!(pe, XgbPoolError::DeadlineExceeded) {
+                                            timings.l2 = now_us(t_l2_total);
+                                            metrics::histogram!("stage_l2_us")
+                                                .record(timings.l2 as f64);
+                                            metrics::counter!("router_deadline_miss_total")
+                                                .increment(1);
+                                        } else {
+                                            return Err(e);
+                                        }
+                                    } else {
+                                        return Err(e);
+                                    }
+                                }
+                            },
+                            Ok(Err(_)) => {
+                                // oneshot canceled: degrade to L1
+                                metrics::counter!("router_deadline_miss_total").increment(1);
+                            }
+                            Err(_) => {
+                                // timeout: degrade to L1
+                                timings.l2 = now_us(t_l2_total);
+                                metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                                metrics::counter!("router_deadline_miss_total").increment(1);
+                            }
+                        }
+                    }
+                    Err(_submit_err) => {
+                        // Could not enqueue L2; degrade to L1 decision.
+                        metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                    }
+                }
             }
         }
+
+        timings.feature = feature_us;
+        metrics::histogram!("stage_feature_us").record(feature_us as f64);
+
         timings.router = now_us(t_router);
         metrics::histogram!("stage_router_us").record(timings.router as f64);
 
         let mut resp = ScoreResponse {
             trace_id: Uuid::new_v4(),
-            score: score1 as f64,
+            score: score_final as f64,
             decision,
             reason: vec![],
             timings_us: timings,

@@ -327,3 +327,90 @@ ldd target/release/risk-server-glommio | rg -i "xgboost|gomp"
 ## 10. 参考命令（记录可复现）
 
 见 `DEV_GUIDE.md` 的 TL;DR 区：编译、运行、knee 压测命令都已整理。
+
+
+---
+
+## Router / L2 触发控制（新增：比例 Gate）
+
+除了 rate limiter / waterline / deadline 预算外，新增 **比例 gate**（确定性采样）：
+
+- 环境变量：`ROUTER_L2_MAX_TRIGGER_RATIO`（`0.0..=1.0`，默认 `1.0`=不限制）
+- 指标：`router_l2_skipped_ratio_total`（被比例 gate 跳过的次数）
+
+用于论文/实验时做 “L2 只吃 hard cases” 的可控触发分布（非常适合做对照实验：ratio=1.0 vs 0.25 vs 0.125）。
+
+另外：高 RPS 下 histogram 写入有额外开销，可用 `RISK_METRICS_SAMPLE_LOG2` 采样写入 histogram（RSK1 响应 timings 不变）。
+
+---
+
+## 11. Policy 校准产物化：用分位点把 L2/L3 预算“锁死”
+
+> 这一节是“论文装逼专用 + 线上工程极有用”。
+> 我们把“希望 L2 触发多少”从口头目标变成 **policy.json 产物**，做到：
+> - 可复现（同一份 score 分布 → 同一份阈值）
+> - 可审计（policy_calibration.json 记录目标/实际/输入）
+> - 可解释（分位点控制触发率 = 预算控制）
+
+### 9.1 policy.json 在系统里的位置
+
+- 每个 `model_dir` 都可以放一个 `policy.json`：
+  - L1 的 `review_threshold`：进入 L2 的门槛（“二次检查线”）
+  - L1 的 `deny_threshold`：本层直接 deny 的门槛（“当场拦截线”）
+  - L2 同理（将来你加 L3：L2 的 review 就是“进入 L3 的线”）
+
+服务端启动时会打印（你已经看到类似）：
+- `L1 loaded ... thresholds: review=... deny=...`
+- `L2 loaded ... thresholds: review=... deny=...`
+
+### 9.2 为什么用分位点选阈值？
+
+因为“触发率”本质上是概率分布上的面积。
+
+设 score 越大越可疑：
+- 想要本层 deny 大约 `deny_frac` 的样本，就取：`deny_th = Q(1 - deny_frac)`
+- 想要路由到下一层 `route_frac` 的样本，就取：`review_th = Q(1 - (route_frac + deny_frac))`
+
+这样就把 **预算控制** 变成一个数值稳定的计算：
+- `P(score >= deny_th) ≈ deny_frac`
+- `P(review_th <= score < deny_th) ≈ route_frac`
+
+> 类比：你给收费站设置两道线，直接控制“拦多少 / 二查多少”。
+
+### 9.3 工程工作流（离线脚本）
+
+我们提供两步脚本（都在 `scripts/ml/`）：
+
+1) **先离线打分**：dense f32le → scores f32le
+
+```bash
+python3 scripts/ml/score_xgb_dense_f32le.py \
+  --model-dir models/ieee_l1l2_full/ieee_l1 \
+  --dense-file data/bench/ieee_20k.f32 \
+  --dim 432 \
+  --out scores/l1_scores_20k.f32
+```
+
+2) **再校准阈值并写入 policy.json**（产物化）
+
+```bash
+python3 scripts/ml/calibrate_policy_quantiles.py \
+  --model-dir models/ieee_l1l2_full/ieee_l1 \
+  --scores-f32le scores/l1_scores_20k.f32 \
+  --route-frac 0.10 \
+  --deny-frac 0.001 \
+  --layer L1
+```
+
+输出：
+- `model_dir/policy.json`
+- `model_dir/policy_calibration.json`（记录目标/实际/输入/时间戳）
+
+### 9.4 policy.json vs runtime gate（谁负责什么）
+
+- **policy.json**：语义层的“常态分流”，决定 L2/L3 平均要吃多少样本
+- **runtime gate（ROUTER_L2_MAX_TRIGGER_RATIO / PER_SEC / waterline）**：运行时保险丝，防止分布漂移/突发把系统打爆
+
+推荐顺序：
+1) 先用 policy 校准到你希望的 L2/L3 预算
+2) 再用 runtime gate 做兜底（保守一点也没坏处）

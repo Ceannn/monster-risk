@@ -1,5 +1,5 @@
-use clap::Parser;
 use bytes::{Bytes, BytesMut};
+use clap::Parser;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use glommio::net::TcpListener;
 use glommio::sync::{Permit, Semaphore};
@@ -9,19 +9,15 @@ use std::io::Write as _;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use risk_core::{
-    config::Config,
-    pipeline::AppCore,
-    schema::ScoreRequest,
-    util::now_us,
-    xgb_pool::XgbPoolError,
+    config::Config, pipeline::AppCore, schema::ScoreRequest, util::now_us, xgb_pool::XgbPoolError,
 };
 
-use serde_json::{Map, Value};
+use serde_json::{json, Value};
 
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 static TRACE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -73,6 +69,16 @@ fn main() -> anyhow::Result<()> {
     let prom = PrometheusBuilder::new()
         .install_recorder()
         .expect("failed to install prometheus recorder");
+
+    // Pre-register key router metrics so `/metrics | grep router_l2` works even before the first hit.
+    metrics::counter!("router_l2_trigger_total").increment(0);
+    metrics::counter!("router_l2_skipped_budget_total").increment(0);
+    metrics::counter!("router_l2_skipped_deadline_budget_total").increment(0);
+    metrics::counter!("router_l2_skipped_rate_total").increment(0);
+    metrics::counter!("router_l2_skipped_waterline_total").increment(0);
+    metrics::counter!("router_timeout_before_l2_total").increment(0);
+    metrics::counter!("router_deadline_miss_total").increment(0);
+
     let mut cfg = Config::default();
 
     // 与 tokio server 保持一致：允许用环境变量覆盖端到端预算（用于超时/降级/背压）。
@@ -85,7 +91,11 @@ fn main() -> anyhow::Result<()> {
 
     let core = if let Some(dir) = args.model_dir.as_deref() {
         tracing::info!("XGB enabled, loading L1 model_dir={}", dir);
-        Arc::new(AppCore::new_with_xgb_l1_l2(cfg, dir, args.model_l2_dir.as_deref())?)
+        Arc::new(AppCore::new_with_xgb_l1_l2(
+            cfg,
+            dir,
+            args.model_l2_dir.as_deref(),
+        )?)
     } else {
         tracing::info!("XGB disabled, baseline /score only");
         Arc::new(AppCore::new(cfg))
@@ -97,6 +107,32 @@ fn main() -> anyhow::Result<()> {
         in_flight: Arc::new(AtomicUsize::new(0)),
         max_in_flight: args.max_in_flight,
     };
+
+    // ====== Startup: print L1/L2 backend + policy thresholds + schema hash ======
+    if let Some(xgb1) = state.core.xgb.as_ref() {
+        tracing::info!(
+            "L1 loaded: backend={} model_dir={} dim={} schema_hash={} thresholds: review={} deny={}",
+            xgb1.backend_name(),
+            xgb1.model_dir.display(),
+            xgb1.feature_names.len(),
+            xgb1.schema_hash_hex(),
+            xgb1.policy.review_threshold,
+            xgb1.policy.deny_threshold,
+        );
+    }
+    if let Some(xgb2) = state.core.xgb_l2.as_ref() {
+        tracing::info!(
+            "L2 loaded: backend={} model_dir={} dim={} schema_hash={} thresholds: review={} deny={}",
+            xgb2.backend_name(),
+            xgb2.model_dir.display(),
+            xgb2.feature_names.len(),
+            xgb2.schema_hash_hex(),
+            xgb2.policy.review_threshold,
+            xgb2.policy.deny_threshold,
+        );
+    } else if args.model_dir.is_some() {
+        tracing::info!("L2 disabled");
+    }
 
     // ✅ 预热只做一次（避免每个 executor 重复跑）
     if args.model_dir.is_some() && args.warmup_iters > 0 {
@@ -131,7 +167,13 @@ fn main() -> anyhow::Result<()> {
         let h = LocalExecutorBuilder::new(Placement::Unbound)
             .name("risk-glommio-io")
             .spawn(move || async move {
-                run_accept_loop(addr2, st, Rc::new(Semaphore::new(per_core_in_flight2)), true).await
+                run_accept_loop(
+                    addr2,
+                    st,
+                    Rc::new(Semaphore::new(per_core_in_flight2)),
+                    true,
+                )
+                .await
             })
             .unwrap();
         handles.push(h);
@@ -145,7 +187,13 @@ fn main() -> anyhow::Result<()> {
                 .name(&name)
                 .spawn(move || async move {
                     // glommio::net::TcpListener::bind() 会设置 SO_REUSEPORT，允许多 executor 同地址并行 accept。
-                    run_accept_loop(addr2, st, Rc::new(Semaphore::new(per_core_in_flight2)), idx == 0).await
+                    run_accept_loop(
+                        addr2,
+                        st,
+                        Rc::new(Semaphore::new(per_core_in_flight2)),
+                        idx == 0,
+                    )
+                    .await
                 })
                 .unwrap();
             handles.push(h);
@@ -278,14 +326,59 @@ async fn handle_conn(
 
         if meta.method == "GET" && meta.path == "/health" {
             write_http(&mut stream, &mut out, 200, "text/plain", b"ok", keep_alive).await?;
+        } else if meta.method == "GET" && meta.path == "/debug/backend" {
+            // Lightweight introspection for verifying L1/L2 wiring, schema, and thresholds.
+            let l1 = st.core.xgb.as_ref();
+            let l2 = st.core.xgb_l2.as_ref();
 
+            let body = json!({
+                "l1": l1.map(|m| json!({
+                    "backend": m.backend_name(),
+                    "model_dir": m.model_dir.to_string_lossy(),
+                    "feature_dim": m.feature_names.len(),
+                    "schema_hash": m.schema_hash_hex(),
+                    "thresholds": {
+                        "review": m.policy.review_threshold,
+                        "deny": m.policy.deny_threshold,
+                    },
+                })),
+                "l2": l2.map(|m| json!({
+                    "backend": m.backend_name(),
+                    "model_dir": m.model_dir.to_string_lossy(),
+                    "feature_dim": m.feature_names.len(),
+                    "schema_hash": m.schema_hash_hex(),
+                    "thresholds": {
+                        "review": m.policy.review_threshold,
+                        "deny": m.policy.deny_threshold,
+                    },
+                })),
+            });
+            let buf = serde_json::to_vec(&body)?;
+            write_http(
+                &mut stream,
+                &mut out,
+                200,
+                "application/json",
+                &buf,
+                keep_alive,
+            )
+            .await?;
         } else if meta.method == "POST" && meta.path == "/score" {
             let req: ScoreRequest = serde_json::from_slice(body.as_ref())?;
             let resp = st.core.score(req);
             let body = serde_json::to_vec(&resp)?;
-            write_http(&mut stream, &mut out, 200, "application/json", &body, keep_alive).await?;
-
-        } else if meta.method == "POST" && (meta.path == "/score_xgb" || meta.path == "/score_xgb_pool") {
+            write_http(
+                &mut stream,
+                &mut out,
+                200,
+                "application/json",
+                &body,
+                keep_alive,
+            )
+            .await?;
+        } else if meta.method == "POST"
+            && (meta.path == "/score_xgb" || meta.path == "/score_xgb_pool")
+        {
             // ✅ 统一走 pool（避免把 CPU-bound 推理塞进 glommio reactor）
             let t_parse = std::time::Instant::now();
 
@@ -293,7 +386,15 @@ async fn handle_conn(
                 Ok(v) => v,
                 Err(e) => {
                     let msg = format!("invalid json body: {}", e);
-                    write_http(&mut stream, &mut out, 400, "text/plain", msg.as_bytes(), keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        400,
+                        "text/plain",
+                        msg.as_bytes(),
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -309,7 +410,15 @@ async fn handle_conn(
                     }
                 }
                 _ => {
-                    write_http(&mut stream, &mut out, 400, "text/plain", b"expected json object", keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        400,
+                        "text/plain",
+                        b"expected json object",
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -318,7 +427,15 @@ async fn handle_conn(
             let (_g, _p) = match try_acquire_inflight(&st, core_sem.as_ref()) {
                 Some(g) => g,
                 None => {
-                    write_http(&mut stream, &mut out, 429, "text/plain", b"overloaded", keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        429,
+                        "text/plain",
+                        b"overloaded",
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -326,14 +443,29 @@ async fn handle_conn(
             match st.core.score_xgb_pool_async(parse_us, &obj).await {
                 Ok(resp) => {
                     let body = serde_json::to_vec(&resp)?;
-                    write_http(&mut stream, &mut out, 200, "application/json", &body, keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        200,
+                        "application/json",
+                        &body,
+                        keep_alive,
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     let (code, msg) = map_xgb_error(&e);
-                    write_http(&mut stream, &mut out, code, "text/plain", msg.as_bytes(), keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        code,
+                        "text/plain",
+                        msg.as_bytes(),
+                        keep_alive,
+                    )
+                    .await?;
                 }
             }
-
         } else if meta.method == "POST" && meta.path == "/score_dense_f32_bin" {
             // ✅ bench2/bench3 主压测口：dense f32le -> RSK1 (48B)
             let t0 = std::time::Instant::now();
@@ -342,7 +474,15 @@ async fn handle_conn(
             let (_g, _p) = match try_acquire_inflight(&st, core_sem.as_ref()) {
                 Some(g) => g,
                 None => {
-                    write_http(&mut stream, &mut out, 429, "text/plain", b"overloaded", keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        429,
+                        "text/plain",
+                        b"overloaded",
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -351,14 +491,30 @@ async fn handle_conn(
             let xgb = match st.core.xgb.as_ref() {
                 Some(x) => x,
                 None => {
-                    write_http(&mut stream, &mut out, 500, "text/plain", b"xgb not enabled", keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        500,
+                        "text/plain",
+                        b"xgb not enabled",
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
             let pool = match st.core.xgb_pool.as_ref() {
                 Some(p) => p,
                 None => {
-                    write_http(&mut stream, &mut out, 500, "text/plain", b"xgb_pool not enabled", keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        500,
+                        "text/plain",
+                        b"xgb_pool not enabled",
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -370,30 +526,74 @@ async fn handle_conn(
             let payload = match parse_dense_payload_le(&body, dim) {
                 Ok(p) => p,
                 Err(msg) => {
-                    write_http(&mut stream, &mut out, 400, "text/plain", msg.as_bytes(), keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        400,
+                        "text/plain",
+                        msg.as_bytes(),
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
             let parse_us = now_us(t_parse);
 
             // submit to XgbPool (bounded queue => fast fail)
+            // Keep a cheap clone of Bytes so we can optionally reuse the same payload for L2.
+            let payload_for_l2 = payload.clone();
+
+            // Optional: stateful L2 (local feature store). We update the store on EVERY request
+            // so that when we route a request to L2 we can build velocity / aggregation / graph features
+            // in Rust without Redis.
+            let mut feature_us: u64 = 0;
+            let mut stateful_ctx = None;
+            if let Some(aug) = st.core.stateful_l2.as_ref() {
+                let (ctx, t) = aug.pre_l1(&payload_for_l2);
+                feature_us = feature_us.saturating_add(t.pre_l1_us);
+                stateful_ctx = Some(ctx);
+            }
+
+            let budget = std::time::Duration::from_millis(st.core.cfg.slo_p99_ms.max(1));
+            let deadline = t0 + budget;
+
             let t_xgb = std::time::Instant::now();
             let rx = match pool.try_submit_dense_bytes_le(payload, dim, 0) {
                 Ok(rx) => rx,
                 Err(e) => {
                     let (code, msg) = map_xgb_pool_err(&e);
-                    write_http(&mut stream, &mut out, code, "text/plain", msg.as_bytes(), keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        code,
+                        "text/plain",
+                        msg.as_bytes(),
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
 
-            // 与 tokio 版本的“端到端预算”语义对齐：超过 SLO 预算的请求直接 429（快速、可预测），避免 client timeout。
-            let budget = std::time::Duration::from_millis(st.core.cfg.slo_p99_ms.max(1));
-            let rx_res = match glommio::timer::timeout(budget, async { Ok(rx.await) }).await {
+            // 与 tokio 版本的“端到端预算”语义对齐：超过 SLO 预算的请求直接 429（快速、可预测）。
+            let rx_res = match glommio::timer::timeout(budget, async move {
+                Ok::<_, glommio::GlommioError<()>>(rx.await)
+            })
+            .await
+            {
                 Ok(v) => v,
                 Err(_) => {
                     metrics::counter!("xgb_deadline_exceeded_total").increment(1);
-                    write_http(&mut stream, &mut out, 429, "text/plain", b"xgb deadline exceeded", keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        429,
+                        "text/plain",
+                        b"xgb deadline exceeded",
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -402,42 +602,183 @@ async fn handle_conn(
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     let msg = format!("xgb inference failed: {:#}", e);
-                    write_http(&mut stream, &mut out, 500, "text/plain", msg.as_bytes(), keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        500,
+                        "text/plain",
+                        msg.as_bytes(),
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
                 Err(_) => {
-                    write_http(&mut stream, &mut out, 503, "text/plain", b"xgb worker canceled", keep_alive).await?;
+                    write_http(
+                        &mut stream,
+                        &mut out,
+                        503,
+                        "text/plain",
+                        b"xgb canceled",
+                        keep_alive,
+                    )
+                    .await?;
                     continue;
                 }
             };
 
             let xgb_us = now_us(t_xgb);
-            metrics::histogram!("stage_feature_us").record(0.0);
             metrics::histogram!("stage_xgb_us").record(xgb_us as f64);
 
-            // router (decision mapping)
+            let mut l2_us: u64 = 0;
+
+            // router: L1 decision + optional L2
+            let mut score = out1.score;
+            let mut decision_u8 = decision_str_to_u8(xgb.decide(score));
             let t_router = std::time::Instant::now();
-            let decision_u8 = decision_str_to_u8(xgb.decide(out1.score));
-            if decision_u8 == 2 && st.core.xgb_l2.is_some() {
-                // 与 tokio 版本的 dense-bytes 路径保持一致：此端点不触发 L2，统计为“跳过”。
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+
+            // Router: for dense-bytes path we make L2 actually different by optionally appending
+            // stateful features (velocity/aggregation/graph) in Rust.
+            let mut l2_invoked = false;
+
+            if decision_u8 == 2 {
+                if let (Some(xgb2), Some(pool2)) =
+                    (st.core.xgb_l2.as_ref(), st.core.xgb_pool_l2.as_ref())
+                {
+                    let l2_ctrl = st.core.l2_ctrl();
+                    // Budget checks
+                    let now = std::time::Instant::now();
+                    let remaining_us = deadline
+                        .checked_duration_since(now)
+                        .map(|d| d.as_micros() as u64)
+                        .unwrap_or(0);
+
+                    if remaining_us < l2_ctrl.min_remaining_us() {
+                        metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                    } else if !l2_ctrl.allow_by_rate() {
+                        metrics::counter!("router_l2_skipped_rate_total").increment(1);
+                    } else {
+                        let st_waterline = pool2.stats().queue_waterline();
+                        let max_w = l2_ctrl.max_queue_waterline();
+                        if max_w < 1.0 && st_waterline > max_w {
+                            metrics::counter!("router_l2_skipped_waterline_total").increment(1);
+                        } else {
+                            // Optional queue-wait budget for L2 pool.
+                            let q_budget_us = l2_ctrl.queue_wait_budget_us();
+
+                            // Build L2 payload (optionally append stateful features)
+                            let (payload_l2, l2_dim) =
+                                if let Some(aug) = st.core.stateful_l2.as_ref() {
+                                    let ctx = stateful_ctx.as_ref().expect("stateful ctx missing");
+                                    let (p2, t2) = aug.build_l2_payload(&payload_for_l2, ctx);
+                                    feature_us = feature_us.saturating_add(t2.build_l2_payload_us);
+                                    (p2, aug.l2_dim())
+                                } else {
+                                    (payload_for_l2.clone(), xgb2.feature_names.len())
+                                };
+
+                            let t_l2 = std::time::Instant::now();
+                            let submit = if q_budget_us > 0 {
+                                pool2.try_submit_dense_bytes_le_with_budget(
+                                    payload_l2,
+                                    l2_dim,
+                                    0,
+                                    q_budget_us,
+                                )
+                            } else {
+                                pool2.try_submit_dense_bytes_le(payload_l2, l2_dim, 0)
+                            };
+
+                            if let Ok(rx2) = submit {
+                                metrics::counter!("router_l2_trigger_total").increment(1);
+
+                                let rem = deadline
+                                    .checked_duration_since(std::time::Instant::now())
+                                    .unwrap_or(std::time::Duration::from_millis(0));
+
+                                match glommio::timer::timeout::<
+                                    _,
+                                    anyhow::Result<risk_core::xgb_pool::XgbOut>,
+                                >(rem, async move {
+                                    match rx2.await {
+                                        Ok(r) => Ok::<_, glommio::GlommioError<()>>(r),
+                                        Err(_) => Ok(Err(anyhow::anyhow!("l2 oneshot canceled"))),
+                                    }
+                                })
+                                .await
+                                {
+                                    Ok(Ok(out2)) => {
+                                        l2_us = now_us(t_l2);
+                                        score = out2.score;
+                                        decision_u8 = decision_str_to_u8(xgb2.decide(score));
+                                        l2_invoked = true;
+                                    }
+                                    Ok(Err(e)) => {
+                                        l2_us = now_us(t_l2);
+                                        if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
+                                            if matches!(pe, XgbPoolError::DeadlineExceeded) {
+                                                metrics::counter!(
+                                                    "router_l2_skipped_deadline_budget_total"
+                                                )
+                                                .increment(1);
+                                            }
+                                        }
+                                    }
+                                    Err(_timeout) => {
+                                        l2_us = now_us(t_l2);
+                                        metrics::counter!(
+                                            "router_l2_skipped_deadline_budget_total"
+                                        )
+                                        .increment(1);
+                                    }
+                                }
+
+                                metrics::histogram!("stage_l2_us").record(l2_us as f64);
+                            } else {
+                                // L2 pool saturated -> fall back to L1 decision (ManualReview) instead of failing request.
+                                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                                l2_us = 0;
+                                metrics::histogram!("stage_l2_us").record(0.0);
+                            }
+                        }
+                    }
+                }
             }
+
             let router_us = now_us(t_router);
             metrics::histogram!("stage_router_us").record(router_us as f64);
+            metrics::histogram!("stage_feature_us").record(feature_us as f64);
 
             // serialize (RSK1)
             let t_ser = std::time::Instant::now();
             let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
             // NOTE: 序列化耗时本身不能“精确地”写回同一个包（会有轻微递归依赖）。
             // 这里用两步：先用 serialize_us=0 编码，然后把测得的 serialize_us patch 回固定 offset(44..48)。
-            let mut rsk1 = encode_rsk1(trace_id, out1.score, decision_u8, parse_us, 0, router_us, xgb_us, 0, 0);
+            let mut rsk1 = encode_rsk1(
+                trace_id,
+                score,
+                decision_u8,
+                parse_us,
+                feature_us,
+                router_us,
+                xgb_us,
+                l2_us,
+                0,
+            );
             let ser_us = now_us(t_ser);
             patch_rsk1_serialize_us(&mut rsk1, ser_us);
             metrics::histogram!("stage_serialize_us").record(ser_us as f64);
             metrics::histogram!("e2e_us").record(now_us(t0) as f64);
 
-            write_http(&mut stream, &mut out, 200, "application/octet-stream", &rsk1, keep_alive).await?;
-
+            write_http(
+                &mut stream,
+                &mut out,
+                200,
+                "application/octet-stream",
+                &rsk1,
+                keep_alive,
+            )
+            .await?;
         } else if meta.method == "GET" && meta.path == "/metrics" {
             let text = st.prom.render();
             write_http(
@@ -450,7 +791,15 @@ async fn handle_conn(
             )
             .await?;
         } else {
-            write_http(&mut stream, &mut out, 404, "text/plain", b"not found", keep_alive).await?;
+            write_http(
+                &mut stream,
+                &mut out,
+                404,
+                "text/plain",
+                b"not found",
+                keep_alive,
+            )
+            .await?;
         }
 
         if meta.want_close {
@@ -469,7 +818,10 @@ impl Drop for InFlightGuard {
     }
 }
 
-fn try_acquire_inflight<'a>(st: &AppState, core_sem: &'a Semaphore) -> Option<(InFlightGuard, Permit<'a>)> {
+fn try_acquire_inflight<'a>(
+    st: &AppState,
+    core_sem: &'a Semaphore,
+) -> Option<(InFlightGuard, Permit<'a>)> {
     // 先拿全局 token，再拿本核 token；本核拿不到就回滚全局。
     let cur = st.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
     if st.max_in_flight > 0 && cur > st.max_in_flight {
@@ -547,11 +899,7 @@ fn get_self_affinity_cpus() -> anyhow::Result<Vec<usize>> {
     {
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
-            let rc = libc::sched_getaffinity(
-                0,
-                std::mem::size_of::<libc::cpu_set_t>(),
-                &mut set,
-            );
+            let rc = libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
             if rc != 0 {
                 return Err(anyhow::anyhow!(std::io::Error::last_os_error()));
             }
@@ -629,7 +977,10 @@ fn parse_dense_payload_le(body: &Bytes, expected_dim: usize) -> Result<Bytes, St
     }
     let dim = u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as usize;
     if dim != expected_dim {
-        return Err(format!("RVEC dim mismatch: got {}, expected {}", dim, expected_dim));
+        return Err(format!(
+            "RVEC dim mismatch: got {}, expected {}",
+            dim, expected_dim
+        ));
     }
     Ok(body.slice(16..))
 }
@@ -733,7 +1084,9 @@ fn parse_request_head(head: &str) -> ReqMeta {
             .strip_prefix("Transfer-Encoding:")
             .or_else(|| line.strip_prefix("transfer-encoding:"))
         {
-            if v.split(',').any(|t| t.trim().eq_ignore_ascii_case("chunked")) {
+            if v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+            {
                 chunked = true;
             }
         }

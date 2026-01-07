@@ -32,7 +32,10 @@ use crossbeam_utils::Backoff;
 #[cfg(all(not(feature = "xgb_ffi"), not(feature = "native_l1_tl2cgen")))]
 compile_error!("risk-core: enable feature `xgb_ffi` or `native_l1_tl2cgen` to build xgb_pool");
 
-use tokio::sync::oneshot;
+// NOTE: runtime-agnostic oneshot.
+// - Tokio server can still await it directly.
+// - Glommio server can await it without pulling in Tokio sync internals.
+use futures_channel::oneshot;
 
 #[cfg(feature = "xgb_ffi")]
 use xgb_ffi::Booster;
@@ -221,7 +224,10 @@ impl XgbPool {
         let live_workers = Arc::new(AtomicUsize::new(n_workers));
 
         for wid in 0..n_workers {
+            #[cfg(feature = "xgb_ffi")]
             let model_path = Arc::clone(&model_path);
+            #[cfg(not(feature = "xgb_ffi"))]
+            let _model_path = Arc::clone(&model_path);
             let feature_names = Arc::clone(&feature_names);
             let cpu = pin_cpus.get(wid).copied();
             let warmup_iters = warmup_iters;
@@ -746,6 +752,58 @@ impl XgbPool {
 
         Ok(resp_rx)
     }
+
+    /// Non-blocking submission for dense bytes payload (f32 little-endian) with a queue-wait budget (microseconds).
+    ///
+    /// - `budget_us = 0` disables the budget (falls back to `try_submit_dense_bytes_le`).
+    /// - The effective queue-wait deadline is the minimum of:
+    ///   - pool-level `early_reject_pred_wait_us` (if > 0)
+    ///   - per-call `budget_us` (if > 0)
+    pub fn try_submit_dense_bytes_le_with_budget(
+        &self,
+        bytes: Bytes,
+        ncols: usize,
+        contrib_topk: usize,
+        budget_us: u64,
+    ) -> Result<oneshot::Receiver<anyhow::Result<XgbOut>>, XgbPoolError> {
+        if budget_us == 0 {
+            return self.try_submit_dense_bytes_le(bytes, ncols, contrib_topk);
+        }
+
+        // Validate shape early to avoid silent corruption.
+        let need = ncols.checked_mul(4).ok_or(XgbPoolError::QueueFull)?;
+        if bytes.len() != need {
+            // Treat as bad request upstream; here we surface it as QueueFull to keep API stable.
+            return Err(XgbPoolError::QueueFull);
+        }
+
+        self.admission_control()?;
+
+        let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
+        let enq_at = Instant::now();
+
+        // Per-call budget + pool-level early-reject => pick the tighter deadline.
+        let mut eff_us = budget_us;
+        if self.early_reject_pred_wait_us > 0 {
+            eff_us = eff_us.min(self.early_reject_pred_wait_us);
+        }
+        let deadline_at = Some(enq_at + Duration::from_micros(eff_us));
+
+        let job = XgbJob {
+            enq_at,
+            deadline_at,
+            row: XgbRow::DenseBytesLe { bytes, ncols },
+            contrib_topk,
+            resp_tx,
+        };
+
+        let sid = pick_shard(&self.io_cpu_to_shard, self.shards.len());
+        self.shards[sid].push(job);
+
+        Ok(resp_rx)
+    }
+
+
 
     /// Convenience async wrapper.
     pub async fn submit_dense_bytes_le(

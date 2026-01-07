@@ -34,6 +34,30 @@ fn looks_like_l2_path(p: &Path) -> bool {
     s.contains("l2")
 }
 
+/// Stable, deterministic schema hash over feature names **with order**.
+///
+/// Motivation:
+/// - XGBoost/TL2CGEN is extremely sensitive to feature order.
+/// - Rust's default Hash/SipHash is randomized per process; we need a stable hash.
+///
+/// We use FNV-1a 64-bit here (small, fast, dependency-free).
+fn schema_hash_fnv1a64(names: &[String]) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+
+    let mut h = FNV_OFFSET;
+    for n in names {
+        for &b in n.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // Add an unambiguous delimiter so "ab"+"c" != "a"+"bc".
+        h ^= 0xFF;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
 fn select_model_file(dir: &Path) -> Option<PathBuf> {
     let p0 = dir.join("xgb_model.json");
     if p0.exists() {
@@ -59,7 +83,8 @@ fn select_model_file(dir: &Path) -> Option<PathBuf> {
         }
     }
     cands.sort_by_key(|(it, _)| *it);
-    cands.first().map(|(_, p)| p.clone())
+    // Prefer the newest iteration if multiple snapshots exist.
+    cands.last().map(|(_, p)| p.clone())
 }
 
 fn load_feature_names(dir: &Path) -> Result<Vec<String>> {
@@ -127,6 +152,8 @@ pub struct XgbRuntime {
     pub feature_names: Vec<String>,
     pub cat_maps: HashMap<String, HashMap<String, u32>>,
     pub policy: Policy,
+    /// Stable schema hash of `feature_names` (order-sensitive).
+    pub schema_hash: u64,
     is_l2: bool,
 
     #[cfg(feature = "xgb_ffi")]
@@ -135,16 +162,46 @@ pub struct XgbRuntime {
 
 impl XgbRuntime {
     pub fn load_from_dir(dir: &Path) -> Result<Self> {
+        Self::load_from_dir_with_is_l2(dir, looks_like_l2_path(dir))
+    }
+
+    /// Force-load a model as L1 (stage=1).
+    ///
+    /// Use this in server startup to avoid relying on directory-name heuristics.
+    pub fn load_from_dir_l1(dir: &Path) -> Result<Self> {
+        Self::load_from_dir_with_is_l2(dir, false)
+    }
+
+    /// Force-load a model as L2 (stage=2).
+    ///
+    /// Use this in server startup to avoid relying on directory-name heuristics.
+    pub fn load_from_dir_l2(dir: &Path) -> Result<Self> {
+        Self::load_from_dir_with_is_l2(dir, true)
+    }
+
+    /// Load a model directory with an explicit stage flag.
+    ///
+    /// Why this exists:
+    /// - With TL2CGEN, L1/L2 are compiled into the binary as different symbols.
+    /// - If we mis-detect L2 (e.g. directory name doesn't contain "l2"), we could
+    ///   silently call the wrong predictor. This is a catastrophic "silent failure".
+    pub fn load_from_dir_with_is_l2(dir: &Path, is_l2: bool) -> Result<Self> {
         let model_dir = dir.to_path_buf();
-        let is_l2 = looks_like_l2_path(dir);
 
         let feature_names = load_feature_names(dir)?;
+        anyhow::ensure!(
+            !feature_names.is_empty(),
+            "empty feature schema in model_dir={}",
+            dir.display()
+        );
+        let schema_hash = schema_hash_fnv1a64(&feature_names);
         let cat_maps = load_cat_maps(dir)?;
         let policy = load_policy(dir)?;
 
         // xgb_model.json 在 TL2CGEN 静态推理模式下不一定“必须”，但保留路径用于日志/兼容。
         let model_path = select_model_file(dir).unwrap_or_else(|| dir.join("xgb_model.json"));
 
+        // In native TL2CGEN mode, model file may not exist. In xgb_ffi mode, it must.
         #[cfg(feature = "xgb_ffi")]
         {
             if !model_path.exists() {
@@ -155,12 +212,43 @@ impl XgbRuntime {
             }
             let booster = Booster::from_file(&model_path)
                 .with_context(|| format!("load xgboost model: {}", model_path.display()))?;
+
+            // Schema hardening for TL2CGEN builds: verify the compiled predictor expects
+            // exactly the same feature dimension as the runtime schema.
+            #[cfg(feature = "native_l1_tl2cgen")]
+            {
+                if !is_l2 {
+                    let want = native_l1_tl2cgen::num_feature();
+                    anyhow::ensure!(
+                        want == feature_names.len(),
+                        "schema dim mismatch for L1: feature_names.len={} but tl2cgen num_feature={} (model_dir={})",
+                        feature_names.len(),
+                        want,
+                        dir.display()
+                    );
+                }
+            }
+            #[cfg(feature = "native_l2_tl2cgen")]
+            {
+                if is_l2 {
+                    let want = native_l2_tl2cgen::num_feature();
+                    anyhow::ensure!(
+                        want == feature_names.len(),
+                        "schema dim mismatch for L2: feature_names.len={} but tl2cgen num_feature={} (model_dir={})",
+                        feature_names.len(),
+                        want,
+                        dir.display()
+                    );
+                }
+            }
+
             Ok(Self {
                 model_dir,
                 model_path,
                 feature_names,
                 cat_maps,
                 policy,
+                schema_hash,
                 is_l2,
                 booster,
             })
@@ -168,12 +256,53 @@ impl XgbRuntime {
 
         #[cfg(not(feature = "xgb_ffi"))]
         {
+            // Schema hardening for TL2CGEN builds: verify dim matches compiled predictor.
+            #[cfg(feature = "native_l1_tl2cgen")]
+            {
+                if !is_l2 {
+                    let want = native_l1_tl2cgen::num_feature();
+                    anyhow::ensure!(
+                        want == feature_names.len(),
+                        "schema dim mismatch for L1: feature_names.len={} but tl2cgen num_feature={} (model_dir={})",
+                        feature_names.len(),
+                        want,
+                        dir.display()
+                    );
+                }
+            }
+            #[cfg(feature = "native_l2_tl2cgen")]
+            {
+                if is_l2 {
+                    let want = native_l2_tl2cgen::num_feature();
+                    anyhow::ensure!(
+                        want == feature_names.len(),
+                        "schema dim mismatch for L2: feature_names.len={} but tl2cgen num_feature={} (model_dir={})",
+                        feature_names.len(),
+                        want,
+                        dir.display()
+                    );
+                }
+            }
+
+            // If the user explicitly marks this runtime as L2, but we did not compile
+            // any L2 predictor backend, fail fast at startup.
+            #[cfg(all(not(feature = "native_l2_tl2cgen"), not(feature = "xgb_ffi")))]
+            {
+                if is_l2 {
+                    return Err(anyhow!(
+                        "L2 requested (model_dir={}) but no L2 backend is enabled: enable feature native_l2_tl2cgen or xgb_ffi",
+                        dir.display()
+                    ));
+                }
+            }
+
             Ok(Self {
                 model_dir,
                 model_path,
                 feature_names,
                 cat_maps,
                 policy,
+                schema_hash,
                 is_l2,
             })
         }
@@ -182,6 +311,58 @@ impl XgbRuntime {
     #[inline]
     pub fn is_l2(&self) -> bool {
         self.is_l2
+    }
+
+    /// Human-readable predictor backend name for debugging.
+    ///
+    /// Note: this is compile-feature dependent.
+
+    #[inline]
+    pub fn backend_name(&self) -> &'static str {
+        if self.is_l2 {
+            Self::backend_name_l2()
+        } else {
+            Self::backend_name_l1()
+        }
+    }
+
+    // Keep these helpers fully cfg-selected to avoid unreachable-code warnings.
+    #[cfg(feature = "native_l1_tl2cgen")]
+    #[inline]
+    fn backend_name_l1() -> &'static str {
+        "native_tl2cgen"
+    }
+    #[cfg(all(not(feature = "native_l1_tl2cgen"), feature = "xgb_ffi"))]
+    #[inline]
+    fn backend_name_l1() -> &'static str {
+        "xgb_ffi"
+    }
+    #[cfg(all(not(feature = "native_l1_tl2cgen"), not(feature = "xgb_ffi")))]
+    #[inline]
+    fn backend_name_l1() -> &'static str {
+        "disabled"
+    }
+
+    #[cfg(feature = "native_l2_tl2cgen")]
+    #[inline]
+    fn backend_name_l2() -> &'static str {
+        "native_tl2cgen"
+    }
+    #[cfg(all(not(feature = "native_l2_tl2cgen"), feature = "xgb_ffi"))]
+    #[inline]
+    fn backend_name_l2() -> &'static str {
+        "xgb_ffi"
+    }
+    #[cfg(all(not(feature = "native_l2_tl2cgen"), not(feature = "xgb_ffi")))]
+    #[inline]
+    fn backend_name_l2() -> &'static str {
+        "disabled"
+    }
+
+    /// Schema hash in hex (zero-padded 16 chars).
+    #[inline]
+    pub fn schema_hash_hex(&self) -> String {
+        format!("{:016x}", self.schema_hash)
     }
 
     #[inline]
@@ -267,16 +448,38 @@ impl XgbRuntime {
                 .ok_or_else(|| anyhow!("xgb_ffi predict returned empty"))
         }
 
-        #[cfg(not(feature = "xgb_ffi"))]
+        #[cfg(all(
+            not(feature = "xgb_ffi"),
+            not(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))
+        ))]
         {
             Err(anyhow!(
                 "no predictor backend enabled: build with native_*_tl2cgen and/or xgb_ffi"
+            ))
+        }
+
+        #[cfg(all(
+            not(feature = "xgb_ffi"),
+            any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen")
+        ))]
+        {
+            Err(anyhow!(
+                "predictor backend missing for role: is_l2={} (native feature not enabled for this role)",
+                self.is_l2
             ))
         }
     }
 
     /// 预测概率：输入为小端 f32 的 bytes（常见于 /score_dense_f32_bin 这种二进制接口）
     pub fn predict_proba_dense_bytes_le(&self, bytes: &[u8], ncols: usize) -> Result<f32> {
+        if bytes.len() != ncols * 4 {
+            return Err(anyhow!(
+                "dense bytes len mismatch: got={} expect={}",
+                bytes.len(),
+                ncols * 4
+            ));
+        }
+
         #[cfg(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))]
         {
             if self.is_l2 {
@@ -304,13 +507,6 @@ impl XgbRuntime {
         }
 
         // fallback：解码 bytes -> row -> predict
-        if bytes.len() != ncols * 4 {
-            return Err(anyhow!(
-                "dense bytes len mismatch: got={} expect={}",
-                bytes.len(),
-                ncols * 4
-            ));
-        }
         let mut row = vec![0f32; ncols];
         for i in 0..ncols {
             let b = &bytes[i * 4..i * 4 + 4];

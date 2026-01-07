@@ -97,6 +97,40 @@ async fn metrics(State(st): State<AppState>) -> String {
     st.prom.render()
 }
 
+async fn debug_backend(State(st): State<AppState>) -> Response {
+    let l1 = st.core.xgb.as_ref();
+    let l2 = st.core.xgb_l2.as_ref();
+    let aug = st.core.stateful_l2.as_ref();
+
+    let body = serde_json::json!({
+        "l1": l1.map(|m| serde_json::json!({
+            "backend": m.backend_name(),
+            "model_dir": m.model_dir.to_string_lossy(),
+            "feature_dim": m.feature_names.len(),
+            "schema_hash": m.schema_hash_hex(),
+            "thresholds": {
+                "review": m.policy.review_threshold,
+                "deny": m.policy.deny_threshold,
+            },
+        })),
+        "l2": l2.map(|m| serde_json::json!({
+            "backend": m.backend_name(),
+            "model_dir": m.model_dir.to_string_lossy(),
+            "feature_dim": m.feature_names.len(),
+            "schema_hash": m.schema_hash_hex(),
+            "thresholds": {
+                "review": m.policy.review_threshold,
+                "deny": m.policy.deny_threshold,
+            },
+        })),
+        "stateful_l2": aug.map(|_| serde_json::json!({
+            "enabled": true,
+        })).unwrap_or(serde_json::json!({"enabled": false})),
+    });
+
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 /// Full pipeline endpoint (if you still want it).
 /// NOTE: risk-core 的 score() 在你项目里是同步的，所以这里不 await。
 async fn score(State(st): State<AppState>, Json(req): Json<ScoreRequest>) -> Json<ScoreResponse> {
@@ -447,6 +481,7 @@ async fn async_main(
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/debug/backend", get(debug_backend))
         .route("/score", post(score))
         .route("/score_xgb", post(score_xgb))
         .route("/score_xgb_pool", post(score_xgb_pool))
