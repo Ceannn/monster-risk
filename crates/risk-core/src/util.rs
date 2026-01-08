@@ -19,3 +19,13 @@ pub fn sigmoid(x: f64) -> f64 {
 pub fn clamp01(x: f64) -> f64 {
     if x < 0.0 { 0.0 } else if x > 1.0 { 1.0 } else { x }
 }
+
+#[inline]
+pub fn mix_u64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    x
+}

@@ -94,7 +94,9 @@ target/release/risk-bench2 \
 | 后端 | 依赖 | 线程模型 | 适用 |
 |---|---|---|---|
 | `native_*_tl2cgen` | **静态链接**（C 代码编进二进制） | 建议走 XgbPool（隔离 CPU） | 线上/压测默认 |
-| `xgb_ffi` | `libxgboost.so` 动态库 + 可能的 OpenMP | 必须谨慎限制线程数 | 兼容/对照实验 |
+| `xgb_ffi` | `libxgboost.so` 动态库 + 可能的 OpenMP | 必须谨慎限制线程数 | **DEPRECATED**：仅对照实验 |
+
+> 注：`xgb_ffi` 已 deprecated，默认构建不再启用。
 
 ---
 
@@ -322,8 +324,15 @@ python3 scripts/ml/sweep_scalar_frontier.py \
 - `ROUTER_L2_MAX_TRIGGER_RATIO`：按比例触发 L2（`0.0..=1.0`，默认 `1.0`=不限制）。  
   - 实现是 **确定性采样**（不会引入 RNG），并新增指标：`router_l2_skipped_ratio_total`  
 - `ROUTER_L2_MAX_QUEUE_WATERLINE`：L2 队列水位阈值（`1.0`=不限制）。  
+- `ROUTER_L2_SAMPLE_RATIO` / `ROUTER_L2_SAMPLE_PPM`：L2 采样基线（默认 0.30 / 300000ppm）。  
+- `ROUTER_L2_SAMPLE_MIN_RATIO`：动态反馈下的最小采样率（默认 base*0.1）。  
+- `ROUTER_L2_DYN_ENABLE`：是否启用动态反馈（`1`=开启，`0`=关闭）。  
+- `ROUTER_L2_WATERLINE_TARGET` / `HI` / `LO`：反馈目标与上下阈值（默认 0.60 / 0.85 / 0.40）。  
 - `ROUTER_L2_MIN_REMAINING_US`：离截止时间不足该值则跳过 L2。  
 - `ROUTER_L2_QUEUE_WAIT_BUDGET_US`：传给 L2 pool 的 queue-wait budget（`0`=不启用）。
+
+路由 gate 顺序：**deadline → rate → sample → waterline → submit**。  
+新增指标：`router_l2_skipped_sample_total` / `router_l2_sample_ratio` / `router_l2_feedback_overload_total` / `router_l2_feedback_relax_total`。
 
 ### 8.2 Metrics 采样（环境变量）
 高 RPS 下 `metrics::histogram!` 记录本身有原子开销；我们保持 **RSK1 响应里 timings 不变**，但允许采样写入 histogram。
@@ -331,6 +340,12 @@ python3 scripts/ml/sweep_scalar_frontier.py \
 - `RISK_METRICS_SAMPLE_LOG2`：  
   - `0`（默认）= 每个请求都 record  
   - `N>0` = 只 record `1/2^N` 的请求（确定性采样，低开销）
+
+### 8.3 Stateful Store / L2 Payload
+- `FEATURE_STORE_SHARDS`：stateful store 分片数（默认 `next_pow2(2 * cpu)`），影响 `FeatureStoreU64` 和 graph store。  
+- store 相关指标：`feature_store_shard_lock_us` / `feature_store_evicted_total` / `feature_store_keys_total`。  
+- L2 payload 相关指标：`l2_payload_extra_build_us` / `l2_payload_extra_dim` / `l2_payload_decode_fallback_total`。  
+- L2 extra 不再在 IO 线程拼接 bytes；由 L2 worker 使用 scratch 复用构造。
 
 
 ---

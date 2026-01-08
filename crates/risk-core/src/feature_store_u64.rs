@@ -1,5 +1,9 @@
-use dashmap::DashMap;
+use crate::util::mix_u64;
+use hashbrown::HashMap;
+use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 /// 100ms 分桶的滑窗特征存储（u64 key 版本）
 ///
@@ -13,11 +17,30 @@ use std::collections::VecDeque;
 /// - 但窗口内桶数更多（300s → 3000 桶）
 /// - 为避免每个用户预分配 3000 桶导致内存炸裂，这里使用 **稀疏 VecDeque**：
 ///   只为出现过交易的 bucket 分配节点。低频用户非常省内存。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FeatureStoreU64 {
-    users: DashMap<u64, UserState>,
+    shards: Vec<Mutex<HashMap<u64, UserState>>>,
+    shard_mask: usize,
     win_60s: i64,
     win_300s: i64,
+    keys_total: AtomicU64,
+}
+
+impl Clone for FeatureStoreU64 {
+    fn clone(&self) -> Self {
+        let mut shards = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            let map = shard.lock();
+            shards.push(Mutex::new(map.clone()));
+        }
+        Self {
+            shards,
+            shard_mask: self.shard_mask,
+            win_60s: self.win_60s,
+            win_300s: self.win_300s,
+            keys_total: AtomicU64::new(self.keys_total.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -42,6 +65,7 @@ const OOO_TOL_MS: i64 = 2_000;
 
 /// 防御：event_time 被恶意拉到未来导致状态膨胀（可按需调整）
 const MAX_FUTURE_SKEW_MS: i64 = 60_000;
+const MAX_BUCKETS: usize = 4096;
 
 #[derive(Debug, Clone, Default)]
 pub struct StoreFeatures {
@@ -56,10 +80,26 @@ pub struct StoreFeatures {
 
 impl FeatureStoreU64 {
     pub fn new(win_60s: u64, win_300s: u64) -> Self {
+        let avail = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let default_shards = avail.saturating_mul(2).max(1);
+        let shard_hint = std::env::var("FEATURE_STORE_SHARDS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(default_shards);
+        let shard_count = shard_hint.max(1).next_power_of_two();
+
+        let mut shards = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            shards.push(Mutex::new(HashMap::new()));
+        }
         Self {
-            users: DashMap::new(),
+            shards,
+            shard_mask: shard_count - 1,
             win_60s: (win_60s as i64) * 1000,
             win_300s: (win_300s as i64) * 1000,
+            keys_total: AtomicU64::new(0),
         }
     }
 
@@ -73,10 +113,13 @@ impl FeatureStoreU64 {
         (self.win_300s / BUCKET_MS).max(1)
     }
 
+    #[inline]
+    fn shard_idx(&self, key: u64) -> usize {
+        (mix_u64(key) as usize) & self.shard_mask
+    }
+
     /// 核心：先 query 再 update，保证“这笔交易的特征不包含它自己”。
     pub fn query_then_update(&self, key: u64, event_time_ms: i64, amount: f64) -> StoreFeatures {
-        let mut entry = self.users.entry(key).or_default();
-
         // --- 基本防御：避免 event_time 过于离谱（未来太多会导致窗口推进大量空桶）
         let now_ms = current_time_ms();
         let mut t_ms = event_time_ms;
@@ -85,6 +128,21 @@ impl FeatureStoreU64 {
         }
 
         let event_bucket = t_ms.div_euclid(BUCKET_MS);
+
+        let shard_idx = self.shard_idx(key);
+        let t_lock = Instant::now();
+        let mut shard = self.shards[shard_idx].lock();
+        let lock_us = t_lock.elapsed().as_micros() as u64;
+        metrics::histogram!("feature_store_shard_lock_us").record(lock_us as f64);
+
+        let entry = match shard.entry(key) {
+            hashbrown::hash_map::Entry::Occupied(v) => v.into_mut(),
+            hashbrown::hash_map::Entry::Vacant(v) => {
+                let n = self.keys_total.fetch_add(1, Ordering::Relaxed) + 1;
+                metrics::gauge!("feature_store_keys_total").set(n as f64);
+                v.insert(UserState::default())
+            }
+        };
 
         // --- 乱序判定
         let mut oo_flag = 0.0;
@@ -112,10 +170,10 @@ impl FeatureStoreU64 {
         }
 
         // --- 过期清理：基于 max_bucket_seen（而不是 event_bucket）
-        self.expire_old(&mut entry);
+        let mut evicted = self.expire_old(entry);
 
         // --- query：以 event_bucket 为“点时”，只统计 <= event_bucket 的桶
-        let (cnt_60, sum_60, cnt_300, sum_300) = self.query_windows(&entry, event_bucket);
+        let (cnt_60, sum_60, cnt_300, sum_300) = self.query_windows(entry, event_bucket);
 
         let features = StoreFeatures {
             velocity_60s: cnt_60 as f64,
@@ -128,12 +186,16 @@ impl FeatureStoreU64 {
 
         // --- update：严重乱序就不写入（否则相当于“回填历史”，会让状态不一致）
         if !severe_oo {
-            self.upsert_bucket(&mut entry, event_bucket, amount);
+            evicted = evicted.saturating_add(self.upsert_bucket(entry, event_bucket, amount));
         }
 
         // last_event_time_ms 只做单调推进（保证正常流量下 inter-arrival 合理）
         if t_ms > entry.last_event_time_ms {
             entry.last_event_time_ms = t_ms;
+        }
+
+        if evicted > 0 {
+            metrics::counter!("feature_store_evicted_total").increment(evicted as u64);
         }
 
         features
@@ -169,20 +231,23 @@ impl FeatureStoreU64 {
         (c60, s60, c300, s300)
     }
 
-    fn expire_old(&self, st: &mut UserState) {
+    fn expire_old(&self, st: &mut UserState) -> usize {
         let w300 = self.win_buckets_300();
         let min_keep = st.max_bucket_seen - w300 + 1;
 
+        let mut evicted = 0usize;
         while let Some(front) = st.buckets.front() {
             if front.bucket_id < min_keep {
                 st.buckets.pop_front();
+                evicted += 1;
             } else {
                 break;
             }
         }
+        evicted
     }
 
-    fn upsert_bucket(&self, st: &mut UserState, bucket_id: i64, amount: f64) {
+    fn upsert_bucket(&self, st: &mut UserState, bucket_id: i64, amount: f64) -> usize {
         // 空：直接 push
         if st.buckets.is_empty() {
             st.buckets.push_back(Bucket {
@@ -190,48 +255,50 @@ impl FeatureStoreU64 {
                 cnt: 1,
                 sum: amount,
             });
-            return;
-        }
-
-        // 快路径：落在末尾（最常见）
-        if let Some(last) = st.buckets.back_mut() {
+        } else if let Some(last) = st.buckets.back_mut() {
+            // 快路径：落在末尾（最常见）
             if last.bucket_id == bucket_id {
                 last.cnt = last.cnt.saturating_add(1);
                 last.sum += amount;
-                return;
             } else if last.bucket_id < bucket_id {
                 st.buckets.push_back(Bucket {
                     bucket_id,
                     cnt: 1,
                     sum: amount,
                 });
-                return;
+            } else {
+                // 慢路径：小乱序，插入/更新中间桶
+                let search = {
+                    let slice = st.buckets.make_contiguous();
+                    slice.binary_search_by_key(&bucket_id, |b| b.bucket_id)
+                };
+
+                match search {
+                    Ok(i) => {
+                        let b = &mut st.buckets[i];
+                        b.cnt = b.cnt.saturating_add(1);
+                        b.sum += amount;
+                    }
+                    Err(i) => {
+                        st.buckets.insert(
+                            i,
+                            Bucket {
+                                bucket_id,
+                                cnt: 1,
+                                sum: amount,
+                            },
+                        );
+                    }
+                }
             }
         }
 
-        // 慢路径：小乱序，插入/更新中间桶
-        let search = {
-            let slice = st.buckets.make_contiguous();
-            slice.binary_search_by_key(&bucket_id, |b| b.bucket_id)
-        };
-
-        match search {
-            Ok(i) => {
-                let b = &mut st.buckets[i];
-                b.cnt = b.cnt.saturating_add(1);
-                b.sum += amount;
-            }
-            Err(i) => {
-                st.buckets.insert(
-                    i,
-                    Bucket {
-                        bucket_id,
-                        cnt: 1,
-                        sum: amount,
-                    },
-                );
-            }
+        let mut evicted = 0usize;
+        while st.buckets.len() > MAX_BUCKETS {
+            st.buckets.pop_front();
+            evicted += 1;
         }
+        evicted
     }
 }
 

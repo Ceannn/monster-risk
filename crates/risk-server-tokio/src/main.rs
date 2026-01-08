@@ -101,6 +101,7 @@ async fn debug_backend(State(st): State<AppState>) -> Response {
     let l1 = st.core.xgb.as_ref();
     let l2 = st.core.xgb_l2.as_ref();
     let aug = st.core.stateful_l2.as_ref();
+    let l2_ctrl = st.core.l2_ctrl();
 
     let body = serde_json::json!({
         "l1": l1.map(|m| serde_json::json!({
@@ -126,6 +127,14 @@ async fn debug_backend(State(st): State<AppState>) -> Response {
         "stateful_l2": aug.map(|_| serde_json::json!({
             "enabled": true,
         })).unwrap_or(serde_json::json!({"enabled": false})),
+        "router_l2": {
+            "sample_ratio": l2_ctrl.sample_ratio(),
+            "sample_base_ratio": l2_ctrl.sample_base_ratio(),
+            "sample_dyn_ratio": l2_ctrl.sample_dyn_ratio(),
+            "waterline_target": l2_ctrl.sample_waterline_target(),
+            "waterline_hi": l2_ctrl.sample_waterline_hi(),
+            "waterline_lo": l2_ctrl.sample_waterline_lo(),
+        },
     });
 
     (StatusCode::OK, Json(body)).into_response()
@@ -463,6 +472,16 @@ async fn async_main(
 
     let core = AppCore::new_with_xgb_l1_l2(cfg, &args.model_dir, args.model_l2_dir.as_deref())
         .context("init AppCore")?;
+    if let Some(xgb1) = core.xgb.as_ref() {
+        if xgb1.backend_name() == "xgb_ffi" {
+            warn!("xgb_ffi backend is deprecated; use native_tl2cgen");
+        }
+    }
+    if let Some(xgb2) = core.xgb_l2.as_ref() {
+        if xgb2.backend_name() == "xgb_ffi" {
+            warn!("xgb_ffi backend is deprecated; use native_tl2cgen");
+        }
+    }
 
     if let Some(dir2) = args.model_l2_dir.as_deref() {
         info!(

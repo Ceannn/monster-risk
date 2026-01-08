@@ -29,8 +29,12 @@ use std::time::{Duration, Instant};
 use crossbeam_deque::{Injector, Steal, Worker as DequeWorker};
 use crossbeam_utils::Backoff;
 
-#[cfg(all(not(feature = "xgb_ffi"), not(feature = "native_l1_tl2cgen")))]
-compile_error!("risk-core: enable feature `xgb_ffi` or `native_l1_tl2cgen` to build xgb_pool");
+#[cfg(all(
+    not(feature = "xgb_ffi"),
+    not(feature = "native_l1_tl2cgen"),
+    not(feature = "native_l2_tl2cgen")
+))]
+compile_error!("risk-core: enable feature `xgb_ffi` or `native_*_tl2cgen` to build xgb_pool");
 
 // NOTE: runtime-agnostic oneshot.
 // - Tokio server can still await it directly.
@@ -41,6 +45,8 @@ use futures_channel::oneshot;
 use xgb_ffi::Booster;
 #[cfg(feature = "native_l1_tl2cgen")]
 use crate::native_l1_tl2cgen;
+#[cfg(feature = "native_l2_tl2cgen")]
+use crate::native_l2_tl2cgen;
 
 #[derive(Debug)]
 pub enum XgbPoolError {
@@ -70,6 +76,8 @@ pub struct XgbOut {
     pub contrib_topk: Vec<(String, f32)>,
 }
 
+pub(crate) const EXTRA_MAX: usize = 32;
+
 /// Input row representation.
 ///
 /// - `OwnedDense`: legacy path (already materialized Vec<f32>)
@@ -78,6 +86,12 @@ pub struct XgbOut {
 enum XgbRow {
     OwnedDense(Vec<f32>),
     DenseBytesLe { bytes: Bytes, ncols: usize },
+    DenseBytesLeExtra {
+        bytes: Bytes,
+        ncols: usize,
+        extra: [f32; EXTRA_MAX],
+        extra_dim: usize,
+    },
 }
 
 struct XgbJob {
@@ -134,6 +148,8 @@ thread_local! {
 /// Work-stealing XGB pool.
 pub struct XgbPool {
     n_workers: usize,
+    model_dim: usize,
+    is_l2: bool,
 
     // Sharded injectors keyed by current CPU (best-effort).
     shards: Arc<Vec<Arc<Injector<XgbJob>>>>,
@@ -184,7 +200,11 @@ impl XgbPool {
     /// Same as [`XgbPool::new`], but pins each worker thread to a specific CPU id (linux only).
     ///
     /// `pin_cpus`: optional CPU ids to pin each worker to (extra ids ignored).
-    #[cfg(any(feature = "xgb_ffi", feature = "native_l1_tl2cgen"))]
+    #[cfg(any(
+        feature = "xgb_ffi",
+        feature = "native_l1_tl2cgen",
+        feature = "native_l2_tl2cgen"
+    ))]
     pub fn new_with_pinning(
         model_path: impl AsRef<Path>,
         feature_names: Arc<Vec<String>>,
@@ -192,6 +212,32 @@ impl XgbPool {
         queue_cap_total: usize,
         warmup_iters: usize,
         pin_cpus: Option<Vec<usize>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_pinning_role(
+            model_path,
+            feature_names,
+            n_workers,
+            queue_cap_total,
+            warmup_iters,
+            pin_cpus,
+            false,
+        )
+    }
+
+    /// Same as [`XgbPool::new_with_pinning`], but allows specifying the pool role (L1/L2).
+    #[cfg(any(
+        feature = "xgb_ffi",
+        feature = "native_l1_tl2cgen",
+        feature = "native_l2_tl2cgen"
+    ))]
+    pub fn new_with_pinning_role(
+        model_path: impl AsRef<Path>,
+        feature_names: Arc<Vec<String>>,
+        n_workers: usize,
+        queue_cap_total: usize,
+        warmup_iters: usize,
+        pin_cpus: Option<Vec<usize>>,
+        is_l2: bool,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(n_workers > 0, "xgb pool n_workers must be > 0");
         anyhow::ensure!(queue_cap_total > 0, "xgb pool queue_cap_total must be > 0");
@@ -202,6 +248,15 @@ impl XgbPool {
         let cap_total = per_worker_cap * n_workers;
 
         let model_path = Arc::new(model_path.as_ref().to_path_buf());
+        let model_dim = feature_names.len();
+
+        #[cfg(all(
+            not(feature = "xgb_ffi"),
+            not(feature = "native_l2_tl2cgen")
+        ))]
+        if is_l2 {
+            anyhow::bail!("xgb pool L2 requested but no L2 backend enabled");
+        }
 
         // Counters for admission control (best-effort).
         let queued = Arc::new(AtomicUsize::new(0));
@@ -211,6 +266,14 @@ impl XgbPool {
         let compute_ema_us = Arc::new(AtomicU64::new(500));
 
         let pin_cpus = pin_cpus.unwrap_or_default();
+
+        eprintln!(
+            "xgb-pool: role={} backend={} workers={} cap_total={}",
+            if is_l2 { "L2" } else { "L1" },
+            pool_backend_name(is_l2),
+            n_workers,
+            cap_total
+        );
 
         // Determine I/O CPUs (where requests are produced) vs worker CPUs.
         // If we can infer an affinity mask, shard by the CPUs that are NOT used by XGB workers.
@@ -237,6 +300,10 @@ impl XgbPool {
             let shards = Arc::clone(&shards);
             let io_cpu_to_shard = Arc::clone(&io_cpu_to_shard);
             let live_workers2 = Arc::clone(&live_workers);
+            #[cfg(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))]
+            let is_l2 = is_l2;
+            #[cfg(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))]
+            let model_dim = model_dim;
 
             thread::Builder::new()
                 .name(format!("xgb-worker-{wid}"))
@@ -280,13 +347,13 @@ impl XgbPool {
                     let local = DequeWorker::new_fifo();
                     let mut rr = wid;
 
-                    #[cfg(feature = "native_l1_tl2cgen")]
+                    #[cfg(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))]
                     {
-                        let ncols = native_l1_tl2cgen::num_feature();
-                        if feature_names.len() != ncols {
+                        let ncols = native_num_feature(is_l2);
+                        if model_dim != ncols {
                             eprintln!(
                                 "xgb-worker-{wid}: tl2cgen num_feature mismatch: feature_names.len()={} num_feature={}",
-                                feature_names.len(),
+                                model_dim,
                                 ncols
                             );
                         }
@@ -294,11 +361,12 @@ impl XgbPool {
                         if warmup_iters > 0 {
                             let row = vec![f32::NAN; ncols];
                             for _ in 0..warmup_iters {
-                                let _ = native_l1_tl2cgen::predict_proba_dense_1row(&row);
+                                let _ = native_predict_proba_dense_1row(is_l2, &row);
                             }
                             eprintln!("xgb-worker-{wid}: warmup done iters={warmup_iters} (tl2cgen)");
                         }
 
+                        let mut scratch_row: Vec<f32> = Vec::new();
                         let backoff = Backoff::new();
 
                         loop {
@@ -340,7 +408,7 @@ impl XgbPool {
 
                             let (score, contrib_topk) = match job.row {
                                 XgbRow::OwnedDense(row) => {
-                                    let s = match native_l1_tl2cgen::predict_proba_dense_1row(&row) {
+                                    let s = match native_predict_proba_dense_1row(is_l2, &row) {
                                         Ok(s) => s,
                                         Err(e) => {
                                             let _ = job.resp_tx.send(Err(e));
@@ -350,7 +418,56 @@ impl XgbPool {
                                     (s, Vec::new())
                                 }
                                 XgbRow::DenseBytesLe { bytes, ncols } => {
-                                    let s = match native_l1_tl2cgen::predict_proba_dense_bytes_le(&bytes, ncols) {
+                                    let s = match native_predict_proba_dense_bytes_le(is_l2, &bytes, ncols) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            let _ = job.resp_tx.send(Err(e));
+                                            continue;
+                                        }
+                                    };
+                                    (s, Vec::new())
+                                }
+                                XgbRow::DenseBytesLeExtra {
+                                    bytes,
+                                    ncols,
+                                    extra,
+                                    extra_dim,
+                                } => {
+                                    if ncols + extra_dim != model_dim || extra_dim > EXTRA_MAX {
+                                        let _ = job
+                                            .resp_tx
+                                            .send(Err(anyhow::anyhow!(
+                                                "dense bytes+extra dim mismatch: base={} extra={} model_dim={}",
+                                                ncols,
+                                                extra_dim,
+                                                model_dim
+                                            )));
+                                        continue;
+                                    }
+
+                                    let t_build = Instant::now();
+                                    let fallback = match decode_f32le_into(&bytes, ncols, &mut scratch_row) {
+                                        Ok(v) => v,
+                                        Err(msg) => {
+                                            let _ = job.resp_tx.send(Err(anyhow::anyhow!(msg)));
+                                            continue;
+                                        }
+                                    };
+                                    if extra_dim > 0 {
+                                        scratch_row.reserve(extra_dim);
+                                        scratch_row.extend_from_slice(&extra[..extra_dim]);
+                                    }
+                                    let build_us =
+                                        t_build.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                                    metrics::histogram!("l2_payload_extra_build_us")
+                                        .record(build_us as f64);
+                                    metrics::gauge!("l2_payload_extra_dim")
+                                        .set(extra_dim as f64);
+                                    if fallback {
+                                        metrics::counter!("l2_payload_decode_fallback_total").increment(1);
+                                    }
+
+                                    let s = match native_predict_proba_dense_1row(is_l2, &scratch_row) {
                                         Ok(s) => s,
                                         Err(e) => {
                                             let _ = job.resp_tx.send(Err(e));
@@ -382,7 +499,10 @@ impl XgbPool {
                         }
                     }
 
-                    #[cfg(all(feature = "xgb_ffi", not(feature = "native_l1_tl2cgen")))]
+                    #[cfg(all(
+                        feature = "xgb_ffi",
+                        not(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))
+                    ))]
                     {
                         let bst = match Booster::load_model(model_path.as_ref()) {
                             Ok(b) => b,
@@ -539,6 +659,8 @@ impl XgbPool {
 
         Ok(Self {
             n_workers,
+            model_dim,
+            is_l2,
             shards,
             io_cpu_to_shard,
             cap_total,
@@ -559,7 +681,11 @@ impl XgbPool {
     }
 
     /// Convenience: build a pool directly from a model directory (same format as `XgbRuntime::load_from_dir`).
-    #[cfg(any(feature = "xgb_ffi", feature = "native_l1_tl2cgen"))]
+    #[cfg(any(
+        feature = "xgb_ffi",
+        feature = "native_l1_tl2cgen",
+        feature = "native_l2_tl2cgen"
+    ))]
     pub fn new_from_dir(
         model_dir: impl AsRef<Path>,
         n_workers: usize,
@@ -569,13 +695,17 @@ impl XgbPool {
     ) -> anyhow::Result<Self> {
         let rt = crate::xgb_runtime::XgbRuntime::load_from_dir(model_dir.as_ref())
             .with_context(|| format!("load model dir: {}", model_dir.as_ref().display()))?;
-        Self::new_with_pinning(
-            rt.model_path,
-            Arc::new(rt.feature_names),
+        let is_l2 = rt.is_l2();
+        let feature_names = Arc::new(rt.feature_names);
+        let model_path = rt.model_path;
+        Self::new_with_pinning_role(
+            model_path,
+            feature_names,
             n_workers,
             queue_cap_total,
             warmup_iters,
             pin_cpus,
+            is_l2,
         )
     }
 
@@ -803,7 +933,121 @@ impl XgbPool {
         Ok(resp_rx)
     }
 
+    /// Non-blocking submission for dense bytes payload (f32 little-endian) with extra f32 tail.
+    ///
+    /// This is intended for L2 only (extra features appended inside worker scratch).
+    pub fn try_submit_dense_bytes_le_extra(
+        &self,
+        bytes: Bytes,
+        ncols: usize,
+        extra: [f32; EXTRA_MAX],
+        extra_dim: usize,
+        contrib_topk: usize,
+    ) -> Result<oneshot::Receiver<anyhow::Result<XgbOut>>, XgbPoolError> {
+        if extra_dim == 0 {
+            return self.try_submit_dense_bytes_le(bytes, ncols, contrib_topk);
+        }
+        if extra_dim > EXTRA_MAX || !self.is_l2 {
+            return Err(XgbPoolError::QueueFull);
+        }
 
+        // Validate shape early to avoid silent corruption.
+        let need = ncols.checked_mul(4).ok_or(XgbPoolError::QueueFull)?;
+        if bytes.len() != need {
+            return Err(XgbPoolError::QueueFull);
+        }
+        if ncols.saturating_add(extra_dim) != self.model_dim {
+            return Err(XgbPoolError::QueueFull);
+        }
+
+        self.admission_control()?;
+
+        let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
+        let enq_at = Instant::now();
+        let deadline_at = if self.early_reject_pred_wait_us > 0 {
+            Some(enq_at + Duration::from_micros(self.early_reject_pred_wait_us))
+        } else {
+            None
+        };
+        let job = XgbJob {
+            enq_at,
+            deadline_at,
+            row: XgbRow::DenseBytesLeExtra {
+                bytes,
+                ncols,
+                extra,
+                extra_dim,
+            },
+            contrib_topk,
+            resp_tx,
+        };
+
+        let sid = pick_shard(&self.io_cpu_to_shard, self.shards.len());
+        self.shards[sid].push(job);
+
+        Ok(resp_rx)
+    }
+
+    /// Non-blocking submission for dense bytes payload (f32 little-endian) with extra tail,
+    /// with a queue-wait budget (microseconds).
+    pub fn try_submit_dense_bytes_le_extra_with_budget(
+        &self,
+        bytes: Bytes,
+        ncols: usize,
+        extra: [f32; EXTRA_MAX],
+        extra_dim: usize,
+        contrib_topk: usize,
+        budget_us: u64,
+    ) -> Result<oneshot::Receiver<anyhow::Result<XgbOut>>, XgbPoolError> {
+        if budget_us == 0 {
+            return self.try_submit_dense_bytes_le_extra(bytes, ncols, extra, extra_dim, contrib_topk);
+        }
+        if extra_dim == 0 {
+            return self.try_submit_dense_bytes_le_with_budget(bytes, ncols, contrib_topk, budget_us);
+        }
+        if extra_dim > EXTRA_MAX || !self.is_l2 {
+            return Err(XgbPoolError::QueueFull);
+        }
+
+        // Validate shape early to avoid silent corruption.
+        let need = ncols.checked_mul(4).ok_or(XgbPoolError::QueueFull)?;
+        if bytes.len() != need {
+            return Err(XgbPoolError::QueueFull);
+        }
+        if ncols.saturating_add(extra_dim) != self.model_dim {
+            return Err(XgbPoolError::QueueFull);
+        }
+
+        self.admission_control()?;
+
+        let (resp_tx, resp_rx) = oneshot::channel::<anyhow::Result<XgbOut>>();
+        let enq_at = Instant::now();
+
+        // Per-call budget + pool-level early-reject => pick the tighter deadline.
+        let mut eff_us = budget_us;
+        if self.early_reject_pred_wait_us > 0 {
+            eff_us = eff_us.min(self.early_reject_pred_wait_us);
+        }
+        let deadline_at = Some(enq_at + Duration::from_micros(eff_us));
+
+        let job = XgbJob {
+            enq_at,
+            deadline_at,
+            row: XgbRow::DenseBytesLeExtra {
+                bytes,
+                ncols,
+                extra,
+                extra_dim,
+            },
+            contrib_topk,
+            resp_tx,
+        };
+
+        let sid = pick_shard(&self.io_cpu_to_shard, self.shards.len());
+        self.shards[sid].push(job);
+
+        Ok(resp_rx)
+    }
 
     /// Convenience async wrapper.
     pub async fn submit_dense_bytes_le(
@@ -817,6 +1061,118 @@ impl XgbPool {
             Ok(v) => Ok(v),
             Err(_) => Err(XgbPoolError::Canceled),
         }
+    }
+}
+
+fn pool_backend_name(is_l2: bool) -> &'static str {
+    if is_l2 {
+        #[cfg(feature = "native_l2_tl2cgen")]
+        {
+            return "native_tl2cgen";
+        }
+        #[cfg(all(not(feature = "native_l2_tl2cgen"), feature = "xgb_ffi"))]
+        {
+            return "xgb_ffi";
+        }
+        #[cfg(all(not(feature = "native_l2_tl2cgen"), not(feature = "xgb_ffi")))]
+        {
+            return "disabled";
+        }
+    } else {
+        #[cfg(feature = "native_l1_tl2cgen")]
+        {
+            return "native_tl2cgen";
+        }
+        #[cfg(all(not(feature = "native_l1_tl2cgen"), feature = "xgb_ffi"))]
+        {
+            return "xgb_ffi";
+        }
+        #[cfg(all(not(feature = "native_l1_tl2cgen"), not(feature = "xgb_ffi")))]
+        {
+            return "disabled";
+        }
+    }
+    "disabled"
+}
+
+#[cfg(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))]
+fn native_num_feature(is_l2: bool) -> usize {
+    if is_l2 {
+        #[cfg(feature = "native_l2_tl2cgen")]
+        {
+            return native_l2_tl2cgen::num_feature();
+        }
+        #[cfg(not(feature = "native_l2_tl2cgen"))]
+        {
+            return 0;
+        }
+    }
+
+    #[cfg(feature = "native_l1_tl2cgen")]
+    {
+        return native_l1_tl2cgen::num_feature();
+    }
+    #[cfg(not(feature = "native_l1_tl2cgen"))]
+    {
+        0
+    }
+}
+
+#[cfg(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))]
+fn native_predict_proba_dense_1row(is_l2: bool, row: &[f32]) -> anyhow::Result<f32> {
+    if is_l2 {
+        #[cfg(feature = "native_l2_tl2cgen")]
+        {
+            return native_l2_tl2cgen::predict_proba_dense_1row(row);
+        }
+        #[cfg(not(feature = "native_l2_tl2cgen"))]
+        {
+            return Err(anyhow::anyhow!(
+                "native_l2_tl2cgen disabled but L2 pool requested"
+            ));
+        }
+    }
+
+    #[cfg(feature = "native_l1_tl2cgen")]
+    {
+        return native_l1_tl2cgen::predict_proba_dense_1row(row);
+    }
+    #[cfg(not(feature = "native_l1_tl2cgen"))]
+    {
+        Err(anyhow::anyhow!(
+            "native_l1_tl2cgen disabled but L1 pool requested"
+        ))
+    }
+}
+
+#[cfg(any(feature = "native_l1_tl2cgen", feature = "native_l2_tl2cgen"))]
+fn native_predict_proba_dense_bytes_le(
+    is_l2: bool,
+    bytes: &Bytes,
+    ncols: usize,
+) -> anyhow::Result<f32> {
+    if is_l2 {
+        #[cfg(feature = "native_l2_tl2cgen")]
+        {
+            return native_l2_tl2cgen::predict_proba_dense_bytes_le(bytes, ncols);
+        }
+        #[cfg(not(feature = "native_l2_tl2cgen"))]
+        {
+            return Err(anyhow::anyhow!(
+                "native_l2_tl2cgen disabled but L2 pool requested"
+            ));
+        }
+    }
+
+    #[cfg(feature = "native_l1_tl2cgen")]
+    {
+        return native_l1_tl2cgen::predict_proba_dense_bytes_le(bytes, ncols);
+    }
+    #[cfg(not(feature = "native_l1_tl2cgen"))]
+    {
+        Err(anyhow::anyhow!(
+            "native_l1_tl2cgen disabled but L1 pool requested"
+        ))
     }
 }
 
@@ -960,6 +1316,39 @@ fn infer_io_cpus(pin_cpus: &[usize]) -> Vec<usize> {
         }
     }
     allowed.into_iter().filter(|&c| c < mark.len() && !mark[c]).collect()
+}
+
+/// Convert raw f32 little-endian bytes into a `&[f32]` view when possible.
+/// Falls back to decoding into `scratch` when the byte slice is unaligned.
+fn decode_f32le_into(bytes: &Bytes, ncols: usize, scratch: &mut Vec<f32>) -> Result<bool, String> {
+    let b = bytes.as_ref();
+    let need = ncols
+        .checked_mul(4)
+        .ok_or_else(|| "ncols too large".to_string())?;
+    if b.len() != need {
+        return Err(format!(
+            "dense bytes size mismatch: got {}, need {}",
+            b.len(),
+            need
+        ));
+    }
+
+    scratch.clear();
+    scratch.reserve(ncols);
+
+    if cfg!(target_endian = "little") {
+        // SAFETY: We only accept the aligned case (head/tail empty). All bit patterns are valid f32.
+        let (head, body, tail) = unsafe { b.align_to::<f32>() };
+        if head.is_empty() && tail.is_empty() && body.len() == ncols {
+            scratch.extend_from_slice(body);
+            return Ok(false);
+        }
+    }
+
+    for c in b.chunks_exact(4) {
+        scratch.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    Ok(true)
 }
 
 /// Convert raw f32 little-endian bytes into a `&[f32]` view when possible.

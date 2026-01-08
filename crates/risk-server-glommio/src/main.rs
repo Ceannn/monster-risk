@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 static TRACE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+const L2_EXTRA_MAX: usize = 32;
 
 #[derive(Clone)]
 struct AppState {
@@ -75,9 +76,12 @@ fn main() -> anyhow::Result<()> {
     metrics::counter!("router_l2_skipped_budget_total").increment(0);
     metrics::counter!("router_l2_skipped_deadline_budget_total").increment(0);
     metrics::counter!("router_l2_skipped_rate_total").increment(0);
+    metrics::counter!("router_l2_skipped_sample_total").increment(0);
     metrics::counter!("router_l2_skipped_waterline_total").increment(0);
     metrics::counter!("router_timeout_before_l2_total").increment(0);
     metrics::counter!("router_deadline_miss_total").increment(0);
+    metrics::counter!("router_l2_feedback_overload_total").increment(0);
+    metrics::counter!("router_l2_feedback_relax_total").increment(0);
 
     let mut cfg = Config::default();
 
@@ -119,6 +123,9 @@ fn main() -> anyhow::Result<()> {
             xgb1.policy.review_threshold,
             xgb1.policy.deny_threshold,
         );
+        if xgb1.backend_name() == "xgb_ffi" {
+            tracing::warn!("xgb_ffi backend is deprecated; use native_tl2cgen");
+        }
     }
     if let Some(xgb2) = state.core.xgb_l2.as_ref() {
         tracing::info!(
@@ -130,6 +137,9 @@ fn main() -> anyhow::Result<()> {
             xgb2.policy.review_threshold,
             xgb2.policy.deny_threshold,
         );
+        if xgb2.backend_name() == "xgb_ffi" {
+            tracing::warn!("xgb_ffi backend is deprecated; use native_tl2cgen");
+        }
     } else if args.model_dir.is_some() {
         tracing::info!("L2 disabled");
     }
@@ -330,6 +340,7 @@ async fn handle_conn(
             // Lightweight introspection for verifying L1/L2 wiring, schema, and thresholds.
             let l1 = st.core.xgb.as_ref();
             let l2 = st.core.xgb_l2.as_ref();
+            let l2_ctrl = st.core.l2_ctrl();
 
             let body = json!({
                 "l1": l1.map(|m| json!({
@@ -352,6 +363,14 @@ async fn handle_conn(
                         "deny": m.policy.deny_threshold,
                     },
                 })),
+                "router_l2": {
+                    "sample_ratio": l2_ctrl.sample_ratio(),
+                    "sample_base_ratio": l2_ctrl.sample_base_ratio(),
+                    "sample_dyn_ratio": l2_ctrl.sample_dyn_ratio(),
+                    "waterline_target": l2_ctrl.sample_waterline_target(),
+                    "waterline_hi": l2_ctrl.sample_waterline_hi(),
+                    "waterline_lo": l2_ctrl.sample_waterline_lo(),
+                },
             });
             let buf = serde_json::to_vec(&body)?;
             write_http(
@@ -654,39 +673,64 @@ async fn handle_conn(
                         .unwrap_or(0);
 
                     if remaining_us < l2_ctrl.min_remaining_us() {
+                        metrics::counter!("router_l2_skipped_budget_total").increment(1);
                         metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
                     } else if !l2_ctrl.allow_by_rate() {
+                        metrics::counter!("router_l2_skipped_budget_total").increment(1);
                         metrics::counter!("router_l2_skipped_rate_total").increment(1);
+                    } else if !l2_ctrl.allow_by_sample() {
+                        metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                        metrics::counter!("router_l2_skipped_sample_total").increment(1);
                     } else {
                         let st_waterline = pool2.stats().queue_waterline();
+                        l2_ctrl.feedback_waterline(st_waterline);
                         let max_w = l2_ctrl.max_queue_waterline();
-                        if max_w < 1.0 && st_waterline > max_w {
+                        if max_w < 1.0 && st_waterline >= max_w {
+                            metrics::counter!("router_l2_skipped_budget_total").increment(1);
                             metrics::counter!("router_l2_skipped_waterline_total").increment(1);
                         } else {
                             // Optional queue-wait budget for L2 pool.
-                            let q_budget_us = l2_ctrl.queue_wait_budget_us();
-
-                            // Build L2 payload (optionally append stateful features)
-                            let (payload_l2, l2_dim) =
-                                if let Some(aug) = st.core.stateful_l2.as_ref() {
-                                    let ctx = stateful_ctx.as_ref().expect("stateful ctx missing");
-                                    let (p2, t2) = aug.build_l2_payload(&payload_for_l2, ctx);
-                                    feature_us = feature_us.saturating_add(t2.build_l2_payload_us);
-                                    (p2, aug.l2_dim())
-                                } else {
-                                    (payload_for_l2.clone(), xgb2.feature_names.len())
-                                };
+                            let mut q_budget_us = l2_ctrl.queue_wait_budget_us();
+                            if q_budget_us > 0 {
+                                q_budget_us = q_budget_us.min(remaining_us);
+                            }
 
                             let t_l2 = std::time::Instant::now();
-                            let submit = if q_budget_us > 0 {
+                            let submit = if let Some(aug) = st.core.stateful_l2.as_ref() {
+                                let ctx = stateful_ctx.as_ref().expect("stateful ctx missing");
+                                let mut extra = [0.0f32; L2_EXTRA_MAX];
+                                extra[..aug.extra_dim()].copy_from_slice(&ctx.extra);
+                                if q_budget_us > 0 {
+                                    pool2.try_submit_dense_bytes_le_extra_with_budget(
+                                        payload_for_l2.clone(),
+                                        dim,
+                                        extra,
+                                        aug.extra_dim(),
+                                        0,
+                                        q_budget_us,
+                                    )
+                                } else {
+                                    pool2.try_submit_dense_bytes_le_extra(
+                                        payload_for_l2.clone(),
+                                        dim,
+                                        extra,
+                                        aug.extra_dim(),
+                                        0,
+                                    )
+                                }
+                            } else if q_budget_us > 0 {
                                 pool2.try_submit_dense_bytes_le_with_budget(
-                                    payload_l2,
-                                    l2_dim,
+                                    payload_for_l2.clone(),
+                                    xgb2.feature_names.len(),
                                     0,
                                     q_budget_us,
                                 )
                             } else {
-                                pool2.try_submit_dense_bytes_le(payload_l2, l2_dim, 0)
+                                pool2.try_submit_dense_bytes_le(
+                                    payload_for_l2.clone(),
+                                    xgb2.feature_names.len(),
+                                    0,
+                                )
                             };
 
                             if let Ok(rx2) = submit {
@@ -717,6 +761,7 @@ async fn handle_conn(
                                         l2_us = now_us(t_l2);
                                         if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
                                             if matches!(pe, XgbPoolError::DeadlineExceeded) {
+                                                l2_ctrl.feedback_overload();
                                                 metrics::counter!(
                                                     "router_l2_skipped_deadline_budget_total"
                                                 )
@@ -726,6 +771,7 @@ async fn handle_conn(
                                     }
                                     Err(_timeout) => {
                                         l2_us = now_us(t_l2);
+                                        l2_ctrl.feedback_overload();
                                         metrics::counter!(
                                             "router_l2_skipped_deadline_budget_total"
                                         )
@@ -736,6 +782,7 @@ async fn handle_conn(
                                 metrics::histogram!("stage_l2_us").record(l2_us as f64);
                             } else {
                                 // L2 pool saturated -> fall back to L1 decision (ManualReview) instead of failing request.
+                                l2_ctrl.feedback_overload();
                                 metrics::counter!("router_l2_skipped_budget_total").increment(1);
                                 l2_us = 0;
                                 metrics::histogram!("stage_l2_us").record(0.0);

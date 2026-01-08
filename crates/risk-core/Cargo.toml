@@ -33,7 +33,8 @@ bytes = "1"
 crossbeam-deque = "0.8"
 crossbeam-utils = "0.8"
 [features]
-default = ["xgb_ffi"]
+default = []
+# DEPRECATED: xgb_ffi backend is kept only for offline comparison.
 xgb_ffi = ["dep:xgb_ffi"]
 native_l1_m2cgen = []
 native_l1_tl2cgen = []

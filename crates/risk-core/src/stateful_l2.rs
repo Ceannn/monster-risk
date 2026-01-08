@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::feature_store_u64::{FeatureStoreU64, StoreFeatures};
 use anyhow::{bail, Context};
 use bytes::{Bytes, BytesMut};
-use dashmap::DashMap;
+use crate::util::mix_u64;
 use hashbrown::HashMap;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -139,6 +139,10 @@ impl StatefulL2Augmenter {
         self.l2_dim
     }
 
+    pub fn extra_dim(&self) -> usize {
+        EXTRA_FEATURE_DIM
+    }
+
     pub fn pre_l1(&self, payload: &Bytes) -> (DenseStatefulCtx, DenseStatefulTiming) {
         let t0 = Instant::now();
         let dt_s = read_f32_le(payload, self.idx_dt).unwrap_or(0.0);
@@ -200,6 +204,7 @@ impl StatefulL2Augmenter {
         )
     }
 
+    /// Deprecated path: allocates a new Bytes buffer. Prefer worker-side extra append.
     pub fn build_l2_payload(&self, payload_l1: &Bytes, ctx: &DenseStatefulCtx) -> (Bytes, DenseStatefulTiming) {
         let t0 = Instant::now();
         debug_assert_eq!(payload_l1.len(), self.l1_dim * 4);
@@ -345,32 +350,42 @@ struct BipartiteKeyState {
 struct BipartiteUniqueStore {
     win_60s_ms: i64,
     win_300s_ms: i64,
-    keys: Arc<DashMap<u64, Arc<Mutex<BipartiteKeyState>>>>,
+    shards: Arc<Vec<Mutex<HashMap<u64, BipartiteKeyState>>>>,
+    shard_mask: usize,
 }
 
 impl BipartiteUniqueStore {
     fn new(win_60s: u64, win_300s: u64) -> Self {
+        let avail = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let default_shards = avail.saturating_mul(2).max(1);
+        let shard_hint = std::env::var("FEATURE_STORE_SHARDS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(default_shards);
+        let shard_count = shard_hint.max(1).next_power_of_two();
+        let mut shards = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            shards.push(Mutex::new(HashMap::new()));
+        }
         Self {
             win_60s_ms: (win_60s as i64) * 1000,
             win_300s_ms: (win_300s as i64) * 1000,
-            keys: Arc::new(DashMap::new()),
+            shards: Arc::new(shards),
+            shard_mask: shard_count - 1,
         }
     }
 
     fn query_then_update(&self, key: u64, other: u64, now_ms: i64) -> (f32, f32) {
         const MAX_EVENTS_PER_WIN: usize = 4096;
-        let entry = self
-            .keys
-            .entry(key)
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(BipartiteKeyState {
-                    w60: UniqueWindow::new(self.win_60s_ms, MAX_EVENTS_PER_WIN),
-                    w300: UniqueWindow::new(self.win_300s_ms, MAX_EVENTS_PER_WIN),
-                }))
-            })
-            .clone();
+        let shard_idx = (mix_u64(key) as usize) & self.shard_mask;
+        let mut shard = self.shards[shard_idx].lock();
+        let st = shard.entry(key).or_insert_with(|| BipartiteKeyState {
+            w60: UniqueWindow::new(self.win_60s_ms, MAX_EVENTS_PER_WIN),
+            w300: UniqueWindow::new(self.win_300s_ms, MAX_EVENTS_PER_WIN),
+        });
 
-        let mut st = entry.lock();
         st.w60.expire(now_ms);
         st.w300.expire(now_ms);
         let u60 = st.w60.uniq() as f32;

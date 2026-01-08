@@ -35,7 +35,7 @@
   *你看到的 `used_l2`、`review_th/deny_th` 等策略字段就在这里跑。*
 - `crates/risk-core/src/xgb_runtime.rs`  
   推理后端的**统一门面**：  
-  - 负责选择 “native tl2cgen” 还是 “xgb_ffi（动态库）”；
+  - 负责选择 “native tl2cgen” 还是 “xgb_ffi（动态库，**DEPRECATED**）”；
   - 提供 `predict_proba_*` 这一族 API；
   - 负责把 L1/L2 的阈值策略（decide）封装起来（供 pipeline 调用）。
 - `crates/risk-core/src/xgb_pool.rs`  
@@ -103,7 +103,7 @@
 - **native tl2cgen（推荐/默认）**：  
   - 推理函数来自静态链接的 `libieee_l1.a / libieee_l2.a`
   - 形式上是 `extern "C"`，但本质是普通函数调用（没有动态库加载/符号解析开销）
-- **xgb_ffi（历史兼容）**：  
+- **xgb_ffi（DEPRECATED）**：  
   - 通过 FFI 调用 `libxgboost.so`
   - 需要处理 `LD_LIBRARY_PATH / OMP_NUM_THREADS` 等运行时环境
   - 目前主要用于对照、debug 或在还没导出 tl2cgen 时兜底
@@ -152,7 +152,7 @@
 **编译期开关（Cargo features）**
 - `native_l1_tl2cgen`：启用 L1 静态模型
 - `native_l2_tl2cgen`：启用 L2 静态模型
-- `xgb_ffi`：启用动态库后端（历史兼容）
+- `xgb_ffi`：启用动态库后端（**DEPRECATED**，仅对照实验）
 
 > 注意：feature 开关在 `risk-core` 里定义，server crate 需要把 feature **forward** 到 `risk-core`，否则会出现 “server 没有这个 feature” 的编译错误。
 
@@ -228,7 +228,7 @@
 ## 4. TL2CGEN 静态推理：为什么这么快？
 
 ### 4.1 从“调用动态库”变成“普通函数调用”
-- `xgb_ffi`：每次推理要经过 FFI + 动态库符号 + 可能的 OpenMP runtime
+- `xgb_ffi`（**DEPRECATED**）：每次推理要经过 FFI + 动态库符号 + 可能的 OpenMP runtime
 - TL2CGEN：编译期把 C 代码塞进 `.text`，运行时就是一次 `call`（非常接近手写 C）
 
 ### 4.2 分支预测与 cache 友好
@@ -340,6 +340,20 @@ ldd target/release/risk-server-glommio | rg -i "xgboost|gomp"
 
 用于论文/实验时做 “L2 只吃 hard cases” 的可控触发分布（非常适合做对照实验：ratio=1.0 vs 0.25 vs 0.125）。
 
+新增 **采样 gate + 反馈闭环**（base=0.30，动态收敛）：
+- `ROUTER_L2_SAMPLE_RATIO` / `ROUTER_L2_SAMPLE_PPM`
+- `ROUTER_L2_SAMPLE_MIN_RATIO`
+- `ROUTER_L2_DYN_ENABLE`
+- `ROUTER_L2_WATERLINE_TARGET` / `HI` / `LO`
+- 指标：`router_l2_skipped_sample_total` / `router_l2_sample_ratio` / `router_l2_feedback_overload_total` / `router_l2_feedback_relax_total`
+- gate 顺序：**deadline → rate → sample → waterline → submit**
+
+Stateful store / L2 payload 相关：
+- `FEATURE_STORE_SHARDS`（`FeatureStoreU64` + graph store 分片）
+- 指标：`feature_store_shard_lock_us` / `feature_store_evicted_total` / `feature_store_keys_total`
+- L2 extra 由 worker scratch 构造（不在 IO 线程拼 bytes）
+- 指标：`l2_payload_extra_build_us` / `l2_payload_extra_dim` / `l2_payload_decode_fallback_total`
+
 另外：高 RPS 下 histogram 写入有额外开销，可用 `RISK_METRICS_SAMPLE_LOG2` 采样写入 histogram（RSK1 响应 timings 不变）。
 
 ---
@@ -409,7 +423,7 @@ python3 scripts/ml/calibrate_policy_quantiles.py \
 ### 9.4 policy.json vs runtime gate（谁负责什么）
 
 - **policy.json**：语义层的“常态分流”，决定 L2/L3 平均要吃多少样本
-- **runtime gate（ROUTER_L2_MAX_TRIGGER_RATIO / PER_SEC / waterline）**：运行时保险丝，防止分布漂移/突发把系统打爆
+- **runtime gate（ROUTER_L2_MAX_TRIGGER_RATIO / PER_SEC / sample / waterline）**：运行时保险丝，防止分布漂移/突发把系统打爆
 
 推荐顺序：
 1) 先用 policy 校准到你希望的 L2/L3 预算

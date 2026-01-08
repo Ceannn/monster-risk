@@ -1,21 +1,22 @@
 use crate::stateful_l2::{DenseStatefulCtx, StatefulL2Augmenter};
-use crate::xgb_pool::{XgbPool, XgbPoolError};
+use crate::xgb_pool::{XgbPool, XgbPoolError, EXTRA_MAX};
 use crate::xgb_runtime::XgbRuntime;
 use crate::{
     config::Config,
     feature_store::FeatureStore,
     model::Models,
     schema::{Decision, ReasonItem, ScoreRequest, ScoreResponse, TimingsUs},
-    util::now_us,
+    util::{mix_u64, now_us},
 };
 
 use anyhow::Context;
 use bytes::Bytes;
 use serde_json::{Map, Value};
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// A very small per-second budget (rate limiter) for L2 triggers.
@@ -68,6 +69,29 @@ impl RateBudget {
     }
 }
 
+thread_local! {
+    static TLS_L2_SAMPLE_RNG: Cell<u64> = const { Cell::new(0) };
+}
+
+fn tls_rand_u64() -> u64 {
+    TLS_L2_SAMPLE_RNG.with(|c| {
+        let mut state = c.get();
+        if state == 0 {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let salt = (std::process::id() as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            let addr = (&*c as *const Cell<u64> as usize) as u64;
+            state = now ^ salt ^ addr;
+        }
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let out = mix_u64(state);
+        c.set(state);
+        out
+    })
+}
+
 #[derive(Debug)]
 struct L2Control {
     /// Hard cap: max L2 triggers per second (0 = unlimited).
@@ -83,6 +107,25 @@ struct L2Control {
 
     /// Optional queue-wait budget passed to XgbPool (microseconds). 0 disables.
     queue_wait_budget_us: u64,
+
+    /// Base sampling ratio for L2 triggers (ppm: 0..=1_000_000).
+    sample_base_ppm: u32,
+    /// Minimum sampling ratio after feedback (ppm).
+    sample_min_ppm: u32,
+    /// Dynamic sampling ratio (ppm).
+    sample_dyn_ppm: AtomicU64,
+    /// Enable dynamic feedback controller.
+    sample_dyn_enable: bool,
+    /// Last feedback update time (ms since start).
+    sample_last_update_ms: AtomicU64,
+    /// Counter to throttle feedback updates.
+    sample_update_ctr: AtomicU64,
+    /// Waterline feedback target and bounds.
+    sample_waterline_target: f64,
+    sample_waterline_hi: f64,
+    sample_waterline_lo: f64,
+    /// Local timebase for feedback throttling.
+    start: Instant,
 }
 
 impl L2Control {
@@ -111,12 +154,52 @@ impl L2Control {
 
         let queue_wait_budget_us = env_u64("ROUTER_L2_QUEUE_WAIT_BUDGET_US").unwrap_or(0);
 
+        let base_ppm = env_u64("ROUTER_L2_SAMPLE_PPM")
+            .or_else(|| {
+                env_f64("ROUTER_L2_SAMPLE_RATIO").map(|v| {
+                    (v.max(0.0).min(1.0) * 1_000_000.0).round() as u64
+                })
+            })
+            .unwrap_or(300_000)
+            .min(1_000_000) as u32;
+
+        let mut min_ppm = env_f64("ROUTER_L2_SAMPLE_MIN_RATIO")
+            .map(|v| (v.max(0.0).min(1.0) * 1_000_000.0).round() as u32)
+            .unwrap_or_else(|| ((base_ppm as f64) * 0.1).round() as u32);
+        if min_ppm > base_ppm {
+            min_ppm = base_ppm;
+        }
+
+        let sample_dyn_enable = env_u64("ROUTER_L2_DYN_ENABLE").unwrap_or(1) != 0;
+
+        let clamp01 = |v: f64| if v < 0.0 { 0.0 } else if v > 1.0 { 1.0 } else { v };
+        let sample_waterline_target =
+            clamp01(env_f64("ROUTER_L2_WATERLINE_TARGET").unwrap_or(0.60));
+        let mut sample_waterline_hi = clamp01(env_f64("ROUTER_L2_WATERLINE_HI").unwrap_or(0.85));
+        let mut sample_waterline_lo = clamp01(env_f64("ROUTER_L2_WATERLINE_LO").unwrap_or(0.40));
+        if sample_waterline_lo > sample_waterline_hi {
+            std::mem::swap(&mut sample_waterline_lo, &mut sample_waterline_hi);
+        }
+
+        metrics::gauge!("router_l2_sample_ratio")
+            .set(base_ppm as f64 / 1_000_000.0);
+
         Self {
             max_triggers_per_sec,
             rate_budget,
             max_queue_waterline,
             min_remaining_us,
             queue_wait_budget_us,
+            sample_base_ppm: base_ppm,
+            sample_min_ppm: min_ppm,
+            sample_dyn_ppm: AtomicU64::new(base_ppm as u64),
+            sample_dyn_enable,
+            sample_last_update_ms: AtomicU64::new(0),
+            sample_update_ctr: AtomicU64::new(0),
+            sample_waterline_target,
+            sample_waterline_hi,
+            sample_waterline_lo,
+            start: Instant::now(),
         }
     }
 
@@ -125,6 +208,119 @@ impl L2Control {
         match &self.rate_budget {
             Some(b) => b.try_acquire(),
             None => true,
+        }
+    }
+
+    #[inline]
+    fn sample_ppm(&self) -> u32 {
+        if self.sample_dyn_enable {
+            self.sample_dyn_ppm.load(Ordering::Relaxed).min(1_000_000) as u32
+        } else {
+            self.sample_base_ppm
+        }
+    }
+
+    #[inline]
+    fn allow_by_sample(&self) -> bool {
+        let ppm = self.sample_ppm();
+        if ppm >= 1_000_000 {
+            return true;
+        }
+        if ppm == 0 {
+            return false;
+        }
+        (tls_rand_u64() % 1_000_000) < (ppm as u64)
+    }
+
+    #[inline]
+    fn sample_ratio(&self) -> f64 {
+        self.sample_ppm() as f64 / 1_000_000.0
+    }
+
+    #[inline]
+    fn sample_base_ratio(&self) -> f64 {
+        self.sample_base_ppm as f64 / 1_000_000.0
+    }
+
+    #[inline]
+    fn sample_dyn_ratio(&self) -> f64 {
+        self.sample_dyn_ppm.load(Ordering::Relaxed).min(1_000_000) as f64 / 1_000_000.0
+    }
+
+    fn feedback_overload(&self) {
+        if !self.sample_dyn_enable {
+            return;
+        }
+        let base = self.sample_base_ppm as f64;
+        let min = self.sample_min_ppm as f64;
+        let cur = self.sample_dyn_ppm.load(Ordering::Relaxed) as f64;
+        let mut next = cur * 0.7;
+        if next < min {
+            next = min;
+        }
+        if next > base {
+            next = base;
+        }
+        let next_ppm = next.round() as u64;
+        let cur_ppm = cur.round() as u64;
+        if next_ppm != cur_ppm {
+            self.sample_dyn_ppm.store(next_ppm, Ordering::Relaxed);
+            metrics::gauge!("router_l2_sample_ratio").set(next / 1_000_000.0);
+        }
+        metrics::counter!("router_l2_feedback_overload_total").increment(1);
+    }
+
+    fn feedback_waterline(&self, waterline: f64) {
+        if !self.sample_dyn_enable {
+            return;
+        }
+
+        const UPDATE_EVERY: u64 = 1024;
+        const UPDATE_INTERVAL_MS: u64 = 200;
+
+        let cnt = self.sample_update_ctr.fetch_add(1, Ordering::Relaxed) + 1;
+        let now_ms = self.start.elapsed().as_millis() as u64;
+        let last = self.sample_last_update_ms.load(Ordering::Relaxed);
+        if (cnt % UPDATE_EVERY != 0) && now_ms.saturating_sub(last) < UPDATE_INTERVAL_MS {
+            return;
+        }
+        if self
+            .sample_last_update_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.sample_update_ctr.store(0, Ordering::Relaxed);
+
+        let base = self.sample_base_ppm as f64;
+        let min = self.sample_min_ppm as f64;
+        let cur = self.sample_dyn_ppm.load(Ordering::Relaxed) as f64;
+        let mut next = cur;
+
+        if waterline > self.sample_waterline_hi {
+            next = cur * 0.85;
+        } else if waterline < self.sample_waterline_lo {
+            next = (cur * 1.03).min(base);
+        } else {
+            next = cur + (base - cur) * 0.01;
+        }
+
+        if next < min {
+            next = min;
+        }
+        if next > base {
+            next = base;
+        }
+
+        let next_ppm = next.round() as u64;
+        let cur_ppm = cur.round() as u64;
+        if next_ppm != cur_ppm {
+            if next > cur {
+                metrics::counter!("router_l2_feedback_relax_total").increment(1);
+            }
+            self.sample_dyn_ppm.store(next_ppm, Ordering::Relaxed);
+            metrics::gauge!("router_l2_sample_ratio").set(next / 1_000_000.0);
         }
     }
 }
@@ -138,6 +334,51 @@ impl L2ControlView {
     #[inline]
     pub fn allow_by_rate(&self) -> bool {
         self.inner.allow_by_rate()
+    }
+
+    #[inline]
+    pub fn allow_by_sample(&self) -> bool {
+        self.inner.allow_by_sample()
+    }
+
+    #[inline]
+    pub fn sample_ratio(&self) -> f64 {
+        self.inner.sample_ratio()
+    }
+
+    #[inline]
+    pub fn sample_base_ratio(&self) -> f64 {
+        self.inner.sample_base_ratio()
+    }
+
+    #[inline]
+    pub fn sample_dyn_ratio(&self) -> f64 {
+        self.inner.sample_dyn_ratio()
+    }
+
+    #[inline]
+    pub fn sample_waterline_target(&self) -> f64 {
+        self.inner.sample_waterline_target
+    }
+
+    #[inline]
+    pub fn sample_waterline_hi(&self) -> f64 {
+        self.inner.sample_waterline_hi
+    }
+
+    #[inline]
+    pub fn sample_waterline_lo(&self) -> f64 {
+        self.inner.sample_waterline_lo
+    }
+
+    #[inline]
+    pub fn feedback_overload(&self) {
+        self.inner.feedback_overload();
+    }
+
+    #[inline]
+    pub fn feedback_waterline(&self, waterline: f64) {
+        self.inner.feedback_waterline(waterline);
     }
 
     #[inline]
@@ -200,7 +441,7 @@ impl AppCore {
 
     pub fn new_with_xgb(cfg: Config, model_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
         let model_dir = model_dir.as_ref();
-        let xgb = Arc::new(XgbRuntime::load_from_dir(model_dir)?);
+        let xgb = Arc::new(XgbRuntime::load_from_dir_l1(model_dir)?);
         let l2_ctrl = Arc::new(L2Control::from_env(&cfg));
 
         // ====== 专用推理池参数（不动 Config，靠 env 控制，实验很舒服）======
@@ -323,7 +564,7 @@ impl AppCore {
 
         // ---------- L1 ----------
         let l1_dir = l1_model_dir.as_ref();
-        let xgb1 = Arc::new(XgbRuntime::load_from_dir(l1_dir)?);
+        let xgb1 = Arc::new(XgbRuntime::load_from_dir_l1(l1_dir)?);
 
         let default_l1_threads = avail.min(8).max(1);
         let l1_threads = std::env::var("XGB_L1_POOL_THREADS")
@@ -398,7 +639,7 @@ impl AppCore {
 
         if let Some(l2_dir) = l2_model_dir {
             let l2_dir = l2_dir.as_ref();
-            let x = Arc::new(XgbRuntime::load_from_dir(l2_dir)?);
+            let x = Arc::new(XgbRuntime::load_from_dir_l2(l2_dir)?);
 
             // 默认给 L2 少一点线程（因为只跑灰区），但你可以用 env 覆盖
             let default_l2_threads = (avail / 2).max(1).min(8);
@@ -414,13 +655,14 @@ impl AppCore {
 
             let feature_names = Arc::new(x.feature_names.clone());
             let model_path = x.model_path.clone();
-            let mut pool = XgbPool::new_with_pinning(
+            let mut pool = XgbPool::new_with_pinning_role(
                 model_path,
                 feature_names,
                 l2_threads,
                 l2_cap,
                 l2_warm,
                 l2_pin,
+                true,
             )?;
 
             // L2 is slower; default to a smaller budget (quarter of SLO) unless overridden.
@@ -542,6 +784,9 @@ impl AppCore {
             } else if !self.l2_ctrl.allow_by_rate() {
                 metrics::counter!("router_l2_skipped_budget_total").increment(1);
                 metrics::counter!("router_l2_skipped_rate_total").increment(1);
+            } else if !self.l2_ctrl.allow_by_sample() {
+                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                metrics::counter!("router_l2_skipped_sample_total").increment(1);
             } else {
                 metrics::counter!("router_l2_trigger_total").increment(1);
 
@@ -674,86 +919,98 @@ impl AppCore {
                 metrics::counter!("router_l2_skipped_budget_total").increment(1);
                 metrics::counter!("router_l2_skipped_rate_total").increment(1);
             }
-            // 3) queue waterline gate (avoid knee-cliff when L2 backlog grows)
-            else if self.l2_ctrl.max_queue_waterline < 1.0
-                && pool2.stats().queue_waterline() >= self.l2_ctrl.max_queue_waterline
-            {
+            // 3) sample gate
+            else if !self.l2_ctrl.allow_by_sample() {
                 metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                metrics::counter!("router_l2_skipped_waterline_total").increment(1);
+                metrics::counter!("router_l2_skipped_sample_total").increment(1);
             } else {
-                // Only build row2 when we really plan to run L2.
-                let row2: Vec<f32> = xgb2.build_row(obj);
-
-                let t_l2_total = Instant::now();
-
-                // Optional queue-wait budget for L2 pool.
-                let mut q_budget_us = self.l2_ctrl.queue_wait_budget_us;
-                if q_budget_us > 0 {
-                    q_budget_us = q_budget_us.min(remaining_us);
-                }
-
-                let rx2 = (if q_budget_us > 0 {
-                    pool2.try_submit_with_budget(row2, 5, q_budget_us)
+                // 4) queue waterline gate (avoid knee-cliff when L2 backlog grows)
+                let waterline = pool2.stats().queue_waterline();
+                self.l2_ctrl.feedback_waterline(waterline);
+                if self.l2_ctrl.max_queue_waterline < 1.0
+                    && waterline >= self.l2_ctrl.max_queue_waterline
+                {
+                    metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                    metrics::counter!("router_l2_skipped_waterline_total").increment(1);
                 } else {
-                    pool2.try_submit(row2, 5)
-                })
-                .map_err(|e| anyhow::Error::new(e))?;
+                    // Only build row2 when we really plan to run L2.
+                    let row2: Vec<f32> = xgb2.build_row(obj);
 
-                // Count as triggered only after we successfully enqueued.
-                metrics::counter!("router_l2_trigger_total").increment(1);
+                    let t_l2_total = Instant::now();
 
-                match rx2.await {
-                    Ok(inner) => match inner {
-                        Ok(out2) => {
-                            timings.l2 = now_us(t_l2_total);
-                            metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                    // Optional queue-wait budget for L2 pool.
+                    let mut q_budget_us = self.l2_ctrl.queue_wait_budget_us;
+                    if q_budget_us > 0 {
+                        q_budget_us = q_budget_us.min(remaining_us);
+                    }
 
-                            score_final = out2.score;
-                            decision = decision_from_str(xgb2.decide(out2.score));
+                    let rx2 = (if q_budget_us > 0 {
+                        pool2.try_submit_with_budget(row2, 5, q_budget_us)
+                    } else {
+                        pool2.try_submit(row2, 5)
+                    })
+                    .map_err(|e| {
+                        self.l2_ctrl.feedback_overload();
+                        anyhow::Error::new(e)
+                    })?;
 
-                            for (name, c) in out2.contrib_topk {
-                                let c = c as f64;
+                    // Count as triggered only after we successfully enqueued.
+                    metrics::counter!("router_l2_trigger_total").increment(1);
+
+                    match rx2.await {
+                        Ok(inner) => match inner {
+                            Ok(out2) => {
+                                timings.l2 = now_us(t_l2_total);
+                                metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+
+                                score_final = out2.score;
+                                decision = decision_from_str(xgb2.decide(out2.score));
+
+                                for (name, c) in out2.contrib_topk {
+                                    let c = c as f64;
+                                    reasons.push(ReasonItem {
+                                        signal: name,
+                                        value: c,
+                                        baseline_p95: 0.0,
+                                        direction: if c >= 0.0 {
+                                            "risk_up".into()
+                                        } else {
+                                            "risk_down".into()
+                                        },
+                                    });
+                                }
+
+                                // 额外给一个信息项：让你线上 debug 更爽（不会影响排序/决策）
                                 reasons.push(ReasonItem {
-                                    signal: name,
-                                    value: c,
+                                    signal: "l1_score".into(),
+                                    value: score1 as f64,
                                     baseline_p95: 0.0,
-                                    direction: if c >= 0.0 {
-                                        "risk_up".into()
-                                    } else {
-                                        "risk_down".into()
-                                    },
+                                    direction: "info".into(),
                                 });
                             }
-
-                            // 额外给一个信息项：让你线上 debug 更爽（不会影响排序/决策）
-                            reasons.push(ReasonItem {
-                                signal: "l1_score".into(),
-                                value: score1 as f64,
-                                baseline_p95: 0.0,
-                                direction: "info".into(),
-                            });
-                        }
-                        Err(e) => {
-                            // If L2 missed its queue-wait budget, degrade to L1 result (200) rather than fail the whole request.
-                            if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
-                                match pe {
-                                    XgbPoolError::DeadlineExceeded => {
-                                        timings.l2 = now_us(t_l2_total);
-                                        metrics::histogram!("stage_l2_us")
-                                            .record(timings.l2 as f64);
-                                        metrics::counter!("router_deadline_miss_total")
-                                            .increment(1);
+                            Err(e) => {
+                                // If L2 missed its queue-wait budget, degrade to L1 result (200) rather than fail the whole request.
+                                if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
+                                    match pe {
+                                        XgbPoolError::DeadlineExceeded => {
+                                            self.l2_ctrl.feedback_overload();
+                                            timings.l2 = now_us(t_l2_total);
+                                            metrics::histogram!("stage_l2_us")
+                                                .record(timings.l2 as f64);
+                                            metrics::counter!("router_deadline_miss_total")
+                                                .increment(1);
+                                        }
+                                        _ => return Err(e),
                                     }
-                                    _ => return Err(e),
+                                } else {
+                                    return Err(e);
                                 }
-                            } else {
-                                return Err(e);
                             }
+                        },
+                        Err(_) => {
+                            // oneshot canceled（极少见）：回退到 L1 结果
+                            metrics::counter!("router_deadline_miss_total").increment(1);
                         }
-                    },
-                    Err(_) => {
-                        // oneshot canceled（极少见）：回退到 L1 结果
-                        metrics::counter!("router_deadline_miss_total").increment(1);
                     }
                 }
             }
@@ -1001,88 +1258,121 @@ impl AppCore {
                 metrics::counter!("router_l2_skipped_budget_total").increment(1);
                 metrics::counter!("router_l2_skipped_rate_total").increment(1);
             }
-            // 3) queue waterline gate
-            else if self.l2_ctrl.max_queue_waterline < 1.0
-                && pool2.stats().queue_waterline() >= self.l2_ctrl.max_queue_waterline
-            {
+            // 3) sample gate
+            else if !self.l2_ctrl.allow_by_sample() {
                 metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                metrics::counter!("router_l2_skipped_waterline_total").increment(1);
+                metrics::counter!("router_l2_skipped_sample_total").increment(1);
             } else {
-                // Build L2 payload only when we really plan to run L2.
-                let mut l2_dim = xgb2.feature_names.len();
-                let payload2: Bytes = if let Some(aug) = self.stateful_l2.as_ref() {
-                    // If stateful augmenter is enabled, L2 must use (L1 + EXTRA) schema.
-                    let ctx = stateful_ctx.as_ref().expect("stateful ctx missing");
-                    let (p2, t2) = aug.build_l2_payload(&payload_for_l2, ctx);
-                    feature_us = feature_us.saturating_add(t2.build_l2_payload_us);
-                    l2_dim = aug.l2_dim();
-                    p2
+                // 4) queue waterline gate
+                let waterline = pool2.stats().queue_waterline();
+                self.l2_ctrl.feedback_waterline(waterline);
+                if self.l2_ctrl.max_queue_waterline < 1.0
+                    && waterline >= self.l2_ctrl.max_queue_waterline
+                {
+                    metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                    metrics::counter!("router_l2_skipped_waterline_total").increment(1);
                 } else {
-                    payload_for_l2.clone()
-                };
+                    // Build L2 payload only when we really plan to run L2.
+                    let use_stateful = self.stateful_l2.is_some();
 
-                let t_l2_total = Instant::now();
+                    let t_l2_total = Instant::now();
 
-                // Optional queue-wait budget for L2 pool.
-                let mut q_budget_us = self.l2_ctrl.queue_wait_budget_us;
-                if q_budget_us > 0 {
-                    q_budget_us = q_budget_us.min(remaining_us);
-                }
+                    // Optional queue-wait budget for L2 pool.
+                    let mut q_budget_us = self.l2_ctrl.queue_wait_budget_us;
+                    if q_budget_us > 0 {
+                        q_budget_us = q_budget_us.min(remaining_us);
+                    }
 
-                let rx2 = (if q_budget_us > 0 {
-                    pool2.try_submit_dense_bytes_le_with_budget(payload2, l2_dim, 0, q_budget_us)
-                } else {
-                    pool2.try_submit_dense_bytes_le(payload2, l2_dim, 0)
-                })
-                .map_err(|e| anyhow::Error::new(e));
+                    let rx2 = if use_stateful {
+                        let aug = self.stateful_l2.as_ref().unwrap();
+                        let ctx = stateful_ctx.as_ref().expect("stateful ctx missing");
+                        let mut extra = [0.0f32; EXTRA_MAX];
+                        extra[..aug.extra_dim()].copy_from_slice(&ctx.extra);
+                        if q_budget_us > 0 {
+                            pool2.try_submit_dense_bytes_le_extra_with_budget(
+                                payload_for_l2.clone(),
+                                l1_dim,
+                                extra,
+                                aug.extra_dim(),
+                                0,
+                                q_budget_us,
+                            )
+                        } else {
+                            pool2.try_submit_dense_bytes_le_extra(
+                                payload_for_l2.clone(),
+                                l1_dim,
+                                extra,
+                                aug.extra_dim(),
+                                0,
+                            )
+                        }
+                    } else if q_budget_us > 0 {
+                        pool2.try_submit_dense_bytes_le_with_budget(
+                            payload_for_l2.clone(),
+                            xgb2.feature_names.len(),
+                            0,
+                            q_budget_us,
+                        )
+                    } else {
+                        pool2.try_submit_dense_bytes_le(
+                            payload_for_l2.clone(),
+                            xgb2.feature_names.len(),
+                            0,
+                        )
+                    }
+                    .map_err(|e| anyhow::Error::new(e));
 
-                match rx2 {
-                    Ok(rx2) => {
-                        // Count as triggered only after we successfully enqueued.
-                        metrics::counter!("router_l2_trigger_total").increment(1);
+                    match rx2 {
+                        Ok(rx2) => {
+                            // Count as triggered only after we successfully enqueued.
+                            metrics::counter!("router_l2_trigger_total").increment(1);
 
-                        let rem = deadline.saturating_duration_since(Instant::now());
-                        match tokio::time::timeout(rem, rx2).await {
-                            Ok(Ok(inner)) => match inner {
-                                Ok(out2) => {
-                                    timings.l2 = now_us(t_l2_total);
-                                    metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                            let rem = deadline.saturating_duration_since(Instant::now());
+                            match tokio::time::timeout(rem, rx2).await {
+                                Ok(Ok(inner)) => match inner {
+                                    Ok(out2) => {
+                                        timings.l2 = now_us(t_l2_total);
+                                        metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
 
-                                    score_final = out2.score;
-                                    decision = decision_from_str(xgb2.decide(out2.score));
-                                }
-                                Err(e) => {
-                                    // If L2 missed its queue-wait budget, degrade to L1 result rather than fail the request.
-                                    if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
-                                        if matches!(pe, XgbPoolError::DeadlineExceeded) {
-                                            timings.l2 = now_us(t_l2_total);
-                                            metrics::histogram!("stage_l2_us")
-                                                .record(timings.l2 as f64);
-                                            metrics::counter!("router_deadline_miss_total")
-                                                .increment(1);
+                                        score_final = out2.score;
+                                        decision = decision_from_str(xgb2.decide(out2.score));
+                                    }
+                                    Err(e) => {
+                                        // If L2 missed its queue-wait budget, degrade to L1 result rather than fail the request.
+                                        if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
+                                            if matches!(pe, XgbPoolError::DeadlineExceeded) {
+                                                self.l2_ctrl.feedback_overload();
+                                                timings.l2 = now_us(t_l2_total);
+                                                metrics::histogram!("stage_l2_us")
+                                                    .record(timings.l2 as f64);
+                                                metrics::counter!("router_deadline_miss_total")
+                                                    .increment(1);
+                                            } else {
+                                                return Err(e);
+                                            }
                                         } else {
                                             return Err(e);
                                         }
-                                    } else {
-                                        return Err(e);
                                     }
+                                },
+                                Ok(Err(_)) => {
+                                    // oneshot canceled: degrade to L1
+                                    metrics::counter!("router_deadline_miss_total").increment(1);
                                 }
-                            },
-                            Ok(Err(_)) => {
-                                // oneshot canceled: degrade to L1
-                                metrics::counter!("router_deadline_miss_total").increment(1);
-                            }
-                            Err(_) => {
-                                // timeout: degrade to L1
-                                timings.l2 = now_us(t_l2_total);
-                                metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
-                                metrics::counter!("router_deadline_miss_total").increment(1);
+                                Err(_) => {
+                                    // timeout: degrade to L1
+                                    self.l2_ctrl.feedback_overload();
+                                    timings.l2 = now_us(t_l2_total);
+                                    metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                                    metrics::counter!("router_deadline_miss_total").increment(1);
+                                }
                             }
                         }
-                    }
-                    Err(_submit_err) => {
-                        // Could not enqueue L2; degrade to L1 decision.
-                        metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                        Err(_submit_err) => {
+                            // Could not enqueue L2; degrade to L1 decision.
+                            self.l2_ctrl.feedback_overload();
+                            metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                        }
                     }
                 }
             }

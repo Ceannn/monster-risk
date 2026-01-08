@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "xgb_ffi")]
+// DEPRECATED: xgb_ffi backend is kept only for offline comparison.
 use xgb_ffi::{Booster, DMatrix};
 
 #[cfg(feature = "native_l1_tl2cgen")]
@@ -204,6 +205,7 @@ impl XgbRuntime {
         // In native TL2CGEN mode, model file may not exist. In xgb_ffi mode, it must.
         #[cfg(feature = "xgb_ffi")]
         {
+            eprintln!("WARN: xgb_ffi backend is deprecated; use native_tl2cgen");
             if !model_path.exists() {
                 return Err(anyhow!(
                     "xgb_ffi enabled but model file missing: {}",
