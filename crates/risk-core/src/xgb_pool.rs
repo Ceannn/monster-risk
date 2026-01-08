@@ -366,7 +366,8 @@ impl XgbPool {
                             eprintln!("xgb-worker-{wid}: warmup done iters={warmup_iters} (tl2cgen)");
                         }
 
-                        let mut scratch_row: Vec<f32> = Vec::new();
+                        let mut scratch_row: Vec<f32> = Vec::with_capacity(model_dim);
+                        let mut last_extra_dim: Option<usize> = None;
                         let backoff = Backoff::new();
 
                         loop {
@@ -461,8 +462,11 @@ impl XgbPool {
                                         t_build.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                                     metrics::histogram!("l2_payload_extra_build_us")
                                         .record(build_us as f64);
-                                    metrics::gauge!("l2_payload_extra_dim")
-                                        .set(extra_dim as f64);
+                                    if last_extra_dim != Some(extra_dim) {
+                                        metrics::gauge!("l2_payload_extra_dim")
+                                            .set(extra_dim as f64);
+                                        last_extra_dim = Some(extra_dim);
+                                    }
                                     if fallback {
                                         metrics::counter!("l2_payload_decode_fallback_total").increment(1);
                                     }

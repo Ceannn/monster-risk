@@ -682,8 +682,8 @@ async fn handle_conn(
                         metrics::counter!("router_l2_skipped_budget_total").increment(1);
                         metrics::counter!("router_l2_skipped_sample_total").increment(1);
                     } else {
-                        let st_waterline = pool2.stats().queue_waterline();
-                        l2_ctrl.feedback_waterline(st_waterline);
+                        let st_waterline =
+                            l2_ctrl.waterline_cached_or_update(|| pool2.stats().queue_waterline());
                         let max_w = l2_ctrl.max_queue_waterline();
                         if max_w < 1.0 && st_waterline >= max_w {
                             metrics::counter!("router_l2_skipped_budget_total").increment(1);
@@ -702,7 +702,7 @@ async fn handle_conn(
                                 extra[..aug.extra_dim()].copy_from_slice(&ctx.extra);
                                 if q_budget_us > 0 {
                                     pool2.try_submit_dense_bytes_le_extra_with_budget(
-                                        payload_for_l2.clone(),
+                                        payload_for_l2,
                                         dim,
                                         extra,
                                         aug.extra_dim(),
@@ -711,7 +711,7 @@ async fn handle_conn(
                                     )
                                 } else {
                                     pool2.try_submit_dense_bytes_le_extra(
-                                        payload_for_l2.clone(),
+                                        payload_for_l2,
                                         dim,
                                         extra,
                                         aug.extra_dim(),
@@ -720,14 +720,14 @@ async fn handle_conn(
                                 }
                             } else if q_budget_us > 0 {
                                 pool2.try_submit_dense_bytes_le_with_budget(
-                                    payload_for_l2.clone(),
+                                    payload_for_l2,
                                     xgb2.feature_names.len(),
                                     0,
                                     q_budget_us,
                                 )
                             } else {
                                 pool2.try_submit_dense_bytes_le(
-                                    payload_for_l2.clone(),
+                                    payload_for_l2,
                                     xgb2.feature_names.len(),
                                     0,
                                 )

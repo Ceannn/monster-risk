@@ -124,6 +124,12 @@ struct L2Control {
     sample_waterline_target: f64,
     sample_waterline_hi: f64,
     sample_waterline_lo: f64,
+    /// Cached L2 queue waterline (bits).
+    waterline_cached_bits: AtomicU64,
+    /// Last waterline refresh time (ms since start).
+    waterline_last_update_ms: AtomicU64,
+    /// Counter to throttle waterline refreshes.
+    waterline_update_ctr: AtomicU64,
     /// Local timebase for feedback throttling.
     start: Instant,
 }
@@ -199,6 +205,9 @@ impl L2Control {
             sample_waterline_target,
             sample_waterline_hi,
             sample_waterline_lo,
+            waterline_cached_bits: AtomicU64::new(0.0f64.to_bits()),
+            waterline_last_update_ms: AtomicU64::new(0),
+            waterline_update_ctr: AtomicU64::new(0),
             start: Instant::now(),
         }
     }
@@ -245,6 +254,36 @@ impl L2Control {
     #[inline]
     fn sample_dyn_ratio(&self) -> f64 {
         self.sample_dyn_ppm.load(Ordering::Relaxed).min(1_000_000) as f64 / 1_000_000.0
+    }
+
+    #[inline]
+    fn waterline_cached_or_update<F>(&self, fetch: F) -> f64
+    where
+        F: FnOnce() -> f64,
+    {
+        const UPDATE_EVERY: u64 = 1024;
+        const UPDATE_INTERVAL_MS: u64 = 200;
+
+        let cnt = self.waterline_update_ctr.fetch_add(1, Ordering::Relaxed) + 1;
+        let now_ms = self.start.elapsed().as_millis() as u64;
+        let last = self.waterline_last_update_ms.load(Ordering::Relaxed);
+        if (cnt % UPDATE_EVERY != 0) && now_ms.saturating_sub(last) < UPDATE_INTERVAL_MS {
+            return f64::from_bits(self.waterline_cached_bits.load(Ordering::Relaxed));
+        }
+        if self
+            .waterline_last_update_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return f64::from_bits(self.waterline_cached_bits.load(Ordering::Relaxed));
+        }
+        self.waterline_update_ctr.store(0, Ordering::Relaxed);
+
+        let waterline = fetch();
+        self.waterline_cached_bits
+            .store(waterline.to_bits(), Ordering::Relaxed);
+        self.feedback_waterline(waterline);
+        waterline
     }
 
     fn feedback_overload(&self) {
@@ -354,6 +393,14 @@ impl L2ControlView {
     #[inline]
     pub fn sample_dyn_ratio(&self) -> f64 {
         self.inner.sample_dyn_ratio()
+    }
+
+    #[inline]
+    pub fn waterline_cached_or_update<F>(&self, fetch: F) -> f64
+    where
+        F: FnOnce() -> f64,
+    {
+        self.inner.waterline_cached_or_update(fetch)
     }
 
     #[inline]
@@ -925,8 +972,9 @@ impl AppCore {
                 metrics::counter!("router_l2_skipped_sample_total").increment(1);
             } else {
                 // 4) queue waterline gate (avoid knee-cliff when L2 backlog grows)
-                let waterline = pool2.stats().queue_waterline();
-                self.l2_ctrl.feedback_waterline(waterline);
+                let waterline = self
+                    .l2_ctrl
+                    .waterline_cached_or_update(|| pool2.stats().queue_waterline());
                 if self.l2_ctrl.max_queue_waterline < 1.0
                     && waterline >= self.l2_ctrl.max_queue_waterline
                 {
@@ -1264,8 +1312,9 @@ impl AppCore {
                 metrics::counter!("router_l2_skipped_sample_total").increment(1);
             } else {
                 // 4) queue waterline gate
-                let waterline = pool2.stats().queue_waterline();
-                self.l2_ctrl.feedback_waterline(waterline);
+                let waterline = self
+                    .l2_ctrl
+                    .waterline_cached_or_update(|| pool2.stats().queue_waterline());
                 if self.l2_ctrl.max_queue_waterline < 1.0
                     && waterline >= self.l2_ctrl.max_queue_waterline
                 {
@@ -1290,7 +1339,7 @@ impl AppCore {
                         extra[..aug.extra_dim()].copy_from_slice(&ctx.extra);
                         if q_budget_us > 0 {
                             pool2.try_submit_dense_bytes_le_extra_with_budget(
-                                payload_for_l2.clone(),
+                                payload_for_l2,
                                 l1_dim,
                                 extra,
                                 aug.extra_dim(),
@@ -1299,7 +1348,7 @@ impl AppCore {
                             )
                         } else {
                             pool2.try_submit_dense_bytes_le_extra(
-                                payload_for_l2.clone(),
+                                payload_for_l2,
                                 l1_dim,
                                 extra,
                                 aug.extra_dim(),
@@ -1308,17 +1357,13 @@ impl AppCore {
                         }
                     } else if q_budget_us > 0 {
                         pool2.try_submit_dense_bytes_le_with_budget(
-                            payload_for_l2.clone(),
+                            payload_for_l2,
                             xgb2.feature_names.len(),
                             0,
                             q_budget_us,
                         )
                     } else {
-                        pool2.try_submit_dense_bytes_le(
-                            payload_for_l2.clone(),
-                            xgb2.feature_names.len(),
-                            0,
-                        )
+                        pool2.try_submit_dense_bytes_le(payload_for_l2, xgb2.feature_names.len(), 0)
                     }
                     .map_err(|e| anyhow::Error::new(e));
 
