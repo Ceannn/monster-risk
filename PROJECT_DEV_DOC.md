@@ -350,11 +350,14 @@ ldd target/release/risk-server-glommio | rg -i "xgboost|gomp"
 
 Stateful store / L2 payload 相关：
 - `FEATURE_STORE_SHARDS`（`FeatureStoreU64` + graph store 分片）
+- `FEATURE_STORE_SHARD_CAP`（每个 store shard 预留容量，0=不预留）
+- `GRAPH_STORE_SHARD_CAP`（每个 graph shard 预留容量，0=不预留）
 - 指标：`feature_store_shard_lock_us` / `feature_store_evicted_total` / `feature_store_keys_total`
 - L2 extra 由 worker scratch 构造（不在 IO 线程拼 bytes）
 - 指标：`l2_payload_extra_build_us` / `l2_payload_extra_dim` / `l2_payload_decode_fallback_total`
 
-另外：高 RPS 下 histogram 写入有额外开销，可用 `RISK_METRICS_SAMPLE_LOG2` 采样写入 histogram（RSK1 响应 timings 不变）。
+另外：高 RPS 下 histogram 写入有额外开销，可用 `RISK_METRICS_SAMPLE_LOG2` 采样写入 histogram（serialize_us 仅在采样时计算，未采样为 0）。  
+counter 也支持批量刷新：`RISK_METRICS_COUNTER_BATCH`（默认 256）/ `RISK_METRICS_COUNTER_FLUSH_MS`（默认 200ms）。
 
 ---
 

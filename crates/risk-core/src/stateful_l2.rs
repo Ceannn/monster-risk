@@ -1,13 +1,15 @@
 use crate::config::Config;
 use crate::feature_store_u64::{FeatureStoreU64, StoreFeatures};
+use crate::ring_buf::RingBuf;
+use crate::util::mix_u64;
 use anyhow::{bail, Context};
 use bytes::{Bytes, BytesMut};
-use crate::util::mix_u64;
 use hashbrown::HashMap;
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
+
+type FastHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
 pub const EXTRA_FEATURE_NAMES: &[&str] = &[
     "uid_velocity_60s",
@@ -286,8 +288,8 @@ fn read_f32_le(bytes: &Bytes, idx: usize) -> Option<f32> {
 struct UniqueWindow {
     win_ms: i64,
     max_events: usize,
-    q: VecDeque<(i64, u64)>,
-    counts: HashMap<u64, u32>,
+    q: RingBuf<(i64, u64)>,
+    counts: FastHashMap<u64, u32>,
 }
 
 impl UniqueWindow {
@@ -295,14 +297,15 @@ impl UniqueWindow {
         Self {
             win_ms,
             max_events,
-            q: VecDeque::new(),
-            counts: HashMap::new(),
+            q: RingBuf::default(),
+            counts: FastHashMap::default(),
         }
     }
 
     fn expire(&mut self, now_ms: i64) {
         let min_keep = now_ms.saturating_sub(self.win_ms);
-        while let Some((t, other)) = self.q.front().copied() {
+        while let Some(front) = self.q.front() {
+            let (t, other) = *front;
             if t >= min_keep {
                 break;
             }
@@ -350,7 +353,7 @@ struct BipartiteKeyState {
 struct BipartiteUniqueStore {
     win_60s_ms: i64,
     win_300s_ms: i64,
-    shards: Arc<Vec<Mutex<HashMap<u64, BipartiteKeyState>>>>,
+    shards: Arc<Vec<Mutex<FastHashMap<u64, BipartiteKeyState>>>>,
     shard_mask: usize,
 }
 
@@ -365,9 +368,18 @@ impl BipartiteUniqueStore {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(default_shards);
         let shard_count = shard_hint.max(1).next_power_of_two();
+        let shard_cap = std::env::var("GRAPH_STORE_SHARD_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            shards.push(Mutex::new(HashMap::new()));
+            let map = if shard_cap > 0 {
+                FastHashMap::with_capacity_and_hasher(shard_cap, Default::default())
+            } else {
+                FastHashMap::default()
+            };
+            shards.push(Mutex::new(map));
         }
         Self {
             win_60s_ms: (win_60s as i64) * 1000,

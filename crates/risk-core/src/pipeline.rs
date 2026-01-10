@@ -306,7 +306,7 @@ impl L2Control {
             self.sample_dyn_ppm.store(next_ppm, Ordering::Relaxed);
             metrics::gauge!("router_l2_sample_ratio").set(next / 1_000_000.0);
         }
-        metrics::counter!("router_l2_feedback_overload_total").increment(1);
+        crate::batched_counter!("router_l2_feedback_overload_total").increment(1);
     }
 
     fn feedback_waterline(&self, waterline: f64) {
@@ -356,7 +356,7 @@ impl L2Control {
         let cur_ppm = cur.round() as u64;
         if next_ppm != cur_ppm {
             if next > cur {
-                metrics::counter!("router_l2_feedback_relax_total").increment(1);
+                crate::batched_counter!("router_l2_feedback_relax_total").increment(1);
             }
             self.sample_dyn_ppm.store(next_ppm, Ordering::Relaxed);
             metrics::gauge!("router_l2_sample_ratio").set(next / 1_000_000.0);
@@ -442,6 +442,22 @@ impl L2ControlView {
     pub fn queue_wait_budget_us(&self) -> u64 {
         self.inner.queue_wait_budget_us
     }
+}
+
+#[inline]
+fn record_serialize_metrics(resp: &mut ScoreResponse) {
+    let ser_hist = crate::sampled_histogram!("stage_serialize_us");
+    if ser_hist.enabled() {
+        let t_ser = Instant::now();
+        let _ = serde_json::to_vec(resp);
+        resp.timings_us.serialize = now_us(t_ser);
+        ser_hist.record(resp.timings_us.serialize as f64);
+    }
+}
+
+#[inline]
+fn record_e2e_metrics(t0: Instant) {
+    crate::sampled_histogram!("e2e_us").record(now_us(t0) as f64);
 }
 
 #[derive(Clone)]
@@ -796,12 +812,12 @@ impl AppCore {
         let t_feat = Instant::now();
         let row1 = xgb1.build_row(obj);
         timings.feature = now_us(t_feat);
-        metrics::histogram!("stage_feature_us").record(timings.feature as f64);
+        crate::sampled_histogram!("stage_feature_us").record(timings.feature as f64);
 
         let t_l1 = Instant::now();
         let score1 = xgb1.predict_proba(&row1)?;
         timings.xgb = now_us(t_l1);
-        metrics::histogram!("stage_xgb_us").record(timings.xgb as f64);
+        crate::sampled_histogram!("stage_xgb_us").record(timings.xgb as f64);
 
         let mut score_final = score1;
         let mut decision: Decision = decision_from_str(xgb1.decide(score1));
@@ -822,20 +838,20 @@ impl AppCore {
                 .min(u128::from(u64::MAX)) as u64;
 
             if remaining_us < self.l2_ctrl.min_remaining_us {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
                 if now >= deadline {
-                    metrics::counter!("router_timeout_before_l2_total").increment(1);
+                    crate::batched_counter!("router_timeout_before_l2_total").increment(1);
                 } else {
-                    metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                    crate::batched_counter!("router_l2_skipped_deadline_budget_total").increment(1);
                 }
             } else if !self.l2_ctrl.allow_by_rate() {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                metrics::counter!("router_l2_skipped_rate_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_rate_total").increment(1);
             } else if !self.l2_ctrl.allow_by_sample() {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                metrics::counter!("router_l2_skipped_sample_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_sample_total").increment(1);
             } else {
-                metrics::counter!("router_l2_trigger_total").increment(1);
+                crate::batched_counter!("router_l2_trigger_total").increment(1);
 
                 let row2 = xgb2.build_row(obj);
 
@@ -856,7 +872,7 @@ impl AppCore {
                     });
                 }
                 timings.l2 = now_us(t_l2);
-                metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                crate::sampled_histogram!("stage_l2_us").record(timings.l2 as f64);
 
                 decision = decision_from_str(xgb2.decide(score_final));
 
@@ -870,7 +886,7 @@ impl AppCore {
         }
 
         timings.router = now_us(t_router);
-        metrics::histogram!("stage_router_us").record(timings.router as f64);
+        crate::sampled_histogram!("stage_router_us").record(timings.router as f64);
 
         let mut resp = ScoreResponse {
             trace_id: Uuid::new_v4(),
@@ -880,12 +896,8 @@ impl AppCore {
             timings_us: timings,
         };
 
-        let t_ser = Instant::now();
-        let _ = serde_json::to_vec(&resp);
-        resp.timings_us.serialize = now_us(t_ser);
-        metrics::histogram!("stage_serialize_us").record(resp.timings_us.serialize as f64);
-
-        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
+        record_serialize_metrics(&mut resp);
+        record_e2e_metrics(t0);
 
         Ok(resp)
     }
@@ -913,7 +925,7 @@ impl AppCore {
         let t_feat = Instant::now();
         let row1: Vec<f32> = xgb1.build_row(obj);
         timings.feature = now_us(t_feat);
-        metrics::histogram!("stage_feature_us").record(timings.feature as f64);
+        crate::sampled_histogram!("stage_feature_us").record(timings.feature as f64);
 
         // L1：score（pool）
         let t_l1_total = Instant::now();
@@ -926,7 +938,7 @@ impl AppCore {
             .map_err(|_| anyhow::Error::new(XgbPoolError::Canceled))??;
 
         timings.xgb = now_us(t_l1_total);
-        metrics::histogram!("stage_xgb_us").record(timings.xgb as f64);
+        crate::sampled_histogram!("stage_xgb_us").record(timings.xgb as f64);
 
         let score1 = out1.score;
         let mut score_final = score1;
@@ -954,22 +966,22 @@ impl AppCore {
 
             // 1) deadline / remaining budget
             if remaining_us < self.l2_ctrl.min_remaining_us {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
                 if now >= deadline {
-                    metrics::counter!("router_timeout_before_l2_total").increment(1);
+                    crate::batched_counter!("router_timeout_before_l2_total").increment(1);
                 } else {
-                    metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                    crate::batched_counter!("router_l2_skipped_deadline_budget_total").increment(1);
                 }
             }
             // 2) per-second budget (rate limiter)
             else if !self.l2_ctrl.allow_by_rate() {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                metrics::counter!("router_l2_skipped_rate_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_rate_total").increment(1);
             }
             // 3) sample gate
             else if !self.l2_ctrl.allow_by_sample() {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                metrics::counter!("router_l2_skipped_sample_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_sample_total").increment(1);
             } else {
                 // 4) queue waterline gate (avoid knee-cliff when L2 backlog grows)
                 let waterline = self
@@ -978,8 +990,8 @@ impl AppCore {
                 if self.l2_ctrl.max_queue_waterline < 1.0
                     && waterline >= self.l2_ctrl.max_queue_waterline
                 {
-                    metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                    metrics::counter!("router_l2_skipped_waterline_total").increment(1);
+                    crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                    crate::batched_counter!("router_l2_skipped_waterline_total").increment(1);
                 } else {
                     // Only build row2 when we really plan to run L2.
                     let row2: Vec<f32> = xgb2.build_row(obj);
@@ -1003,13 +1015,13 @@ impl AppCore {
                     })?;
 
                     // Count as triggered only after we successfully enqueued.
-                    metrics::counter!("router_l2_trigger_total").increment(1);
+                    crate::batched_counter!("router_l2_trigger_total").increment(1);
 
                     match rx2.await {
                         Ok(inner) => match inner {
                             Ok(out2) => {
                                 timings.l2 = now_us(t_l2_total);
-                                metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                                crate::sampled_histogram!("stage_l2_us").record(timings.l2 as f64);
 
                                 score_final = out2.score;
                                 decision = decision_from_str(xgb2.decide(out2.score));
@@ -1043,9 +1055,9 @@ impl AppCore {
                                         XgbPoolError::DeadlineExceeded => {
                                             self.l2_ctrl.feedback_overload();
                                             timings.l2 = now_us(t_l2_total);
-                                            metrics::histogram!("stage_l2_us")
+                                            crate::sampled_histogram!("stage_l2_us")
                                                 .record(timings.l2 as f64);
-                                            metrics::counter!("router_deadline_miss_total")
+                                            crate::batched_counter!("router_deadline_miss_total")
                                                 .increment(1);
                                         }
                                         _ => return Err(e),
@@ -1057,7 +1069,7 @@ impl AppCore {
                         },
                         Err(_) => {
                             // oneshot canceled（极少见）：回退到 L1 结果
-                            metrics::counter!("router_deadline_miss_total").increment(1);
+                            crate::batched_counter!("router_deadline_miss_total").increment(1);
                         }
                     }
                 }
@@ -1067,9 +1079,9 @@ impl AppCore {
             let explain_budget = Duration::from_millis(((self.cfg.slo_p99_ms as u64) / 3).max(1));
             let now = Instant::now();
             if now + explain_budget > deadline {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
             } else {
-                metrics::counter!("router_l2_trigger_total").increment(1);
+                crate::batched_counter!("router_l2_trigger_total").increment(1);
 
                 let t_l2_total = Instant::now();
                 let rx2 = pool1
@@ -1081,7 +1093,7 @@ impl AppCore {
                     .map_err(|_| anyhow::Error::new(XgbPoolError::Canceled))??;
 
                 timings.l2 = now_us(t_l2_total);
-                metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                crate::sampled_histogram!("stage_l2_us").record(timings.l2 as f64);
 
                 for (name, c) in out2.contrib_topk {
                     let c = c as f64;
@@ -1100,7 +1112,7 @@ impl AppCore {
         }
 
         timings.router = now_us(t_router);
-        metrics::histogram!("stage_router_us").record(timings.router as f64);
+        crate::sampled_histogram!("stage_router_us").record(timings.router as f64);
 
         let mut resp = ScoreResponse {
             trace_id: Uuid::new_v4(),
@@ -1110,12 +1122,8 @@ impl AppCore {
             timings_us: timings,
         };
 
-        let t_ser = Instant::now();
-        let _ = serde_json::to_vec(&resp);
-        resp.timings_us.serialize = now_us(t_ser);
-        metrics::histogram!("stage_serialize_us").record(resp.timings_us.serialize as f64);
-
-        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
+        record_serialize_metrics(&mut resp);
+        record_e2e_metrics(t0);
 
         Ok(resp)
     }
@@ -1135,7 +1143,7 @@ impl AppCore {
         let mut timings = TimingsUs::default();
         timings.parse = parse_us;
         timings.feature = 0;
-        metrics::histogram!("stage_feature_us").record(0.0);
+        crate::sampled_histogram!("stage_feature_us").record(0.0);
 
         let xgb1 = self
             .xgb
@@ -1163,7 +1171,7 @@ impl AppCore {
             .map_err(|_| anyhow::Error::new(XgbPoolError::Canceled))??;
 
         timings.xgb = now_us(t_l1_total);
-        metrics::histogram!("stage_xgb_us").record(timings.xgb as f64);
+        crate::sampled_histogram!("stage_xgb_us").record(timings.xgb as f64);
 
         let score1 = out1.score;
         let score_final = score1;
@@ -1174,8 +1182,8 @@ impl AppCore {
         // router：当前 dense 版本默认不跑 L2（因为缺少 obj，无法按 L2 的 feature_names 重建 row2）
         let t_router = Instant::now();
         if matches!(decision, Decision::ManualReview) && self.xgb_l2.is_some() {
-            metrics::counter!("router_l2_skipped_budget_total").increment(1);
-            metrics::counter!("router_l2_skipped_dense_unsupported_total").increment(1);
+            crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
+            crate::batched_counter!("router_l2_skipped_dense_unsupported_total").increment(1);
 
             // 如果已经接近 deadline，就把原因单独记一笔（论文里很好解释）
             let now = Instant::now();
@@ -1185,11 +1193,11 @@ impl AppCore {
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
             if remaining_us < self.l2_ctrl.min_remaining_us {
-                metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_deadline_budget_total").increment(1);
             }
         }
         timings.router = now_us(t_router);
-        metrics::histogram!("stage_router_us").record(timings.router as f64);
+        crate::sampled_histogram!("stage_router_us").record(timings.router as f64);
 
         let mut resp = ScoreResponse {
             trace_id: Uuid::new_v4(),
@@ -1199,12 +1207,8 @@ impl AppCore {
             timings_us: timings,
         };
 
-        let t_ser = Instant::now();
-        let _ = serde_json::to_vec(&resp);
-        resp.timings_us.serialize = now_us(t_ser);
-        metrics::histogram!("stage_serialize_us").record(resp.timings_us.serialize as f64);
-
-        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
+        record_serialize_metrics(&mut resp);
+        record_e2e_metrics(t0);
 
         Ok(resp)
     }
@@ -1270,7 +1274,7 @@ impl AppCore {
         };
 
         timings.xgb = now_us(t_l1_total);
-        metrics::histogram!("stage_xgb_us").record(timings.xgb as f64);
+        crate::sampled_histogram!("stage_xgb_us").record(timings.xgb as f64);
 
         let score1 = out1.score;
         let mut score_final = score1;
@@ -1294,22 +1298,22 @@ impl AppCore {
 
             // 1) deadline / remaining budget
             if remaining_us < self.l2_ctrl.min_remaining_us {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
                 if now >= deadline {
-                    metrics::counter!("router_timeout_before_l2_total").increment(1);
+                    crate::batched_counter!("router_timeout_before_l2_total").increment(1);
                 } else {
-                    metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                    crate::batched_counter!("router_l2_skipped_deadline_budget_total").increment(1);
                 }
             }
             // 2) per-second budget (rate limiter)
             else if !self.l2_ctrl.allow_by_rate() {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                metrics::counter!("router_l2_skipped_rate_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_rate_total").increment(1);
             }
             // 3) sample gate
             else if !self.l2_ctrl.allow_by_sample() {
-                metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                metrics::counter!("router_l2_skipped_sample_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                crate::batched_counter!("router_l2_skipped_sample_total").increment(1);
             } else {
                 // 4) queue waterline gate
                 let waterline = self
@@ -1318,8 +1322,8 @@ impl AppCore {
                 if self.l2_ctrl.max_queue_waterline < 1.0
                     && waterline >= self.l2_ctrl.max_queue_waterline
                 {
-                    metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                    metrics::counter!("router_l2_skipped_waterline_total").increment(1);
+                    crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                    crate::batched_counter!("router_l2_skipped_waterline_total").increment(1);
                 } else {
                     // Build L2 payload only when we really plan to run L2.
                     let use_stateful = self.stateful_l2.is_some();
@@ -1370,14 +1374,14 @@ impl AppCore {
                     match rx2 {
                         Ok(rx2) => {
                             // Count as triggered only after we successfully enqueued.
-                            metrics::counter!("router_l2_trigger_total").increment(1);
+                            crate::batched_counter!("router_l2_trigger_total").increment(1);
 
                             let rem = deadline.saturating_duration_since(Instant::now());
                             match tokio::time::timeout(rem, rx2).await {
                                 Ok(Ok(inner)) => match inner {
                                     Ok(out2) => {
                                         timings.l2 = now_us(t_l2_total);
-                                        metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                                        crate::sampled_histogram!("stage_l2_us").record(timings.l2 as f64);
 
                                         score_final = out2.score;
                                         decision = decision_from_str(xgb2.decide(out2.score));
@@ -1388,9 +1392,9 @@ impl AppCore {
                                             if matches!(pe, XgbPoolError::DeadlineExceeded) {
                                                 self.l2_ctrl.feedback_overload();
                                                 timings.l2 = now_us(t_l2_total);
-                                                metrics::histogram!("stage_l2_us")
+                                                crate::sampled_histogram!("stage_l2_us")
                                                     .record(timings.l2 as f64);
-                                                metrics::counter!("router_deadline_miss_total")
+                                                crate::batched_counter!("router_deadline_miss_total")
                                                     .increment(1);
                                             } else {
                                                 return Err(e);
@@ -1402,21 +1406,21 @@ impl AppCore {
                                 },
                                 Ok(Err(_)) => {
                                     // oneshot canceled: degrade to L1
-                                    metrics::counter!("router_deadline_miss_total").increment(1);
+                                    crate::batched_counter!("router_deadline_miss_total").increment(1);
                                 }
                                 Err(_) => {
                                     // timeout: degrade to L1
                                     self.l2_ctrl.feedback_overload();
                                     timings.l2 = now_us(t_l2_total);
-                                    metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
-                                    metrics::counter!("router_deadline_miss_total").increment(1);
+                                    crate::sampled_histogram!("stage_l2_us").record(timings.l2 as f64);
+                                    crate::batched_counter!("router_deadline_miss_total").increment(1);
                                 }
                             }
                         }
                         Err(_submit_err) => {
                             // Could not enqueue L2; degrade to L1 decision.
                             self.l2_ctrl.feedback_overload();
-                            metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                            crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
                         }
                     }
                 }
@@ -1424,10 +1428,10 @@ impl AppCore {
         }
 
         timings.feature = feature_us;
-        metrics::histogram!("stage_feature_us").record(feature_us as f64);
+        crate::sampled_histogram!("stage_feature_us").record(feature_us as f64);
 
         timings.router = now_us(t_router);
-        metrics::histogram!("stage_router_us").record(timings.router as f64);
+        crate::sampled_histogram!("stage_router_us").record(timings.router as f64);
 
         let mut resp = ScoreResponse {
             trace_id: Uuid::new_v4(),
@@ -1437,12 +1441,8 @@ impl AppCore {
             timings_us: timings,
         };
 
-        let t_ser = Instant::now();
-        let _ = serde_json::to_vec(&resp);
-        resp.timings_us.serialize = now_us(t_ser);
-        metrics::histogram!("stage_serialize_us").record(resp.timings_us.serialize as f64);
-
-        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
+        record_serialize_metrics(&mut resp);
+        record_e2e_metrics(t0);
 
         Ok(resp)
     }
@@ -1461,20 +1461,20 @@ impl AppCore {
         let tf0 = Instant::now();
         let feats = self.extract_features(&req);
         timings.feature = now_us(tf0);
-        metrics::histogram!("stage_feature_us").record(timings.feature as f64);
+        crate::sampled_histogram!("stage_feature_us").record(timings.feature as f64);
 
         // router + L1
         let tr0 = Instant::now();
         let tl10 = Instant::now();
         let s1: f64 = self.models.l1.score(&feats) as f64;
         timings.xgb = now_us(tl10);
-        metrics::histogram!("stage_xgb_us").record(timings.xgb as f64);
+        crate::sampled_histogram!("stage_xgb_us").record(timings.xgb as f64);
 
         // optional L2（预算式）
         let mut score: f64 = s1;
         let mut used_l2 = false;
-        metrics::counter!("router_l2_trigger_total").increment(0);
-        metrics::counter!("router_l2_skipped_budget_total").increment(0);
+        crate::batched_counter!("router_l2_trigger_total").increment(0);
+        crate::batched_counter!("router_l2_skipped_budget_total").increment(0);
         if s1 > self.cfg.l1_uncertain_low as f64 && s1 < self.cfg.l1_uncertain_high as f64 {
             let now = Instant::now();
             if now < deadline {
@@ -1483,25 +1483,25 @@ impl AppCore {
                     let tl20 = Instant::now();
                     let s2: f64 = self.models.l2.score(&feats) as f64;
                     timings.l2 = now_us(tl20);
-                    metrics::histogram!("stage_l2_us").record(timings.l2 as f64);
+                    crate::sampled_histogram!("stage_l2_us").record(timings.l2 as f64);
 
                     score = s2;
                     used_l2 = true;
-                    metrics::counter!("router_l2_trigger_total").increment(1);
+                    crate::batched_counter!("router_l2_trigger_total").increment(1);
                 } else {
-                    metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                    crate::batched_counter!("router_l2_skipped_budget_total").increment(1);
                 }
             } else {
-                metrics::counter!("router_timeout_before_l2_total").increment(1);
+                crate::batched_counter!("router_timeout_before_l2_total").increment(1);
             }
         }
 
         timings.router = now_us(tr0);
-        metrics::histogram!("stage_router_us").record(timings.router as f64);
+        crate::sampled_histogram!("stage_router_us").record(timings.router as f64);
 
         // decision
         let decision = if Instant::now() > deadline {
-            metrics::counter!("router_deadline_miss_total").increment(1);
+            crate::batched_counter!("router_deadline_miss_total").increment(1);
             Decision::DegradeAllow
         } else if score >= self.cfg.deny_threshold as f64 {
             Decision::Deny
@@ -1531,12 +1531,8 @@ impl AppCore {
         };
 
         // serialize（统计用；真正响应序列化在 server 层）
-        let ts0 = Instant::now();
-        let _ = serde_json::to_vec(&resp);
-        resp.timings_us.serialize = now_us(ts0);
-        metrics::histogram!("stage_serialize_us").record(resp.timings_us.serialize as f64);
-
-        metrics::histogram!("e2e_us").record(now_us(t0) as f64);
+        record_serialize_metrics(&mut resp);
+        record_e2e_metrics(t0);
 
         resp
     }

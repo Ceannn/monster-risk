@@ -335,14 +335,18 @@ python3 scripts/ml/sweep_scalar_frontier.py \
 新增指标：`router_l2_skipped_sample_total` / `router_l2_sample_ratio` / `router_l2_feedback_overload_total` / `router_l2_feedback_relax_total`。
 
 ### 8.2 Metrics 采样（环境变量）
-高 RPS 下 `metrics::histogram!` 记录本身有原子开销；我们保持 **RSK1 响应里 timings 不变**，但允许采样写入 histogram。
+高 RPS 下 `metrics::histogram!` 记录本身有原子开销；我们允许采样写入 histogram，并且 **serialize_us 仅在采样时计算**（未采样时为 0）。
 
 - `RISK_METRICS_SAMPLE_LOG2`：  
   - `0`（默认）= 每个请求都 record  
   - `N>0` = 只 record `1/2^N` 的请求（确定性采样，低开销）
+- `RISK_METRICS_COUNTER_BATCH`：counter 批量刷新阈值（默认 256，`1`=不批量）。  
+- `RISK_METRICS_COUNTER_FLUSH_MS`：counter 定时刷新间隔（默认 200ms，`0`=不定时）。  
 
 ### 8.3 Stateful Store / L2 Payload
 - `FEATURE_STORE_SHARDS`：stateful store 分片数（默认 `next_pow2(2 * cpu)`），影响 `FeatureStoreU64` 和 graph store。  
+- `FEATURE_STORE_SHARD_CAP`：每个 store shard 的预留容量（0=不预留）。  
+- `GRAPH_STORE_SHARD_CAP`：每个 graph shard 的预留容量（0=不预留）。  
 - store 相关指标：`feature_store_shard_lock_us` / `feature_store_evicted_total` / `feature_store_keys_total`。  
 - L2 payload 相关指标：`l2_payload_extra_build_us` / `l2_payload_extra_dim` / `l2_payload_decode_fallback_total`。  
 - L2 extra 不再在 IO 线程拼接 bytes；由 L2 worker 使用 scratch 复用构造。

@@ -1,9 +1,11 @@
+use crate::ring_buf::RingBuf;
 use crate::util::mix_u64;
 use hashbrown::HashMap;
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+type FastHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
 /// 100ms 分桶的滑窗特征存储（u64 key 版本）
 ///
@@ -15,11 +17,11 @@ use std::time::Instant;
 /// 设计取舍（方便你写论文/答辩）：
 /// - 100ms 桶粒度更细，能捕捉“突发脉冲”
 /// - 但窗口内桶数更多（300s → 3000 桶）
-/// - 为避免每个用户预分配 3000 桶导致内存炸裂，这里使用 **稀疏 VecDeque**：
+/// - 为避免每个用户预分配 3000 桶导致内存炸裂，这里使用 **稀疏环形缓冲**：
 ///   只为出现过交易的 bucket 分配节点。低频用户非常省内存。
 #[derive(Debug)]
 pub struct FeatureStoreU64 {
-    shards: Vec<Mutex<HashMap<u64, UserState>>>,
+    shards: Vec<Mutex<FastHashMap<u64, UserState>>>,
     shard_mask: usize,
     win_60s: i64,
     win_300s: i64,
@@ -47,7 +49,7 @@ impl Clone for FeatureStoreU64 {
 struct UserState {
     last_event_time_ms: i64,
     max_bucket_seen: i64,
-    buckets: VecDeque<Bucket>, // 按 bucket_id 升序
+    buckets: RingBuf<Bucket>, // 按 bucket_id 升序
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -89,10 +91,19 @@ impl FeatureStoreU64 {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(default_shards);
         let shard_count = shard_hint.max(1).next_power_of_two();
+        let shard_cap = std::env::var("FEATURE_STORE_SHARD_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
 
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            shards.push(Mutex::new(HashMap::new()));
+            let map = if shard_cap > 0 {
+                FastHashMap::with_capacity_and_hasher(shard_cap, Default::default())
+            } else {
+                FastHashMap::default()
+            };
+            shards.push(Mutex::new(map));
         }
         Self {
             shards,
@@ -133,7 +144,7 @@ impl FeatureStoreU64 {
         let t_lock = Instant::now();
         let mut shard = self.shards[shard_idx].lock();
         let lock_us = t_lock.elapsed().as_micros() as u64;
-        metrics::histogram!("feature_store_shard_lock_us").record(lock_us as f64);
+        crate::sampled_histogram!("feature_store_shard_lock_us").record(lock_us as f64);
 
         let entry = match shard.entry(key) {
             hashbrown::hash_map::Entry::Occupied(v) => v.into_mut(),
@@ -195,7 +206,7 @@ impl FeatureStoreU64 {
         }
 
         if evicted > 0 {
-            metrics::counter!("feature_store_evicted_total").increment(evicted as u64);
+            crate::batched_counter!("feature_store_evicted_total").increment(evicted as u64);
         }
 
         features
@@ -275,9 +286,10 @@ impl FeatureStoreU64 {
 
                 match search {
                     Ok(i) => {
-                        let b = &mut st.buckets[i];
-                        b.cnt = b.cnt.saturating_add(1);
-                        b.sum += amount;
+                        if let Some(b) = st.buckets.make_contiguous().get_mut(i) {
+                            b.cnt = b.cnt.saturating_add(1);
+                            b.sum += amount;
+                        }
                     }
                     Err(i) => {
                         st.buckets.insert(

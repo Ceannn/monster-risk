@@ -390,14 +390,14 @@ impl XgbPool {
                                 now.duration_since(job.enq_at)
                                     .as_micros()
                                     .min(u128::from(u64::MAX)) as u64;
-                            metrics::histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
+                            crate::sampled_histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
 
                             // We've started processing this job => decrement queued.
                             queued.fetch_sub(1, Ordering::Relaxed);
 
                             if let Some(deadline_at) = job.deadline_at {
                                 if now >= deadline_at {
-                                    metrics::counter!("xgb_pool_deadline_miss_total").increment(1);
+                                    crate::batched_counter!("xgb_pool_deadline_miss_total").increment(1);
                                     let _ = job
                                         .resp_tx
                                         .send(Err(anyhow::Error::new(XgbPoolError::DeadlineExceeded)));
@@ -460,7 +460,7 @@ impl XgbPool {
                                     }
                                     let build_us =
                                         t_build.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                                    metrics::histogram!("l2_payload_extra_build_us")
+                                    crate::sampled_histogram!("l2_payload_extra_build_us")
                                         .record(build_us as f64);
                                     if last_extra_dim != Some(extra_dim) {
                                         metrics::gauge!("l2_payload_extra_dim")
@@ -468,7 +468,7 @@ impl XgbPool {
                                         last_extra_dim = Some(extra_dim);
                                     }
                                     if fallback {
-                                        metrics::counter!("l2_payload_decode_fallback_total").increment(1);
+                                        crate::batched_counter!("l2_payload_decode_fallback_total").increment(1);
                                     }
 
                                     let s = match native_predict_proba_dense_1row(is_l2, &scratch_row) {
@@ -483,7 +483,7 @@ impl XgbPool {
                             };
 
                             let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                            metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
+                            crate::sampled_histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
 
                             // Best-effort compute EWMA update.
                             let old = compute_ema_us.load(Ordering::Relaxed);
@@ -552,14 +552,14 @@ impl XgbPool {
                                     .as_micros()
                                     .min(u128::from(u64::MAX)) as u64;
 
-                            metrics::histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
+                            crate::sampled_histogram!("xgb_pool_queue_wait_us").record(queue_wait_us as f64);
 
                             // Started => dequeue.
                             queued.fetch_sub(1, Ordering::Relaxed);
 
                             if let Some(deadline_at) = job.deadline_at {
                                 if now >= deadline_at {
-                                    metrics::counter!("xgb_pool_deadline_miss_total").increment(1);
+                                    crate::batched_counter!("xgb_pool_deadline_miss_total").increment(1);
                                     let _ = job
                                         .resp_tx
                                         .send(Err(anyhow::Error::new(XgbPoolError::DeadlineExceeded)));
@@ -638,7 +638,7 @@ impl XgbPool {
                             };
 
                             let xgb_us = t0.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                            metrics::histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
+                            crate::sampled_histogram!("xgb_pool_xgb_compute_us").record(xgb_us as f64);
 
                             // EWMA update: new = old*7/8 + xgb*1/8
                             let old = compute_ema_us.load(Ordering::Relaxed);
@@ -741,9 +741,9 @@ impl XgbPool {
             let inflight = (self.queued.load(Ordering::Relaxed) + self.running.load(Ordering::Relaxed)) as u64;
             let ema = self.compute_ema_us.load(Ordering::Relaxed).max(1);
             let pred_wait_us = inflight.saturating_mul(ema) / (self.n_workers as u64).max(1);
-            metrics::histogram!("xgb_pool_pred_wait_us").record(pred_wait_us as f64);
+            crate::sampled_histogram!("xgb_pool_pred_wait_us").record(pred_wait_us as f64);
             if pred_wait_us >= self.early_reject_pred_wait_us {
-                metrics::counter!("xgb_pool_admission_reject_total").increment(1);
+                crate::batched_counter!("xgb_pool_admission_reject_total").increment(1);
                 return Err(XgbPoolError::QueueFull);
             }
         }

@@ -15,6 +15,7 @@ thiserror = "1"
 anyhow = "1"
 flate2 = "1"
 hashbrown = "0.14"
+ahash = "0.8"
 parking_lot = "0.12"
 #xgboost = { package = "xgboostrs", version = "0.2.0" }
 # NOTE: the crate directory is `crates/xgb-ffi`, but its package name is `xgb_ffi`

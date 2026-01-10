@@ -2,6 +2,7 @@ pub mod config;
 pub mod feature_store;
 pub mod feature_store_u64;
 pub mod model;
+pub(crate) mod ring_buf;
 #[cfg(feature = "native_l1_m2cgen")]
 pub mod native_l1_m2cgen;
 #[cfg(feature = "native_l1_tl2cgen")]

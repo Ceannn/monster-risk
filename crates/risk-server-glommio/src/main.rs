@@ -72,16 +72,16 @@ fn main() -> anyhow::Result<()> {
         .expect("failed to install prometheus recorder");
 
     // Pre-register key router metrics so `/metrics | grep router_l2` works even before the first hit.
-    metrics::counter!("router_l2_trigger_total").increment(0);
-    metrics::counter!("router_l2_skipped_budget_total").increment(0);
-    metrics::counter!("router_l2_skipped_deadline_budget_total").increment(0);
-    metrics::counter!("router_l2_skipped_rate_total").increment(0);
-    metrics::counter!("router_l2_skipped_sample_total").increment(0);
-    metrics::counter!("router_l2_skipped_waterline_total").increment(0);
-    metrics::counter!("router_timeout_before_l2_total").increment(0);
-    metrics::counter!("router_deadline_miss_total").increment(0);
-    metrics::counter!("router_l2_feedback_overload_total").increment(0);
-    metrics::counter!("router_l2_feedback_relax_total").increment(0);
+    risk_core::batched_counter!("router_l2_trigger_total").increment(0);
+    risk_core::batched_counter!("router_l2_skipped_budget_total").increment(0);
+    risk_core::batched_counter!("router_l2_skipped_deadline_budget_total").increment(0);
+    risk_core::batched_counter!("router_l2_skipped_rate_total").increment(0);
+    risk_core::batched_counter!("router_l2_skipped_sample_total").increment(0);
+    risk_core::batched_counter!("router_l2_skipped_waterline_total").increment(0);
+    risk_core::batched_counter!("router_timeout_before_l2_total").increment(0);
+    risk_core::batched_counter!("router_deadline_miss_total").increment(0);
+    risk_core::batched_counter!("router_l2_feedback_overload_total").increment(0);
+    risk_core::batched_counter!("router_l2_feedback_relax_total").increment(0);
 
     let mut cfg = Config::default();
 
@@ -603,7 +603,7 @@ async fn handle_conn(
             {
                 Ok(v) => v,
                 Err(_) => {
-                    metrics::counter!("xgb_deadline_exceeded_total").increment(1);
+                    risk_core::batched_counter!("xgb_deadline_exceeded_total").increment(1);
                     write_http(
                         &mut stream,
                         &mut out,
@@ -647,7 +647,7 @@ async fn handle_conn(
             };
 
             let xgb_us = now_us(t_xgb);
-            metrics::histogram!("stage_xgb_us").record(xgb_us as f64);
+            risk_core::sampled_histogram!("stage_xgb_us").record(xgb_us as f64);
 
             let mut l2_us: u64 = 0;
 
@@ -673,21 +673,21 @@ async fn handle_conn(
                         .unwrap_or(0);
 
                     if remaining_us < l2_ctrl.min_remaining_us() {
-                        metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                        metrics::counter!("router_l2_skipped_deadline_budget_total").increment(1);
+                        risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                        risk_core::batched_counter!("router_l2_skipped_deadline_budget_total").increment(1);
                     } else if !l2_ctrl.allow_by_rate() {
-                        metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                        metrics::counter!("router_l2_skipped_rate_total").increment(1);
+                        risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                        risk_core::batched_counter!("router_l2_skipped_rate_total").increment(1);
                     } else if !l2_ctrl.allow_by_sample() {
-                        metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                        metrics::counter!("router_l2_skipped_sample_total").increment(1);
+                        risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                        risk_core::batched_counter!("router_l2_skipped_sample_total").increment(1);
                     } else {
                         let st_waterline =
                             l2_ctrl.waterline_cached_or_update(|| pool2.stats().queue_waterline());
                         let max_w = l2_ctrl.max_queue_waterline();
                         if max_w < 1.0 && st_waterline >= max_w {
-                            metrics::counter!("router_l2_skipped_budget_total").increment(1);
-                            metrics::counter!("router_l2_skipped_waterline_total").increment(1);
+                            risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
+                            risk_core::batched_counter!("router_l2_skipped_waterline_total").increment(1);
                         } else {
                             // Optional queue-wait budget for L2 pool.
                             let mut q_budget_us = l2_ctrl.queue_wait_budget_us();
@@ -734,7 +734,7 @@ async fn handle_conn(
                             };
 
                             if let Ok(rx2) = submit {
-                                metrics::counter!("router_l2_trigger_total").increment(1);
+                                risk_core::batched_counter!("router_l2_trigger_total").increment(1);
 
                                 let rem = deadline
                                     .checked_duration_since(std::time::Instant::now())
@@ -762,7 +762,7 @@ async fn handle_conn(
                                         if let Some(pe) = e.downcast_ref::<XgbPoolError>() {
                                             if matches!(pe, XgbPoolError::DeadlineExceeded) {
                                                 l2_ctrl.feedback_overload();
-                                                metrics::counter!(
+                                                risk_core::batched_counter!(
                                                     "router_l2_skipped_deadline_budget_total"
                                                 )
                                                 .increment(1);
@@ -772,20 +772,20 @@ async fn handle_conn(
                                     Err(_timeout) => {
                                         l2_us = now_us(t_l2);
                                         l2_ctrl.feedback_overload();
-                                        metrics::counter!(
+                                        risk_core::batched_counter!(
                                             "router_l2_skipped_deadline_budget_total"
                                         )
                                         .increment(1);
                                     }
                                 }
 
-                                metrics::histogram!("stage_l2_us").record(l2_us as f64);
+                                risk_core::sampled_histogram!("stage_l2_us").record(l2_us as f64);
                             } else {
                                 // L2 pool saturated -> fall back to L1 decision (ManualReview) instead of failing request.
                                 l2_ctrl.feedback_overload();
-                                metrics::counter!("router_l2_skipped_budget_total").increment(1);
+                                risk_core::batched_counter!("router_l2_skipped_budget_total").increment(1);
                                 l2_us = 0;
-                                metrics::histogram!("stage_l2_us").record(0.0);
+                                risk_core::sampled_histogram!("stage_l2_us").record(0.0);
                             }
                         }
                     }
@@ -793,29 +793,49 @@ async fn handle_conn(
             }
 
             let router_us = now_us(t_router);
-            metrics::histogram!("stage_router_us").record(router_us as f64);
-            metrics::histogram!("stage_feature_us").record(feature_us as f64);
+            risk_core::sampled_histogram!("stage_router_us").record(router_us as f64);
+            risk_core::sampled_histogram!("stage_feature_us").record(feature_us as f64);
 
             // serialize (RSK1)
-            let t_ser = std::time::Instant::now();
+            let ser_hist = risk_core::sampled_histogram!("stage_serialize_us");
             let trace_id = TRACE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
             // NOTE: 序列化耗时本身不能“精确地”写回同一个包（会有轻微递归依赖）。
             // 这里用两步：先用 serialize_us=0 编码，然后把测得的 serialize_us patch 回固定 offset(44..48)。
-            let mut rsk1 = encode_rsk1(
-                trace_id,
-                score,
-                decision_u8,
-                parse_us,
-                feature_us,
-                router_us,
-                xgb_us,
-                l2_us,
-                0,
-            );
-            let ser_us = now_us(t_ser);
-            patch_rsk1_serialize_us(&mut rsk1, ser_us);
-            metrics::histogram!("stage_serialize_us").record(ser_us as f64);
-            metrics::histogram!("e2e_us").record(now_us(t0) as f64);
+            let (mut rsk1, ser_us) = if ser_hist.enabled() {
+                let t_ser = std::time::Instant::now();
+                let rsk1 = encode_rsk1(
+                    trace_id,
+                    score,
+                    decision_u8,
+                    parse_us,
+                    feature_us,
+                    router_us,
+                    xgb_us,
+                    l2_us,
+                    0,
+                );
+                (rsk1, now_us(t_ser))
+            } else {
+                (
+                    encode_rsk1(
+                        trace_id,
+                        score,
+                        decision_u8,
+                        parse_us,
+                        feature_us,
+                        router_us,
+                        xgb_us,
+                        l2_us,
+                        0,
+                    ),
+                    0,
+                )
+            };
+            if ser_hist.enabled() {
+                patch_rsk1_serialize_us(&mut rsk1, ser_us);
+                ser_hist.record(ser_us as f64);
+            }
+            risk_core::sampled_histogram!("e2e_us").record(now_us(t0) as f64);
 
             write_http(
                 &mut stream,
