@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use hdrhistogram::Histogram;
 use http::{header, HeaderValue, Method, Request, Uri};
 use http_body_util::Full;
@@ -10,13 +9,15 @@ use hyper::client::conn::http1;
 use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use rand::{Rng, SeedableRng};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// risk-bench2: 每核一线程 + hyper http1 keepalive conn 的 open-loop 压测器。
 ///
@@ -58,12 +59,17 @@ struct Args {
     threads: usize,
 
     /// Total concurrency cap (in-flight). Will be divided across threads.
+    /// NOTE: For HTTP/1.1, real on-wire in-flight is bounded by total connections.
     #[arg(long, default_value_t = 1024)]
     concurrency: usize,
 
     /// Connections per thread (keepalive). Each conn has its own send loop.
     #[arg(long, default_value_t = 4)]
     conns_per_thread: usize,
+
+    /// Per-connection queue cap (1 = real in-flight semantics).
+    #[arg(long, default_value_t = 1)]
+    conn_queue: usize,
 
     /// Request timeout ms (0 = no timeout)
     #[arg(long, default_value_t = 2000)]
@@ -84,7 +90,7 @@ struct Args {
 
     /// Max catch-up for fixed pacer (in ticks) when the pacer wakes up late.
     /// If we are behind by more than this, we skip the extra ticks to avoid bursty catch-up.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 2)]
     pacer_max_catchup_ticks: u64,
 
     /// Max catch-up for poisson pacer (in microseconds). If lag exceeds this, we reset next tick base to "now".
@@ -476,6 +482,8 @@ struct PayloadRing {
     rows: usize,
 }
 
+const PAYLOAD_CACHE_MAX_ROWS: usize = 1_000_000;
+
 impl PayloadRing {
     fn load(path: &str, dense_dim: usize) -> Result<Self> {
         let row_bytes = dense_dim
@@ -504,6 +512,10 @@ impl PayloadRing {
         })
     }
 
+    fn cache_rows(&self) -> Vec<Bytes> {
+        (0..self.rows).map(|i| self.row_slice(i)).collect()
+    }
+
     #[inline]
     fn row_slice(&self, idx: usize) -> Bytes {
         let i = idx % self.rows;
@@ -513,10 +525,9 @@ impl PayloadRing {
 }
 
 struct ReqMsg {
+    req_id: u64,
     body: Bytes,
     t_sched: Instant,
-    measuring: bool,
-    resp_tx: oneshot::Sender<Result<RespInfo>>,
 }
 
 struct RespInfo {
@@ -526,10 +537,21 @@ struct RespInfo {
     rsk1: Option<Rsk1>,
 }
 
+struct RespEvent {
+    req_id: u64,
+    info: Option<RespInfo>,
+}
+
+struct InflightInfo {
+    measuring: bool,
+    t_sched: Instant,
+}
+
 async fn conn_worker(
     target: Target,
     content_type: HeaderValue,
     mut rx: mpsc::Receiver<ReqMsg>,
+    resp_tx: mpsc::Sender<RespEvent>,
 ) -> Result<()> {
     let stream = TcpStream::connect(&target.addr)
         .await
@@ -548,15 +570,19 @@ async fn conn_worker(
     // warm ready
     sender.ready().await.context("sender ready")?;
 
+    let base_req = Request::builder()
+        .method(Method::POST)
+        .uri(target.path_and_query.as_str())
+        .header(header::HOST, target.host_header.clone())
+        .header(header::CONTENT_TYPE, content_type.clone())
+        .body(())
+        .map_err(|e| anyhow!("build request: {e}"))?;
+    let (base_parts, _) = base_req.into_parts();
+
     while let Some(msg) = rx.recv().await {
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(target.path_and_query.as_str())
-            .header(header::HOST, target.host_header.clone())
-            .header(header::CONTENT_TYPE, content_type.clone())
-            .body(Full::new(msg.body))
-            .map_err(|e| anyhow!("build request: {e}"))?;
+        let req = Request::from_parts(base_parts.clone(), Full::new(msg.body));
         let t_sched = msg.t_sched;
+        let req_id = msg.req_id;
         let t0 = Instant::now();
         let client_qwait_us = t0.duration_since(t_sched).as_micros().min(u64::MAX as u128) as u64;
         let res: Result<(StatusCode, Bytes)> = async {
@@ -569,15 +595,17 @@ async fn conn_worker(
 
         let latency_us = t0.elapsed().as_micros() as u64;
 
-        let info = res.map(|(status, body_bytes)| RespInfo {
-            status,
-            latency_us,
-            client_qwait_us,
-            rsk1: decode_rsk1(status, &body_bytes),
-        });
+        let info = res
+            .map(|(status, body_bytes)| RespInfo {
+                status,
+                latency_us,
+                client_qwait_us,
+                rsk1: decode_rsk1(status, &body_bytes),
+            })
+            .ok();
 
-        // receiver might have been dropped (timeout); ignore send error
-        let _ = msg.resp_tx.send(info);
+        // receiver might have been dropped; ignore send error
+        let _ = resp_tx.send(RespEvent { req_id, info }).await;
     }
 
     Ok(())
@@ -605,6 +633,11 @@ async fn run_shard(
     let pacer = parse_pacer(&args.pacer)?;
     let spin_threshold_us = args.pacer_spin_threshold_us;
     let jitter = args.pacer_jitter_us;
+    let rsk1_sample_log2 = std::env::var("RISK_BENCH2_RSK1_SAMPLE_LOG2")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(20);
 
     let content_type =
         HeaderValue::from_str(&args.content_type).context("invalid content-type header value")?;
@@ -613,10 +646,13 @@ async fn run_shard(
 
     // ---------------- connections ----------------
     let conns = args.conns_per_thread.max(1);
+    let conn_queue = args.conn_queue.max(1);
     let mut txs = Vec::with_capacity(conns);
+    let resp_chan_cap = (conns * (conn_queue + 1)).max(1024);
+    let (resp_tx, mut resp_rx) = mpsc::channel::<RespEvent>(resp_chan_cap);
 
     for _ in 0..conns {
-        let (tx, rx) = mpsc::channel::<ReqMsg>(inflight_cap.max(64));
+        let (tx, rx) = mpsc::channel::<ReqMsg>(conn_queue);
         txs.push(tx);
         let target2 = Target {
             uri: target.uri.clone(),
@@ -625,8 +661,9 @@ async fn run_shard(
             addr: target.addr.clone(),
         };
         let ct2 = content_type.clone();
+        let resp_tx2 = resp_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = conn_worker(target2, ct2, rx).await {
+            if let Err(e) = conn_worker(target2, ct2, rx, resp_tx2).await {
                 eprintln!("[bench2] conn_worker error: {e:?}");
             }
         });
@@ -679,13 +716,31 @@ async fn run_shard(
     } else {
         1_000_000
     };
+    if matches!(pacer, PacerKind::Fixed | PacerKind::FixedSpin) {
+        let phase_us = if threads_total > 0 {
+            fixed_period_us.saturating_mul(shard_id as u64) / threads_total as u64
+        } else {
+            0
+        };
+        next_at += Duration::from_micros(phase_us);
+    }
 
-    // inflight join handles return (measuring?, resp?)
-    let mut inflight: FuturesUnordered<tokio::task::JoinHandle<(bool, Option<RespInfo>)>> =
-        FuturesUnordered::new();
+    let timeout_dur = if args.timeout_ms > 0 {
+        Some(Duration::from_millis(args.timeout_ms))
+    } else {
+        None
+    };
+    let mut inflight: HashMap<u64, InflightInfo> = HashMap::with_capacity(inflight_cap * 2);
+    let mut deadlines: BinaryHeap<Reverse<(Instant, u64)>> = BinaryHeap::new();
 
     let mut seq: u64 = 0;
     let mut last_progress = Instant::now();
+    let payload_rows = if payload.rows <= PAYLOAD_CACHE_MAX_ROWS {
+        Some(payload.cache_rows())
+    } else {
+        None
+    };
+    let mut resp_closed = false;
 
     // helper: flush one window
     let mut flush_window = |now: Instant,
@@ -759,6 +814,22 @@ async fn run_shard(
     // ---------------- main loop ----------------
     while Instant::now() < measure_end || !inflight.is_empty() {
         let in_window = Instant::now() < measure_end;
+        let timeout_enabled = timeout_dur.is_some();
+        let next_deadline = if timeout_enabled {
+            deadlines.peek().map(|entry| (entry.0).0)
+        } else {
+            None
+        };
+        let mut deadline_sleep = if timeout_enabled {
+            if let Some(deadline) = next_deadline {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))
+            } else {
+                tokio::time::sleep(Duration::from_secs(3600))
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(3600))
+        };
+        tokio::pin!(deadline_sleep);
 
         tokio::select! {
                     // tick: schedule request
@@ -839,15 +910,36 @@ async fn run_shard(
                             continue;
                         }
 
-                        let row_idx = ((seq as usize).wrapping_mul(1315423911) ^ shard_id) % payload.rows;
-                        let body = payload.row_slice(row_idx);
+                        let req_id = seq;
+                        let row_idx = ((req_id as usize).wrapping_mul(1315423911) ^ shard_id) % payload.rows;
+                        let body = match payload_rows.as_ref() {
+                            Some(rows) => rows[row_idx].clone(),
+                            None => payload.row_slice(row_idx),
+                        };
                         seq = seq.wrapping_add(1);
 
-                        let (resp_tx, resp_rx) = oneshot::channel::<Result<RespInfo>>();
-                        let t0 = now;
-
-                        let conn_idx = (seq as usize) % txs.len();
-                        if let Err(_e) = txs[conn_idx].try_send(ReqMsg{ body, t_sched: t0, measuring, resp_tx }) {
+                        let t_sched = now;
+                        let mut msg = ReqMsg { req_id, body, t_sched };
+                        let start_idx = (seq as usize) % txs.len();
+                        let mut sent = false;
+                        for i in 0..txs.len() {
+                            let conn_idx = (start_idx + i) % txs.len();
+                            match txs[conn_idx].try_send(msg) {
+                                Ok(()) => {
+                                    sent = true;
+                                    break;
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(m)) => {
+                                    msg = m;
+                                    continue;
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(m)) => {
+                                    msg = m;
+                                    continue;
+                                }
+                            }
+                        }
+                        if !sent {
                             if measuring {
                                 stats.dropped += 1;
                                 stats.drop_conn_queue_full += 1;
@@ -860,12 +952,6 @@ async fn run_shard(
                             continue;
                         }
 
-                        let timeout = if args.timeout_ms > 0 {
-                            Some(Duration::from_millis(args.timeout_ms))
-                        } else {
-                            None
-                        };
-
                         // count attempted at send time (measured only)
                         if measuring {
                             if let Some(w) = win.as_mut() {
@@ -873,28 +959,25 @@ async fn run_shard(
                             }
                         }
 
-                        inflight.push(tokio::spawn(async move {
-                            let got = match timeout {
-                                Some(t) => {
-                                    match tokio::time::timeout(t, resp_rx).await {
-                                        Ok(Ok(Ok(info))) => Some(info),
-                                        Ok(Ok(Err(_e))) => None,
-                                        Ok(Err(_closed)) => None,
-                                        Err(_elapsed) => None,
-                                    }
-                                }
-                                None => {
-                                    match resp_rx.await {
-                                        Ok(Ok(info)) => Some(info),
-                                        _ => None,
-                                    }
-                                }
-                            };
-                            (measuring, got)
-                        }));
+                        inflight.insert(
+                            req_id,
+                            InflightInfo {
+                                measuring,
+                                t_sched,
+                            },
+                        );
+                        if let Some(timeout) = timeout_dur {
+                            deadlines.push(Reverse((t_sched + timeout, req_id)));
+                        }
 
                         if args.progress && last_progress.elapsed() >= Duration::from_secs(1) {
-                            eprintln!("[bench2] shard={} inflight={} t={:.1}s (measuring={})", shard_id, inflight.len(), start.elapsed().as_secs_f64(), measuring);
+                            eprintln!(
+                                "[bench2] shard={} inflight={} t={:.1}s (measuring={})",
+                                shard_id,
+                                inflight.len(),
+                                start.elapsed().as_secs_f64(),
+                                measuring
+                            );
                             last_progress = Instant::now();
                         }
                     }
@@ -910,75 +993,120 @@ async fn run_shard(
                         }
                     }
 
+                    // deadline tick (timeout)
+                    _ = &mut deadline_sleep, if timeout_enabled => {
+                        let now = Instant::now();
+                        while let Some(Reverse((deadline, req_id))) = deadlines.peek().copied() {
+                            if deadline > now {
+                                break;
+                            }
+                            let _ = deadlines.pop();
+                            let info = inflight.remove(&req_id);
+                            let Some(info) = info else {
+                                continue;
+                            };
+                            if !info.measuring {
+                                continue;
+                            }
+                            stats.timeout += 1;
+                            let qwait_us = now
+                                .duration_since(info.t_sched)
+                                .as_micros()
+                                .min(u64::MAX as u128) as u64;
+                            let _ = stats.client_qwait_us.record(qwait_us.max(1));
+                            if let Some(w) = win.as_mut() {
+                                let _ = w.client_qwait_us.record(qwait_us.max(1));
+                                w.timeout += 1;
+                            }
+                        }
+                    }
+
                     // response completion
-                    Some(joined) = inflight.next(), if !inflight.is_empty() => {
-                        match joined {
-                            Ok((measuring, maybe_info)) => {
-                                if !measuring {
-                                    continue;
+                    resp = resp_rx.recv(), if !resp_closed => {
+                        let Some(event) = resp else {
+                            resp_closed = true;
+                            continue;
+                        };
+                        let Some(info) = inflight.remove(&event.req_id) else {
+                            continue;
+                        };
+                        if !info.measuring {
+                            continue;
+                        }
+
+                        if let Some(info) = event.info {
+                            if info.status.is_success() {
+                                stats.ok += 1;
+                                stats.http_2xx += 1;
+                                if let Some(w) = win.as_mut() {
+                                    w.ok += 1;
+                                    w.http_2xx += 1;
                                 }
-
-                                // measured completion
-                                if let Some(info) = maybe_info {
-                                    if info.status.is_success() {
-                                        stats.ok += 1;
-                                        stats.http_2xx += 1;
-                                        if let Some(w) = win.as_mut() {
-                                            w.ok += 1;
-                                            w.http_2xx += 1;
-                                        }
-                                    } else {
-                                        stats.err += 1;
-                                        if info.status == StatusCode::TOO_MANY_REQUESTS {
-                                            stats.http_429 += 1;
-                                            if let Some(w) = win.as_mut() { w.err += 1; w.http_429 += 1; }
-                                        } else if info.status.is_server_error() {
-                                            stats.http_5xx += 1;
-                                            if let Some(w) = win.as_mut() { w.err += 1; w.http_5xx += 1; }
-                                        } else {
-                                            if let Some(w) = win.as_mut() { w.err += 1; }
-                                        }
-                                    }
-
-                                    let _ = stats.lat_us.record(info.latency_us.max(1));
-                                    if let Some(w) = win.as_mut() {
-                                        let _ = w.lat_us.record(info.latency_us.max(1));
-                                    }
-
-                                    if let Some(r) = info.rsk1 {
-                                        stats.rsk1_samples += 1;
-
-                                        let _ = stats.stage_parse.record((r.timings.parse as u64).max(1));
-                                        let _ = stats.stage_feature.record((r.timings.feature as u64).max(1));
-                                        let _ = stats.stage_router.record((r.timings.router as u64).max(1));
-                                        let _ = stats.stage_xgb.record((r.timings.xgb as u64).max(1));
-                                        let _ = stats.stage_l2.record((r.timings.l2 as u64).max(1));
-                                        let _ = stats.stage_serialize.record((r.timings.serialize as u64).max(1));
-
-                                        if let Some(w) = win.as_mut() {
-                                            let _ = w.stage_parse.record((r.timings.parse as u64).max(1));
-                                            let _ = w.stage_feature.record((r.timings.feature as u64).max(1));
-                                            let _ = w.stage_router.record((r.timings.router as u64).max(1));
-                                            let _ = w.stage_xgb.record((r.timings.xgb as u64).max(1));
-                                            let _ = w.stage_l2.record((r.timings.l2 as u64).max(1));
-                                            let _ = w.stage_serialize.record((r.timings.serialize as u64).max(1));
-                                        }
-                                    }
+                            } else {
+                                stats.err += 1;
+                                if info.status == StatusCode::TOO_MANY_REQUESTS {
+                                    stats.http_429 += 1;
+                                    if let Some(w) = win.as_mut() { w.err += 1; w.http_429 += 1; }
+                                } else if info.status.is_server_error() {
+                                    stats.http_5xx += 1;
+                                    if let Some(w) = win.as_mut() { w.err += 1; w.http_5xx += 1; }
                                 } else {
-                                    // timeout or internal error
-                                    stats.timeout += 1;
+                                    if let Some(w) = win.as_mut() { w.err += 1; }
+                                }
+                            }
+
+                            let _ = stats.lat_us.record(info.latency_us.max(1));
+                            if let Some(w) = win.as_mut() {
+                                let _ = w.lat_us.record(info.latency_us.max(1));
+                            }
+                            let _ = stats
+                                .client_qwait_us
+                                .record(info.client_qwait_us.max(1));
+                            if let Some(w) = win.as_mut() {
+                                let _ = w
+                                    .client_qwait_us
+                                    .record(info.client_qwait_us.max(1));
+                            }
+
+                            if let Some(r) = info.rsk1 {
+                                stats.rsk1_samples += 1;
+
+                                // Sample stage hist to reduce overhead at high QPS.
+                                let sample_ok = if rsk1_sample_log2 == 0 {
+                                    true
+                                } else {
+                                    let mask = (1u64 << rsk1_sample_log2) - 1;
+                                    (stats.rsk1_samples & mask) == 0
+                                };
+                                if sample_ok {
+                                    let _ = stats.stage_parse.record((r.timings.parse as u64).max(1));
+                                    let _ = stats.stage_feature.record((r.timings.feature as u64).max(1));
+                                    let _ = stats.stage_router.record((r.timings.router as u64).max(1));
+                                    let _ = stats.stage_xgb.record((r.timings.xgb as u64).max(1));
+                                    let _ = stats.stage_l2.record((r.timings.l2 as u64).max(1));
+                                    let _ = stats.stage_serialize.record((r.timings.serialize as u64).max(1));
+
                                     if let Some(w) = win.as_mut() {
-                                        w.timeout += 1;
+                                        let _ = w.stage_parse.record((r.timings.parse as u64).max(1));
+                                        let _ = w.stage_feature.record((r.timings.feature as u64).max(1));
+                                        let _ = w.stage_router.record((r.timings.router as u64).max(1));
+                                        let _ = w.stage_xgb.record((r.timings.xgb as u64).max(1));
+                                        let _ = w.stage_l2.record((r.timings.l2 as u64).max(1));
+                                        let _ = w.stage_serialize.record((r.timings.serialize as u64).max(1));
                                     }
                                 }
                             }
-                            Err(_join_err) => {
-                                // join error
-                                // if it's measuring we can't know; assume measured & count as timeout
-                                stats.timeout += 1;
-                                if let Some(w) = win.as_mut() {
-                                    w.timeout += 1;
-                                }
+                        } else {
+                            // timeout or internal error
+                            stats.timeout += 1;
+                            let qwait_us = Instant::now()
+                                .duration_since(info.t_sched)
+                                .as_micros()
+                                .min(u64::MAX as u128) as u64;
+                            let _ = stats.client_qwait_us.record(qwait_us.max(1));
+                            if let Some(w) = win.as_mut() {
+                                let _ = w.client_qwait_us.record(qwait_us.max(1));
+                                w.timeout += 1;
                             }
                         }
                     }
@@ -1016,12 +1144,15 @@ fn main() -> Result<()> {
     let threads = pick_threads(&args).max(1);
     let conc_total = args.concurrency.max(threads);
     let inflight_per = (conc_total + threads - 1) / threads;
+    let conn_queue = args.conn_queue.max(1);
+    let conns_total = threads * args.conns_per_thread.max(1);
+    let inflight_per_eff = inflight_per.min(args.conns_per_thread.max(1) * conn_queue);
 
     let rps_total = args.rps.max(1);
     let rps_per = rps_total as f64 / threads as f64;
 
     eprintln!(
-        "[bench2] url={} rps={} warmup={}s duration={}s threads={} inflight_total={} inflight_per={} conns_per_thread={} pacer={} jitter_us={} timeout_ms={} payload_rows={} dim={} content_type={} window_ms={} window_csv={}",
+        "[bench2] url={} rps={} warmup={}s duration={}s threads={} inflight_total={} inflight_per={} inflight_per_eff={} conns_per_thread={} conn_queue={} conns_total={} pacer={} jitter_us={} catchup_ticks={} catchup_us={} timeout_ms={} payload_rows={} dim={} content_type={} window_ms={} window_csv={}",
         args.url,
         rps_total,
         args.warmup,
@@ -1029,9 +1160,14 @@ fn main() -> Result<()> {
         threads,
         conc_total,
         inflight_per,
+        inflight_per_eff,
         args.conns_per_thread,
+        conn_queue,
+        conns_total,
         args.pacer,
         args.pacer_jitter_us,
+        args.pacer_max_catchup_ticks,
+        args.pacer_max_catchup_us,
         args.timeout_ms,
         payload.rows,
         args.xgb_dense_dim,
@@ -1091,6 +1227,16 @@ fn main() -> Result<()> {
     let drop_rps = total.dropped as f64 / measured_elapsed;
     let drop_pct = if attempted > 0.0 {
         (total.dropped as f64) * 100.0 / attempted
+    } else {
+        0.0
+    };
+    let drop_inflight_pct = if attempted > 0.0 {
+        (total.drop_inflight_cap as f64) * 100.0 / attempted
+    } else {
+        0.0
+    };
+    let drop_conn_pct = if attempted > 0.0 {
+        (total.drop_conn_queue_full as f64) * 100.0 / attempted
     } else {
         0.0
     };
@@ -1166,6 +1312,14 @@ fn main() -> Result<()> {
         qwait_max,
         total.client_qwait_us.len()
     );
+    println!(
+        "[bench2] bench_limits: drop_inflight_cap={} ({:.3}%) drop_conn_queue_full={} ({:.3}%) client_qwait_p99={}us",
+        total.drop_inflight_cap,
+        drop_inflight_pct,
+        total.drop_conn_queue_full,
+        drop_conn_pct,
+        qwait_p99
+    );
 
     // ---------------- quality gate ----------------
     // FAIL should mean: *the bench* is preventing us from hitting the target (or keeping the in-flight cap),
@@ -1175,12 +1329,17 @@ fn main() -> Result<()> {
 
     // Hard signals that the load generator is the bottleneck / not stable at the requested load:
     if total.drop_inflight_cap > 0 {
-        fail_reasons.push(format!("drop_inflight_cap={}", total.drop_inflight_cap));
+        fail_reasons.push(format!(
+            "drop_inflight_cap={} ({:.3}%)",
+            total.drop_inflight_cap,
+            drop_inflight_pct
+        ));
     }
     if total.drop_conn_queue_full > 0 {
         fail_reasons.push(format!(
-            "drop_conn_queue_full={}",
-            total.drop_conn_queue_full
+            "drop_conn_queue_full={} ({:.3}%)",
+            total.drop_conn_queue_full,
+            drop_conn_pct
         ));
     }
     if total.timeout > 0 {
@@ -1200,6 +1359,20 @@ fn main() -> Result<()> {
     }
     if lag_max >= 50_000 {
         warn_reasons.push(format!("pacer_lag_max={}us", lag_max));
+    }
+    if total.client_qwait_us.len() > 0 {
+        let target_period_us =
+            ((1_000_000.0 * threads as f64) / (rps_total as f64)).max(1.0) as u64;
+        let qwait_fail =
+            qwait_p99 >= 5_000 || qwait_p99 >= target_period_us.saturating_mul(10);
+        if qwait_fail {
+            fail_reasons.push(format!("client_qwait_p99={}us", qwait_p99));
+        } else if qwait_p99 >= 1_000 {
+            warn_reasons.push(format!("client_qwait_p99={}us", qwait_p99));
+        }
+        if qwait_max >= 50_000 {
+            warn_reasons.push(format!("client_qwait_max={}us", qwait_max));
+        }
     }
 
     if fail_reasons.is_empty() && warn_reasons.is_empty() {
